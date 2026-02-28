@@ -1,0 +1,29 @@
+# Git
+.git
+.gitignore
+
+# Environments
+.env
+.venv
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Byte-compiled
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Project specific
+app/core/__pycache__
+app/api/__pycache__
+app/services/__pycache__
+app/agents/__pycache__
+app/models/__pycache__
