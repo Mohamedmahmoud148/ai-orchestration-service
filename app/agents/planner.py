@@ -23,9 +23,10 @@ class PlannerAgent(BaseAgent):
         
         # The schema definition we want the LLM to adhere to
         self.output_schema_instruction = (
-            "You are an AI Planner mapping a user request to backend tool steps.\n"
+            "You are an AI Planner mapping a user request to a sequence of execution steps.\n"
             "Generate an execution plan satisfying the request.\n"
             "Available tools: {tools}\n"
+            "Note: You can pass outputs from previous steps using {{step_X.output}} syntax in the input_payload.\n"
             "Format your output strictly as JSON matching this structure:\n"
             '{\n'
             '  "goal_summary": "Description of the plan",\n'
@@ -33,9 +34,13 @@ class PlannerAgent(BaseAgent):
             '  "steps": [\n'
             '    {\n'
             '      "step_id": 1,\n'
-            '      "tool_name": "NameOfTool",\n'
-            '      "parameters": {"key1": "value1"},\n'
-            '      "depends_on": []\n'
+            '      "action": "tool", // "tool", "model", or "agent_module"\n'
+            '      "tool_name": "NameOfTool", // If action is "tool"\n'
+            '      "model_name": null, // If action is "model", e.g. "gemini-2.5-flash"\n'
+            '      "module_name": null, // If action is "agent_module"\n'
+            '      "input_payload": {"key1": "value1"},\n'
+            '      "depends_on": [],\n'
+            '      "condition": null // Optional python expression eval condition\n'
             '    }\n'
             '  ]\n'
             '}\n'
