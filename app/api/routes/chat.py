@@ -1,64 +1,90 @@
-from fastapi import APIRouter, HTTPException, Request
-from app.models.chat import ChatRequest, ChatResponse
-from app.services.ai_service import ai_service
-from app.services.tool_registry import tool_registry
-from app.services.backend_client import backend_client
-from app.core.logging import logger
+"""
+chat.py — /api/chat endpoint
 
+Responsibilities (ONLY these):
+  1. Authenticate the caller.
+  2. Build an ExecutionContext from the request.
+  3. Delegate everything to OrchestrationPipeline.run().
+  4. Serialise context.result into a ChatResponse.
+
+This file must NEVER:
+  - Call Gemini / OpenAI / any LLM directly.
+  - Call PlannerAgent, ToolRegistry, ModelRouter, or PlanExecutor directly.
+  - Contain if/else logic based on intent, role, or tool.
+"""
+
+from fastapi import APIRouter, HTTPException, Request
+
+from app.agents.execution_context import ExecutionContext
+from app.agents.pipeline import OrchestrationPipeline, _PipelineStageError
+from app.core.logging import logger
+from app.models.chat import ChatRequest, ChatResponse
+
+# ─────────────────────────────────────────────────────────────
+#  Pipeline is assembled once at import time via the app
+#  state (set in main.py).  The endpoint reads it from there.
+# ─────────────────────────────────────────────────────────────
 router = APIRouter()
+
+
+def _get_pipeline(fastapi_request: Request) -> OrchestrationPipeline:
+    """Retrieve the pre-built pipeline from FastAPI app state."""
+    pipeline: OrchestrationPipeline = fastapi_request.app.state.pipeline
+    if pipeline is None:
+        raise HTTPException(status_code=503, detail="Orchestration pipeline not initialised.")
+    return pipeline
+
 
 @router.post("/chat", response_model=ChatResponse, tags=["AI Chat"])
 async def chat_endpoint(request: ChatRequest, fastapi_request: Request):
     """
-    1. Receives chat message.
-    2. Uses AI Service to determine intent.
-    3. If a tool maps to this intent, calls the .NET backend.
-    4. Returns a structured JSON response.
+    Unified chat entry-point.
+
+    Delegates ALL orchestration logic to OrchestrationPipeline.run().
+    This handler contains zero business logic.
     """
+    # ── Auth ─────────────────────────────────────────────────
     auth_header = fastapi_request.headers.get("Authorization")
     if not auth_header:
-        logger.warning(f"Unauthorized chat attempt. Missing Authorization header for user: {request.user_id}")
-        raise HTTPException(status_code=401, detail="Authorization header missing")
-
-    logger.info(f"Received chat request from user: {request.user_id}")
-    
-    # 1. Determine Intent using Gemini
-    intent = await ai_service.determine_intent(request.message)
-    logger.info(f"Identified intent: {intent.intent_name} with parameters: {intent.parameters}")
-    
-    if intent.intent_name == "Error":
-        raise HTTPException(status_code=500, detail=intent.parameters.get("error", "Unknown AI error"))
-
-    # 2. Check Tool Registry for matching route
-    backend_route = tool_registry.get_route_for_intent(intent.intent_name)
-    
-    backend_data = None
-    response_text = ""
-    
-    # 3. Call .NET Backend if tool is registered
-    if backend_route:
-        logger.info(f"Routing intent '{intent.intent_name}' to backend route '{backend_route}'")
-        backend_data = await backend_client.execute_tool(
-            route=backend_route,
-            parameters=intent.parameters,
-            auth_header=auth_header,
-            user_id=request.user_id
+        logger.warning(
+            "Unauthorized chat attempt — missing Authorization header. user_id=%s",
+            request.user_id,
         )
-        
-        if backend_data and "error" in backend_data:
-            response_text = f"I tried to execute the tool for {intent.intent_name} but encountered an error: {backend_data['error']}"
-        else:
-            response_text = f"Successfully executed backend tool for intent '{intent.intent_name}'."
-    else:
-        # No specific tool mapped, treat as simple chat or unhandled intent
-        if intent.intent_name == "DefaultChat":
-            response_text = "I received your message, but it didn't match any specific action I perform. How can I assist you further?"
-        else:
-            response_text = f"I understood you want to perform '{intent.intent_name}', but I don't have a backend tool configured for that yet."
-    
-    # 4. Return structured response
+        raise HTTPException(status_code=401, detail="Authorization header missing.")
+
+    logger.info("Chat request received. user_id=%s role=%s", request.user_id, request.role)
+
+    # ── Build context ─────────────────────────────────────────
+    context = ExecutionContext(
+        user_id=request.user_id or "anonymous",
+        role=request.role,
+        message=request.message,
+        conversation_id=request.conversation_id or "",   # pipeline generates UUID if empty
+        history=request.history,
+        academic_context=request.academic_context,
+        metadata={"auth_header": auth_header},           # forwarded for backend_client inside executor
+    )
+
+    # ── Delegate to pipeline ──────────────────────────────────
+    pipeline = _get_pipeline(fastapi_request)
+
+    try:
+        await pipeline.run(context)
+    except _PipelineStageError as exc:
+        logger.error(
+            "Pipeline aborted. stage=%s conversation_id=%s detail=%s",
+            exc.stage,
+            context.conversation_id,
+            exc.detail,
+        )
+        raise HTTPException(status_code=500, detail=exc.detail)
+
+    # ── Serialise & return ────────────────────────────────────
     return ChatResponse(
-        response=response_text,
-        intent_executed=intent.intent_name if backend_route else None,
-        backend_data=backend_data
+        response=str(context.result or ""),
+        conversation_id=context.conversation_id,
+        intent_executed=context.intent,
+        tool_used=context.selected_tool,
+        model_used=context.selected_model,
+        metadata=context.metadata,
     )
