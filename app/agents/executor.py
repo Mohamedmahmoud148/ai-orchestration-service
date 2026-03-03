@@ -1,8 +1,7 @@
-from typing import Dict, Any, Callable, Awaitable, Optional, TYPE_CHECKING
+from typing import Dict, Any, Callable, Awaitable, Optional, TYPE_CHECKING, List
 import re
 from app.agents.schemas import AgentInput, AgentOutput, ExecutionPlan
 from app.core.logging import logger
-
 if TYPE_CHECKING:
     from app.agents.model_router import ModelRouter
     from app.agents.base_agent import BaseAgent
