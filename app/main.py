@@ -22,7 +22,7 @@ from app.agents.planner import PlannerAgent
 from app.api.routes import chat, health
 from app.core.config import settings
 from app.core.logging import logger, setup_logging
-from app.services.backend_client import backend_client
+from app.services.backend_client import tool_execution_client
 from app.services.tool_registry import tool_registry
 
 
@@ -49,7 +49,7 @@ async def lifespan(app: FastAPI):
     planner = PlannerAgent(model_router=model_router, ranker=None)  # ranker is optional
 
     executor = PlanExecutor(
-        backend_execution_func=backend_client.execute_tool,
+        backend_execution_func=tool_execution_client.execute_tool,
         model_router=model_router,
     )
 

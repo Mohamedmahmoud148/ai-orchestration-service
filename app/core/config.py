@@ -9,7 +9,7 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: str = ""
     
     # Backend Config
-    DOTNET_BACKEND_URL: str = ""
+    BACKEND_BASE_URL: str = ""
     
     model_config = SettingsConfigDict(
         env_file=".env",

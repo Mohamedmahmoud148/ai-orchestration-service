@@ -2,7 +2,7 @@ import json
 from typing import Optional, Protocol
 from pydantic import ValidationError
 from app.agents.base_agent import BaseAgent
-from app.agents.schemas import AgentInput, AgentOutput, ExecutionPlan
+from app.agents.schemas import AgentInput, AgentOutput, ExecutionPlan, PreExecutionStep
 from app.core.logging import logger
 
 class MemoryStore(Protocol):
@@ -27,10 +27,40 @@ class PlannerAgent(BaseAgent):
             "Generate an execution plan satisfying the request.\n"
             "Available tools: {tools}\n"
             "Note: You can pass outputs from previous steps using {{step_X.output}} syntax in the input_payload.\n"
+            "\n"
+            "## Intent: generate_exam\n"
+            "When the request is about generating an exam, quiz, or assessment:\n"
+            "  - Set \"intent\": \"generate_exam\" in the plan.\n"
+            "  - Extract the following fields into \"exam_params\":\n"
+            "      collegeName       (string, required)\n"
+            "      departmentName    (string, required)\n"
+            "      batchName         (string, required)\n"
+            "      subjectName       (string, required)\n"
+            "      numberOfQuestions (integer, required)\n"
+            "      examType          (\"midterm\" | \"final\", required)\n"
+            "      variationMode     (\"same_for_all\" | \"different_per_student\", required)\n"
+            "      subjectOfferingId (string | null — include only when the user provides it)\n"
+            "  - Do NOT generate exam content. Only build the plan.\n"
+            "  - If subjectOfferingId is null or absent, you MUST add a pre_execution_steps entry:\n"
+            "      {\n"
+            "        \"tool\": \"ResolveSubjectOffering\",\n"
+            "        \"reason\": \"subjectOfferingId is required to generate the exam but was not provided\",\n"
+            "        \"input_payload\": {\n"
+            "          \"collegeName\": <value>,\n"
+            "          \"departmentName\": <value>,\n"
+            "          \"batchName\": <value>,\n"
+            "          \"subjectName\": <value>\n"
+            "        }\n"
+            "      }\n"
+            "  - When subjectOfferingId is known, pre_execution_steps must be an empty array.\n"
+            "\n"
             "Format your output strictly as JSON matching this structure:\n"
             '{\n'
             '  "goal_summary": "Description of the plan",\n'
+            '  "intent": "generate_exam",  // or null for other intents\n'
             '  "is_executable": true,\n'
+            '  "exam_params": { ... },  // populated when intent is generate_exam, else null\n'
+            '  "pre_execution_steps": [],  // PreExecutionStep objects when required\n'
             '  "steps": [\n'
             '    {\n'
             '      "step_id": 1,\n'
@@ -91,6 +121,39 @@ class PlannerAgent(BaseAgent):
         # 4. Validate output matches Pydantic Schema
         try:
             plan = ExecutionPlan(**raw_json_response)
+
+            # ── Deterministic guard for generate_exam ─────────────────────
+            # If the LLM correctly identified the intent but forgot to inject
+            # the ResolveSubjectOffering step, we inject it here so the
+            # executor never receives an incomplete plan.
+            if (
+                plan.intent == "generate_exam"
+                and plan.exam_params is not None
+                and plan.exam_params.subjectOfferingId is None
+            ):
+                already_present = any(
+                    s.tool == "ResolveSubjectOffering"
+                    for s in plan.pre_execution_steps
+                )
+                if not already_present:
+                    logger.info(
+                        "PlannerAgent: injecting ResolveSubjectOffering pre-execution step "
+                        "(subjectOfferingId not provided)"
+                    )
+                    plan.pre_execution_steps.append(
+                        PreExecutionStep(
+                            tool="ResolveSubjectOffering",
+                            reason="subjectOfferingId is required to generate the exam but was not provided",
+                            input_payload={
+                                "collegeName": plan.exam_params.collegeName,
+                                "departmentName": plan.exam_params.departmentName,
+                                "batchName": plan.exam_params.batchName,
+                                "subjectName": plan.exam_params.subjectName,
+                            },
+                        )
+                    )
+            # ──────────────────────────────────────────────────────────────
+
             return AgentOutput(
                 status="success",
                 response=plan.goal_summary,
