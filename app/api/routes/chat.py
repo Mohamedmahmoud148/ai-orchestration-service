@@ -4,7 +4,7 @@ chat.py — /api/chat endpoint
 Responsibilities (ONLY these):
   1. Authenticate the caller.
   2. Build an ExecutionContext from the request.
-  3. Delegate everything to OrchestrationPipeline.run().
+  3. Delegate everything to Agent.run().
   4. Serialise context.result into a ChatResponse.
 
 This file must NEVER:
@@ -15,24 +15,25 @@ This file must NEVER:
 
 from fastapi import APIRouter, HTTPException, Request
 
+from app.agents.agent import Agent
 from app.agents.execution_context import ExecutionContext
-from app.agents.pipeline import OrchestrationPipeline, _PipelineStageError
+from app.agents.pipeline import _PipelineStageError
 from app.core.logging import logger
 from app.models.chat import ChatRequest, ChatResponse
 
 # ─────────────────────────────────────────────────────────────
-#  Pipeline is assembled once at import time via the app
-#  state (set in main.py).  The endpoint reads it from there.
+#  Agent is assembled once at startup in main.py and stored
+#  in app.state.agent.  The endpoint reads it from there.
 # ─────────────────────────────────────────────────────────────
 router = APIRouter()
 
 
-def _get_pipeline(fastapi_request: Request) -> OrchestrationPipeline:
-    """Retrieve the pre-built pipeline from FastAPI app state."""
-    pipeline: OrchestrationPipeline = fastapi_request.app.state.pipeline
-    if pipeline is None:
-        raise HTTPException(status_code=503, detail="Orchestration pipeline not initialised.")
-    return pipeline
+def _get_agent(fastapi_request: Request) -> Agent:
+    """Retrieve the pre-built Agent from FastAPI app state."""
+    agent: Agent = fastapi_request.app.state.agent
+    if agent is None:
+        raise HTTPException(status_code=503, detail="Agent not initialised.")
+    return agent
 
 
 @router.post("/chat", response_model=ChatResponse, tags=["AI Chat"])
@@ -40,10 +41,10 @@ async def chat_endpoint(request: ChatRequest, fastapi_request: Request):
     """
     Unified chat entry-point.
 
-    Delegates ALL orchestration logic to OrchestrationPipeline.run().
+    Delegates ALL orchestration logic to Agent.run().
     This handler contains zero business logic.
     """
-    # ── Auth ─────────────────────────────────────────────────
+    # ── Auth ──────────────────────────────────────────────────
     auth_header = fastapi_request.headers.get("Authorization")
     if not auth_header:
         logger.warning(
@@ -59,20 +60,20 @@ async def chat_endpoint(request: ChatRequest, fastapi_request: Request):
         user_id=request.user_id or "anonymous",
         role=request.role,
         message=request.message,
-        conversation_id=request.conversation_id or "",   # pipeline generates UUID if empty
+        conversation_id=request.conversation_id or "",
         history=request.history,
         academic_context=request.academic_context,
-        metadata={"auth_header": auth_header},           # forwarded for backend_client inside executor
+        metadata={"auth_header": auth_header},
     )
 
-    # ── Delegate to pipeline ──────────────────────────────────
-    pipeline = _get_pipeline(fastapi_request)
+    # ── Delegate to Agent ─────────────────────────────────────
+    agent = _get_agent(fastapi_request)
 
     try:
-        await pipeline.run(context)
+        await agent.run(context)
     except _PipelineStageError as exc:
         logger.error(
-            "Pipeline aborted. stage=%s conversation_id=%s detail=%s",
+            "Agent aborted. stage=%s conversation_id=%s detail=%s",
             exc.stage,
             context.conversation_id,
             exc.detail,

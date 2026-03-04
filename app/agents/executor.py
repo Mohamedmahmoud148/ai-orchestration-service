@@ -1,218 +1,236 @@
-from typing import Dict, Any, Callable, Awaitable, Optional, TYPE_CHECKING, List
+"""
+app/agents/executor.py
+
+PlanExecutor — the dynamic module dispatcher.
+
+Responsibilities:
+  - Accept an ExecutionPlan + a module_name resolved by the Agent.
+  - Look up (or lazily instantiate) the correct Module from app.modules.
+  - Call module.run(agent_input, plan) and return an AgentOutput.
+  - Fall back to a generic step-by-step executor for plans without a
+    dedicated module (model-only or multi-tool flows).
+"""
+
+from __future__ import annotations
+
+import importlib
 import re
+from typing import Any, Callable, Dict, Optional, Awaitable, TYPE_CHECKING
+
 from app.agents.schemas import AgentInput, AgentOutput, ExecutionPlan
 from app.core.logging import logger
+
 if TYPE_CHECKING:
     from app.agents.model_router import ModelRouter
-    from app.agents.base_agent import BaseAgent
+
+
+# Map module_name strings → fully qualified class names inside app.modules
+_MODULE_CLASS_MAP: Dict[str, tuple[str, str]] = {
+    "exam_generation":  ("app.modules.exam_generation",  "ExamGenerationModule"),
+    "summarization":    ("app.modules.summarization",    "SummarizationModule"),
+    "file_extraction":  ("app.modules.file_extraction",  "FileExtractionModule"),
+    "result_query":     ("app.modules.result_query",      "ResultQueryModule"),
+}
+
 
 class PlanExecutor:
     """
-    Iterates through a generated ExecutionPlan and calls the backend tools,
-    models, or agent modules asynchronously.
+    Iterates through an ExecutionPlan and dispatches work to the
+    appropriate Module, model call, or backend tool call.
     """
-    
+
     def __init__(
-        self, 
-        backend_execution_func: Callable[[str, Dict[str, Any], str, Optional[str]], Awaitable[Dict[str, Any]]],
-        model_router: Optional['ModelRouter'] = None,
-        module_registry: Optional[Dict[str, 'BaseAgent']] = None
-    ):
-        """
-        Inject execution capabilities to decouple from actual services.
-        """
+        self,
+        backend_execution_func: Callable[
+            [str, Dict[str, Any], Optional[str], Optional[str]],
+            Awaitable[Dict[str, Any]],
+        ],
+        model_router: Optional["ModelRouter"] = None,
+    ) -> None:
         self.backend_execution_func = backend_execution_func
         self.model_router = model_router
-        self.module_registry = module_registry or {}
-        
-    def _interpolate_payload(self, payload: Dict[str, Any], results: Dict[int, Any]) -> Dict[str, Any]:
-        """Replaces {{step_X.output}} in strings with actual results."""
-        interpolated = {}
+        # Cache for lazily instantiated module objects
+        self._module_cache: Dict[str, Any] = {}
+
+    # ──────────────────────────────────────────────────────────────────────
+    #  Public API (called by Agent)
+    # ──────────────────────────────────────────────────────────────────────
+
+    async def execute(
+        self,
+        plan: Any,
+        input_context: AgentInput,
+        module_name: str = "model_only",
+    ) -> AgentOutput:
+        """
+        Dispatch to the correct Module if one is registered, otherwise
+        fall back to the generic step-by-step plan runner.
+        """
+        # ── 1. Dedicated module flow ───────────────────────────────────
+        if module_name in _MODULE_CLASS_MAP:
+            return await self._run_module(module_name, plan, input_context)
+
+        # ── 2. Generic plan step-loop (model-only or multi-tool) ──────
+        if plan and isinstance(plan, ExecutionPlan):
+            return await self._run_plan(plan, input_context)
+
+        # ── 3. Bare LLM call (no plan, no module) ─────────────────────
+        return await self._fallback_model_call(input_context)
+
+    # ──────────────────────────────────────────────────────────────────────
+    #  Module dispatch
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _get_module(self, module_name: str) -> Any:
+        """Lazily import and cache the module class instance."""
+        if module_name not in self._module_cache:
+            mod_path, class_name = _MODULE_CLASS_MAP[module_name]
+            mod = importlib.import_module(mod_path)
+            cls = getattr(mod, class_name)
+
+            # Inject only the dependencies that the class accepts
+            import inspect
+            init_params = inspect.signature(cls.__init__).parameters
+            kwargs: Dict[str, Any] = {}
+            if "model_router" in init_params:
+                kwargs["model_router"] = self.model_router
+            if "backend_client" in init_params:
+                # Manufacture a thin wrapper that matches the module interface
+                from app.services.backend_client import tool_execution_client
+                kwargs["backend_client"] = tool_execution_client
+
+            self._module_cache[module_name] = cls(**kwargs)
+            logger.info("PlanExecutor: loaded module '%s'.", module_name)
+
+        return self._module_cache[module_name]
+
+    async def _run_module(
+        self,
+        module_name: str,
+        plan: Any,
+        input_context: AgentInput,
+    ) -> AgentOutput:
+        """Instantiate (or fetch from cache) and run the named module."""
+        logger.info("PlanExecutor: dispatching to module '%s'.", module_name)
+        try:
+            module = self._get_module(module_name)
+            return await module.run(input_context, plan)
+        except Exception as exc:
+            logger.error(
+                "PlanExecutor: module '%s' raised an error: %s",
+                module_name,
+                exc,
+                exc_info=True,
+            )
+            return AgentOutput(
+                status="failed",
+                response=f"Module '{module_name}' failed: {exc}",
+            )
+
+    # ──────────────────────────────────────────────────────────────────────
+    #  Generic step-loop (fallback for multi-tool / model-only plans)
+    # ──────────────────────────────────────────────────────────────────────
+
+    async def _run_plan(
+        self, plan: ExecutionPlan, input_context: AgentInput
+    ) -> AgentOutput:
+        """Execute a generic ExecutionPlan step by step."""
+        if not plan.is_executable:
+            return AgentOutput(
+                status="failed",
+                response="Plan is marked as non-executable.",
+            )
+
+        execution_results: Dict[int, Any] = {}
+        successful_steps = 0
+        ordered_steps = sorted(plan.steps, key=lambda s: s.step_id)
+
+        for step in ordered_steps:
+            logger.info(
+                "PlanExecutor: step_id=%s action=%s", step.step_id, step.action
+            )
+            payload = self._interpolate(step.input_payload, execution_results)
+
+            try:
+                if step.action == "tool":
+                    result = await self.backend_execution_func(
+                        step.tool_name,
+                        payload,
+                        input_context.auth_header,
+                        input_context.user_id,
+                    )
+                elif step.action == "model":
+                    prompt = payload.get("prompt", str(payload))
+                    sys_inst = payload.get("system_instruction", "")
+                    text = await self.model_router.generate(
+                        prompt=prompt, system_instruction=sys_inst
+                    )
+                    result = {"output": text}
+                elif step.action == "agent_module":
+                    result_out = await self._run_module(
+                        step.module_name or "", plan, input_context
+                    )
+                    result = {"output": result_out.response, "data": result_out.data}
+                else:
+                    result = {"skipped": True, "reason": f"Unknown action '{step.action}'"}
+
+                execution_results[step.step_id] = result
+
+                if isinstance(result, dict) and "error" in result:
+                    return AgentOutput(
+                        status="partial_failure",
+                        response=f"Halted at step {step.step_id}: {result['error']}",
+                        data={"results": execution_results},
+                    )
+                successful_steps += 1
+
+            except Exception as exc:
+                return AgentOutput(
+                    status="failed",
+                    response=f"Step {step.step_id} failed: {exc}",
+                    data={"error": str(exc)},
+                )
+
+        return AgentOutput(
+            status="success",
+            response=plan.goal_summary or f"Executed {successful_steps} steps.",
+            data={"results": execution_results},
+        )
+
+    async def _fallback_model_call(self, input_context: AgentInput) -> AgentOutput:
+        """Pure LLM call when there's no plan and no module."""
+        if not self.model_router:
+            return AgentOutput(status="failed", response="No model router available.")
+
+        response = await self.model_router.generate(
+            prompt=input_context.message,
+            system_instruction="You are a helpful AI assistant.",
+        )
+        return AgentOutput(
+            status="success",
+            response=response or "I could not generate a response.",
+        )
+
+    # ──────────────────────────────────────────────────────────────────────
+    #  Helpers
+    # ──────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _interpolate(
+        payload: Dict[str, Any], results: Dict[int, Any]
+    ) -> Dict[str, Any]:
+        """Replace {{step_X.output}} tokens in payload string values."""
         pattern = re.compile(r"\{\{step_(\d+)\.output\}\}")
-        
+        out: Dict[str, Any] = {}
         for k, v in payload.items():
             if isinstance(v, str):
                 match = pattern.search(v)
                 if match:
                     step_id = int(match.group(1))
-                    if step_id in results:
-                        # Simple replacement if it's the exact string, otherwise string inject
-                        if v.strip() == f"{{{{step_{step_id}.output}}}}":
-                            interpolated[k] = results[step_id]
-                        else:
-                            interpolated[k] = v.replace(f"{{{{step_{step_id}.output}}}}", str(results[step_id]))
-                    else:
-                        interpolated[k] = v
+                    sub = results.get(step_id, v)
+                    out[k] = sub if v.strip() == match.group(0) else v.replace(match.group(0), str(sub))
                 else:
-                    interpolated[k] = v
-            # Very basic recursive dictionary handling could go here
+                    out[k] = v
             else:
-                interpolated[k] = v
-        return interpolated
-        
-    def _evaluate_condition(self, condition: str, results: Dict[int, Any]) -> bool:
-        """In a real safe environment, use ast.literal_eval or a safe expressions parser."""
-        # For demonstration purposes, we'll do a basic check assuming condition is empty or simple
-        if not condition:
-            return True
-        logger.warning(f"Condition evaluation skipped for safety: {condition}")
-        return True # Default to true for now, would need safe eval
-    
-    async def execute(self, plan: ExecutionPlan, input_context: AgentInput) -> AgentOutput:
-        """Executes a structured plan step-by-step securely."""
-        logger.info(f"Starting execution of plan: {plan.goal_summary}")
-        
-        if not plan.is_executable:
-            return AgentOutput(
-                status="failed",
-                response="The generated plan is marked as non-executable.",
-                data={"plan": plan.model_dump()}
-            )
-
-        execution_results: Dict[int, Any] = {}
-        pre_step_results: List[Any] = []
-
-        # 1. Execute Pre-Execution Steps (Tool Gates)
-        for pre_step in plan.pre_execution_steps:
-            logger.info(f"Executing Pre-Execution Step: {pre_step.tool}")
-            try:
-                res = await self.backend_execution_func(
-                    pre_step.tool,
-                    pre_step.input_payload,
-                    input_context.auth_header,
-                    input_context.user_id
-                )
-                pre_step_results.append(res)
-                
-                if res and isinstance(res, dict) and "error" in res:
-                    return AgentOutput(
-                        status="failed",
-                        response=f"Pre-execution step '{pre_step.tool}' failed: {res['error']}",
-                        data={"pre_step_results": pre_step_results}
-                    )
-            except Exception as e:
-                logger.error(f"Pre-execution step {pre_step.tool} failed: {e}")
-                return AgentOutput(
-                    status="failed",
-                    response=f"Pre-execution step '{pre_step.tool}' crashed.",
-                    data={"error": str(e)}
-                )
-
-        # 2. Specialized Intent Flow: generate_exam
-        if plan.intent == "generate_exam" and plan.exam_params:
-            return await self._execute_generate_exam(plan, input_context, pre_step_results)
-
-        # 3. Standard Step Loop (Fallback / Generic Plans)
-        if not plan.steps:
-            return AgentOutput(
-                status="success",
-                response=plan.goal_summary,
-                data={"pre_step_results": pre_step_results}
-            )
-
-        successful_steps = 0
-        ordered_steps = sorted(plan.steps, key=lambda x: x.step_id)
-        
-        for step in ordered_steps:
-            # Check conditions
-            if step.condition and not self._evaluate_condition(step.condition, execution_results):
-                logger.info(f"Skipping Step {step.step_id} due to condition -> False")
-                execution_results[step.step_id] = {"skipped": True}
-                continue
-                
-            logger.info(f"Executing Step {step.step_id} - Action: {step.action}")
-            interpolated_payload = self._interpolate_payload(step.input_payload, execution_results)
-            
-            # ... (rest of implementation remains similar but wrapped in try/except)
-            try:
-                if step.action == "tool":
-                    result = await self.backend_execution_func(
-                        step.tool_name, interpolated_payload, input_context.auth_header, input_context.user_id
-                    )
-                elif step.action == "model":
-                    prompt = interpolated_payload.get("prompt", str(interpolated_payload))
-                    sys_inst = interpolated_payload.get("system_instruction", "")
-                    text_result = await self.model_router.generate(prompt=prompt, system_instruction=sys_inst)
-                    result = {"output": text_result}
-                elif step.action == "agent_module":
-                    module = self.module_registry[step.module_name]
-                    mi = AgentInput(message=interpolated_payload.get("message"), user_id=input_context.user_id, auth_header=input_context.auth_header)
-                    mo = await module.run(mi)
-                    result = {"status": mo.status, "output": mo.response, "data": mo.data}
-                
-                execution_results[step.step_id] = result
-                if result and isinstance(result, dict) and "error" in result:
-                     return AgentOutput(status="partial_failure", response=f"Halted at step {step.step_id}.", data={"results": execution_results})
-                successful_steps += 1
-            except Exception as e:
-                 return AgentOutput(status="failed", response=f"Step {step.step_id} failed.", data={"error": str(e)})
-
-        return AgentOutput(status="success", response=f"Executed {successful_steps} steps.", data={"results": execution_results})
-
-    async def _execute_generate_exam(self, plan: ExecutionPlan, input_context: AgentInput, pre_results: List[Any]) -> AgentOutput:
-        """Specific workflow for complex exam generation."""
-        params = plan.exam_params
-        
-        # A. Resolve subjectOfferingId
-        subject_offering_id = params.subjectOfferingId
-        if not subject_offering_id:
-            # Try to find it in pre-results (from ResolveSubjectOffering)
-            for res in pre_results:
-                if isinstance(res, dict) and "subjectOfferingId" in res:
-                    subject_offering_id = res["subjectOfferingId"]
-                    break
-        
-        if not subject_offering_id:
-            return AgentOutput(status="failed", response="Could not resolve subjectOfferingId.")
-
-        # B. Generate Exam Content via LLM
-        logger.info("PlanExecutor: generating exam content via Gemini")
-        prompt = (
-            f"Generate a {params.examType} exam for {params.subjectName} ({params.departmentName}, {params.collegeName}).\n"
-            f"Batch: {params.batchName}. Number of questions: {params.numberOfQuestions}.\n"
-            f"Focus on core curriculum topics."
-        )
-        sys_inst = (
-            "You are a professional academic examiner. Generate a structured exam with clear questions.\n"
-            "Return JSON matching this schema:\n"
-            "{\n"
-            "  \"title\": \"Exam Title\",\n"
-            "  \"questions\": [\n"
-            "    { \"questionText\": \"...\", \"correctAnswer\": \"...\", \"mark\": 5 }\n"
-            "  ]\n"
-            "}"
-        )
-        
-        exam_json = await self.model_router.generate_structured_json(
-            prompt=prompt,
-            system_instruction=sys_inst,
-            model_id="gemini-2.5-flash"
-        )
-        
-        if not exam_json:
-            return AgentOutput(status="failed", response="Gemini failed to generate valid exam JSON.")
-
-        # C. Call Backend tool CreateGeneratedExam
-        logger.info(f"PlanExecutor: calling CreateGeneratedExam for offering {subject_offering_id}")
-        tool_payload = {
-            "subjectOfferingId": subject_offering_id,
-            "examData": exam_json,
-            "handleStudentRandomization": (params.variationMode == "different_per_student")
-        }
-        
-        backend_result = await self.backend_execution_func(
-            "CreateGeneratedExam",
-            tool_payload,
-            input_context.auth_header,
-            input_context.user_id
-        )
-        
-        if backend_result and "error" in backend_result:
-            return AgentOutput(status="failed", response=f"Backend failed to create exam: {backend_result['error']}")
-            
-        return AgentOutput(
-            status="success",
-            response=f"Successfully generated and created the {params.examType} exam for {params.subjectName}.",
-            data={"backend_payload": tool_payload, "backend_result": backend_result}
-        )
-
+                out[k] = v
+        return out

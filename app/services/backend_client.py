@@ -94,6 +94,65 @@ class ToolExecutionClient:
             logger.error("Unexpected error executing backend tool: %s", str(e), exc_info=True)
             return {"error": f"Unexpected execution error: {str(e)}"}
 
+    async def fetch(
+        self,
+        route: str,
+        auth_header: Optional[str],
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        HTTP GET against a .NET backend route.
+
+        Used by modules that need to *read* data (materials, results, etc.)
+        rather than trigger an action.
+
+        Parameters
+        ----------
+        route : str
+            Backend path, e.g. "/api/Materials/by-offering/42".
+        auth_header : str | None
+            Forwarded JWT so the backend can authorise the request.
+        params : dict | None
+            Optional query-string parameters.
+        """
+        if not self.base_url:
+            logger.error("BACKEND_BASE_URL is not set. Cannot fetch data.")
+            return {"error": "Backend URL configuration missing"}
+
+        url = f"{self.base_url}{route}"
+        headers = {}
+        if auth_header:
+            headers["Authorization"] = auth_header
+
+        logger.info("BackendClient GET url=%s params=%s", url, params)
+
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    url,
+                    headers=headers,
+                    params=params or {},
+                    timeout=30.0,
+                )
+                response.raise_for_status()
+                # Some endpoints return plain text / bytes (e.g. file download)
+                content_type = response.headers.get("content-type", "")
+                if "application/json" in content_type:
+                    return response.json()
+                # Return raw bytes under a known key for file-like responses
+                return {"_raw_bytes": response.content, "content_type": content_type}
+
+        except httpx.HTTPStatusError as e:
+            text = e.response.text
+            logger.error("Backend GET returned HTTP %s: %s", e.response.status_code, text)
+            return {"error": f"Backend HTTP error {e.response.status_code}: {text}"}
+        except httpx.RequestError as e:
+            logger.error("Network error fetching from backend at %s: %s", url, str(e))
+            return {"error": f"Network error: {str(e)}"}
+        except Exception as e:
+            logger.error("Unexpected error in BackendClient.fetch: %s", str(e), exc_info=True)
+            return {"error": f"Unexpected error: {str(e)}"}
+
 
 # Export a singleton instance.
 tool_execution_client = ToolExecutionClient()

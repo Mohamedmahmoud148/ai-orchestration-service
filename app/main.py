@@ -3,8 +3,8 @@ main.py
 
 Application entry point.
 
-The OrchestrationPipeline is assembled ONCE here at startup and stored in
-app.state.pipeline.  Every endpoint reads it from there via the app state —
+The Agent is assembled ONCE here at startup and stored in app.state.agent.
+Every endpoint reads it from there via the app state —
 no circular imports, no global singletons, no tight coupling.
 """
 
@@ -14,20 +14,21 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from google import genai
 
+from app.agents.agent import Agent
 from app.agents.executor import PlanExecutor
 from app.agents.model_router import ModelRouter
-from app.agents.pipeline import OrchestrationPipeline
 from app.agents.planner import PlannerAgent
 
 from app.api.routes import chat, health
 from app.core.config import settings
 from app.core.logging import logger, setup_logging
 from app.services.backend_client import tool_execution_client
+from app.services.model_service import local_model_service
 from app.services.tool_registry import tool_registry
 
 
 # ─────────────────────────────────────────────────────────────
-#  Lifespan: build pipeline once, tear down cleanly
+#  Lifespan: build Agent once, tear down cleanly
 # ─────────────────────────────────────────────────────────────
 
 @asynccontextmanager
@@ -36,37 +37,41 @@ async def lifespan(app: FastAPI):
     setup_logging()
     logger.info("Starting AI Orchestration Service (env=%s)", settings.ENVIRONMENT)
 
-    # ── LLM clients ──────────────────────────────────────────
+    # ── Cloud LLM clients ──────────────────────────────────────
     gemini_client = None
     if settings.GEMINI_API_KEY:
         gemini_client = genai.Client(api_key=settings.GEMINI_API_KEY)
         logger.info("Gemini client initialised.")
     else:
-        logger.warning("GEMINI_API_KEY not set — LLM calls will fail.")
+        logger.warning("GEMINI_API_KEY not set — cloud LLM calls will fail.")
 
-    # ── Component assembly ───────────────────────────────────
-    model_router = ModelRouter(gemini_client=gemini_client)
-    planner = PlannerAgent(model_router=model_router, ranker=None)  # ranker is optional
+    # ── Component assembly ────────────────────────────────────
+    model_router = ModelRouter(
+        gemini_client=gemini_client,
+        local_model_service=local_model_service,   # HuggingFace local models
+    )
+
+    planner = PlannerAgent(model_router=model_router, ranker=None)
 
     executor = PlanExecutor(
         backend_execution_func=tool_execution_client.execute_tool,
         model_router=model_router,
     )
 
-    # ── Pipeline (single instance for the lifetime of the app) ──
-    app.state.pipeline = OrchestrationPipeline(
+    # ── Agent (single instance for the lifetime of the app) ───
+    app.state.agent = Agent(
         planner=planner,
         tool_registry=tool_registry,
         model_router=model_router,
         executor=executor,
     )
 
-    logger.info("OrchestrationPipeline ready.")
+    logger.info("Agent ready — flow: User → Agent → Planner → Module → Response")
     yield
 
-    # ── Shutdown ─────────────────────────────────────────────
+    # ── Shutdown ──────────────────────────────────────────────
     logger.info("Shutting down AI Orchestration Service.")
-    app.state.pipeline = None
+    app.state.agent = None
 
 
 # ─────────────────────────────────────────────────────────────
@@ -76,7 +81,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="AI Orchestration Service",
     description="FastAPI service orchestrating AI pipelines to .NET backend execution.",
-    version="2.0.0",
+    version="3.0.0",
     lifespan=lifespan,
 )
 

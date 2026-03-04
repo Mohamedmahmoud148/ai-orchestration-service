@@ -2,22 +2,27 @@ import json
 from typing import Optional, Any
 from app.core.logging import logger
 
+
 class ModelRouter:
     """
-    Abstracts LLM selection away from the agents, allowing future
-    integration of OpenAI, Claude, or local specific fine-tunes.
+    Abstracts LLM selection away from agents and modules.
+    Supports Gemini, OpenAI, Anthropic (cloud), and HuggingFace (local) models.
+
+    Local models are addressed with the 'hf/' prefix, e.g. 'hf/TinyLlama'.
+    Any other model_id is dispatched to the appropriate cloud client.
     """
     def __init__(
-        self, 
+        self,
         gemini_client: Optional[Any] = None,
         openai_client: Optional[Any] = None,
-        anthropic_client: Optional[Any] = None
+        anthropic_client: Optional[Any] = None,
+        local_model_service: Optional[Any] = None,
     ):
-        """Pass pre-configured clients via DI"""
         self.gemini_client = gemini_client
         self.openai_client = openai_client
         self.anthropic_client = anthropic_client
-        
+        self.local_model_service = local_model_service
+
     async def generate_structured_json(
         self, 
         prompt: str, 
@@ -28,7 +33,15 @@ class ModelRouter:
         logger.debug(f"Routing request to model: {model_id}")
         
         try:
-            if "gemini" in model_id.lower() and self.gemini_client:
+            # ── HuggingFace (local) ──────────────────────────────────────────
+            if model_id.startswith("hf/") and self.local_model_service:
+                return await self.local_model_service.generate_structured_json(
+                    prompt=prompt,
+                    system_instruction=system_instruction,
+                )
+
+            # ── Gemini ──────────────────────────────────────────────────────
+            elif "gemini" in model_id.lower() and self.gemini_client:
                 from google.genai import types
                 response = await self.gemini_client.aio.models.generate_content(
                     model=model_id,
@@ -42,7 +55,6 @@ class ModelRouter:
                     return json.loads(response.text)
                     
             elif ("gpt" in model_id.lower() or "o1" in model_id.lower() or "o3" in model_id.lower()) and self.openai_client:
-                # Assuming openai_client is an AsyncOpenAI instance
                 response = await self.openai_client.chat.completions.create(
                     model=model_id,
                     messages=[
@@ -56,8 +68,6 @@ class ModelRouter:
                     return json.loads(content)
                     
             elif "claude" in model_id.lower() and self.anthropic_client:
-                # Anthropic doesn't have a strict JSON mode flag built-in the same way, 
-                # but we can instruct it and parse
                 response = await self.anthropic_client.messages.create(
                     model=model_id,
                     max_tokens=4096,
@@ -88,10 +98,18 @@ class ModelRouter:
         system_instruction: str = "",
         model_id: str = "gemini-2.5-flash"
     ) -> str | None:
-        """Standard text generation."""
+        """Standard text generation — dispatches to cloud or local HuggingFace model."""
         logger.debug(f"Routing text generation to model: {model_id}")
         try:
-            if "gemini" in model_id.lower() and self.gemini_client:
+            # ── HuggingFace (local) ────────────────────────────────────────
+            if model_id.startswith("hf/") and self.local_model_service:
+                return await self.local_model_service.generate_text(
+                    prompt=prompt,
+                    system_instruction=system_instruction,
+                )
+
+            # ── Gemini ─────────────────────────────────────────────────
+            elif "gemini" in model_id.lower() and self.gemini_client:
                 from google.genai import types
                 response = await self.gemini_client.aio.models.generate_content(
                     model=model_id,
