@@ -28,7 +28,7 @@ from app.services.tool_registry import tool_registry
 
 
 # ─────────────────────────────────────────────────────────────
-#  Lifespan: build Agent once, tear down cleanly
+#  Lifespan: validate config, build Agent, tear down cleanly
 # ─────────────────────────────────────────────────────────────
 
 @asynccontextmanager
@@ -37,18 +37,39 @@ async def lifespan(app: FastAPI):
     setup_logging()
     logger.info("Starting AI Orchestration Service (env=%s)", settings.ENVIRONMENT)
 
-    # ── Cloud LLM clients ──────────────────────────────────────
-    gemini_client = None
-    if settings.GEMINI_API_KEY:
-        gemini_client = genai.Client(api_key=settings.GEMINI_API_KEY)
-        logger.info("Gemini client initialised.")
-    else:
-        logger.warning("GEMINI_API_KEY not set — cloud LLM calls will fail.")
+    # ── 1. Startup Validation — fail fast, fail loud ──────────────────
+    if not settings.BACKEND_BASE_URL:
+        raise RuntimeError(
+            "STARTUP FAILED: BACKEND_BASE_URL is not set. "
+            "The AI service cannot communicate with the .NET backend. "
+            "Set BACKEND_BASE_URL in your .env file (e.g. http://localhost:5000) "
+            "and restart."
+        )
+    logger.info("Backend URL: %s", settings.BACKEND_BASE_URL)
 
-    # ── Component assembly ────────────────────────────────────
+    if not settings.GEMINI_API_KEY:
+        raise RuntimeError(
+            "STARTUP FAILED: GEMINI_API_KEY is not set. "
+            "The Planner requires a valid Gemini API key. "
+            "Set GEMINI_API_KEY in your .env file and restart."
+        )
+    logger.info("Gemini API key: configured.")
+
+    # Confirm BackendClient singleton initialised correctly.
+    # (ToolExecutionClient.__init__ raises RuntimeError if URL is missing;
+    #  this is a belt-and-suspenders log confirming it is alive.)
+    logger.info(
+        "ToolExecutionClient ready (base_url=%s).", tool_execution_client.base_url
+    )
+
+    # ── 2. Cloud LLM client ────────────────────────────────────────────
+    gemini_client = genai.Client(api_key=settings.GEMINI_API_KEY)
+    logger.info("Gemini client initialised.")
+
+    # ── 3. Component assembly ─────────────────────────────────────────
     model_router = ModelRouter(
         gemini_client=gemini_client,
-        local_model_service=local_model_service,   # HuggingFace local models
+        local_model_service=local_model_service,
     )
 
     planner = PlannerAgent(model_router=model_router, ranker=None)
@@ -58,7 +79,7 @@ async def lifespan(app: FastAPI):
         model_router=model_router,
     )
 
-    # ── Agent (single instance for the lifetime of the app) ───
+    # ── 4. Agent (single instance for the lifetime of the app) ────────
     app.state.agent = Agent(
         planner=planner,
         tool_registry=tool_registry,
@@ -69,7 +90,7 @@ async def lifespan(app: FastAPI):
     logger.info("Agent ready — flow: User → Agent → Planner → Module → Response")
     yield
 
-    # ── Shutdown ──────────────────────────────────────────────
+    # ── Shutdown ───────────────────────────────────────────────────────
     logger.info("Shutting down AI Orchestration Service.")
     app.state.agent = None
 

@@ -32,6 +32,20 @@ if TYPE_CHECKING:
     from app.services.tool_registry import ToolRegistry
 
 
+# ── Role-based intent mapping ──────────────────────────────────────────────────
+ROLE_PERMITTED_INTENTS = {
+    "student": {"general_chat", "summarization", "result_query", "file_extraction"},
+    "doctor": {"general_chat", "summarization", "generate_exam", "file_extraction"},
+    "admin": {
+        "general_chat",
+        "summarization",
+        "generate_exam",
+        "result_query",
+        "file_extraction",
+    },
+}
+
+
 class Agent:
     """
     Main AI orchestrator.  Accepts an ExecutionContext, drives the pipeline,
@@ -73,6 +87,21 @@ class Agent:
         # ── Stage 1: Planning ─────────────────────────────────────────────
         plan = await self._plan(context)
 
+        # ── INTERCEPTION: Role-based intent validation ───────────────────
+        if not self._validate_role_permissions(context):
+            # If validation failed, _validate_role_permissions has already
+            # overridden the intent and set the permission-denied response.
+            # We skip the rest of the pipeline.
+            elapsed = round(time.perf_counter() - pipeline_start, 4)
+            context.add_metadata("agent_duration_seconds", elapsed)
+            logger.warning(
+                "[Agent] Permission denied: role %r is not allowed to trigger intent %r. "
+                "Returning fallback response.",
+                context.role,
+                context.metadata.get("attempted_intent"),
+            )
+            return context
+
         # ── Stage 2: Model Routing ────────────────────────────────────────
         self._route_model(context)
 
@@ -92,6 +121,32 @@ class Agent:
             elapsed,
         )
         return context
+
+    def _validate_role_permissions(self, context: ExecutionContext) -> bool:
+        """
+        Verify that the role is allowed to trigger the detected intent.
+        Returns True if permitted, False otherwise.
+        """
+        role = context.role or "student"
+        intent = context.intent or "general_chat"
+
+        allowed = ROLE_PERMITTED_INTENTS.get(role, set())
+
+        if intent not in allowed:
+            # INTERCEPT: mark the original intent for logging/debug
+            context.add_metadata("attempted_intent", intent)
+
+            # OVERRIDE: downgrade to general_chat and stop execution
+            context.set_intent("general_chat")
+            context.set_result(
+                f"I'm sorry, but as a {role}, I don't have permission to perform that specific task "
+                f"({intent.replace('_', ' ')}). I can only help you with: "
+                f"{', '.join(i.replace('_', ' ') for i in allowed)}."
+            )
+            return False
+
+        return True
+
 
     # ──────────────────────────────────────────────────────────────────────
     #  Internal stages

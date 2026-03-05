@@ -149,3 +149,68 @@ class ModelRouter:
             logger.error(f"Error in ModelRouter text generation for {model_id}: {e}")
             return None
 
+    async def summarize(
+        self,
+        text: str,
+        model_id: Optional[str] = None,
+        max_length: int = 300,
+    ) -> str:
+        """
+        Summarise text using the provided model_id or a task-optimized default.
+        """
+        target_model = model_id or "hf/facebook/bart-large-cnn"
+        logger.info("ModelRouter.summarize: using model=%s", target_model)
+
+        if target_model.startswith("hf/") and self.local_model_service:
+            return await self.local_model_service.summarize(text, max_length=max_length)
+
+        # Build a summarization prompt for cloud models
+        prompt = (
+            "Provide a concise, bullet-point summary of the following text. "
+            "Focus on the key points and ignore minor details.\n\n"
+            f"TEXT:\n{text[:4000]}"
+        )
+        system_instruction = "You are a professional summarization assistant."
+
+        result = await self.generate(
+            prompt=prompt,
+            system_instruction=system_instruction,
+            model_id=target_model,
+        )
+        return result or ""
+
+    async def generate_questions(
+        self,
+        text: str,
+        num_questions: int = 5,
+        model_id: Optional[str] = None,
+    ) -> str:
+        """
+        Generate questions from text using the provided model_id or a task-optimized default.
+        """
+        target_model = model_id or "hf/google/flan-t5-base"
+        logger.info("ModelRouter.generate_questions: using model=%s", target_model)
+
+        if target_model.startswith("hf/") and self.local_model_service:
+            # Map standard model names to specific local service methods if needed
+            return await self.local_model_service.generate_questions(
+                text, num_questions=num_questions
+            )
+
+        # Build a question generation prompt for cloud models
+        prompt = (
+            f"Based on the text below, generate {num_questions} clear and challenging "
+            "university-level exam questions.\n\n"
+            f"TEXT:\n{text[:4000]}"
+        )
+        system_instruction = (
+            "You are an expert educator. Generate academic questions based strictly on the provided text. "
+            "Return the questions as a simple list."
+        )
+
+        result = await self.generate(
+            prompt=prompt,
+            system_instruction=system_instruction,
+            model_id=target_model,
+        )
+        return result or ""

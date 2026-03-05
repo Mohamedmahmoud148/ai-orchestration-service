@@ -95,11 +95,20 @@ class SummarizationModule:
                 response="SummarizationModule: no content to summarise.",
             )
 
-        # -- 3. Summarise via BART --------------------------------------------
-        from app.services.model_service import local_model_service
+        # -- 3. Summarise via ModelRouter --------------------------------------
+        selected_model = context.get("selected_model")
+        
+        # Guard: Prefer task-optimized BART for summarization unless explicitly requested otherwise
+        target_model = selected_model
+        if not selected_model or not selected_model.startswith("hf/"):
+             target_model = "hf/facebook/bart-large-cnn"
+             logger.info(
+                 "SummarizationModule: overriding pipeline model '%s' with task-optimized 'hf/facebook/bart-large-cnn'.",
+                 selected_model or "default"
+             )
 
         logger.info("SummarizationModule: summarising %d chars.", len(material_text))
-        summary = await local_model_service.summarize(material_text)
+        summary = await self.model_router.summarize(material_text, model_id=target_model)
 
         if not summary:
             return AgentOutput(status="failed", response="Summarization failed.")
@@ -111,5 +120,10 @@ class SummarizationModule:
         return AgentOutput(
             status="success",
             response=bullets or summary,
-            data={"module": "SummarizationModule", "char_count": len(material_text)},
+            data={
+                "module": "SummarizationModule", 
+                "char_count": len(material_text),
+                "model_used": target_model
+            },
         )
+

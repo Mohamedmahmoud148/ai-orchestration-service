@@ -73,6 +73,8 @@ class ResultQueryModule:
                 result_data = result
 
         # -- 3. Build explanation with LLM ------------------------------------
+        selected_model = context.get("selected_model") or "gemini-2.5-flash"
+        
         if result_data:
             data_str = str(result_data)
             prompt   = (
@@ -94,15 +96,16 @@ class ResultQueryModule:
                 "Explain exam results clearly, highlight strengths and areas for improvement, "
                 "and give encouragement. Be concise (2-4 sentences)."
             ),
-            model_id="gemini-2.5-flash",
+            model_id=selected_model,
         )
 
-        if not explanation:
-            # Local model fallback
-            from app.services.model_service import local_model_service
-            explanation = await local_model_service.generate_text(
+        # Automatic fallback to local TinyLlama if generation failed or returned empty
+        if not explanation and not selected_model.startswith("hf/"):
+            logger.info("ResultQueryModule: cloud generation failed, falling back to hf/TinyLlama")
+            explanation = await self.model_router.generate(
                 prompt=prompt,
                 system_instruction="You are a friendly academic advisor explaining exam results.",
+                model_id="hf/TinyLlama/TinyLlama-1.1B-Chat-v1.0"
             )
 
         return AgentOutput(
@@ -112,5 +115,7 @@ class ResultQueryModule:
                 "module": "ResultQueryModule",
                 "exam_id": exam_id,
                 "raw_result": result_data,
+                "model_used": selected_model
             },
         )
+

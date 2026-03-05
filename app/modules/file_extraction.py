@@ -124,6 +124,8 @@ class FileExtractionModule:
         logger.info("FileExtractionModule: extracted %d chars from '%s'.", len(raw_text), file_name)
 
         # -- 3. Optional LLM cleanup ------------------------------------------
+        selected_model = context.get("selected_model") or "gemini-2.5-flash"
+
         cleaned = await self.model_router.generate(
             prompt=(
                 "Clean and structure the following extracted document text. "
@@ -132,7 +134,7 @@ class FileExtractionModule:
                 + raw_text[:4000]
             ),
             system_instruction="You are a document processing assistant.",
-            model_id="gemini-2.5-flash",
+            model_id=selected_model,
         )
 
         return AgentOutput(
@@ -143,5 +145,7 @@ class FileExtractionModule:
                 "file_name": file_name,
                 "char_count": len(raw_text),
                 "raw_preview": raw_text[:500],
+                "model_used": selected_model
             },
         )
+

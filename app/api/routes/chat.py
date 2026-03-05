@@ -57,7 +57,7 @@ async def chat_endpoint(request: ChatRequest, fastapi_request: Request):
 
     # ── Build context ─────────────────────────────────────────
     context = ExecutionContext(
-        user_id=request.user_id or "anonymous",
+        user_id=request.user_id,
         role=request.role,
         message=request.message,
         conversation_id=request.conversation_id or "",

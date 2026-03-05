@@ -81,14 +81,24 @@ class ExamGenerationModule:
         if not material_text:
             material_text = agent_input.message or f"General {exam_type} exam for {subject}."
 
-        # -- 3. Generate questions via Flan-T5 --------------------------------
-        from app.services.model_service import local_model_service
+        # -- 3. Generate questions via ModelRouter ----------------------------
+        selected_model = context.get("selected_model")
+
+        # Guard: Prefer task-optimized Flan-T5 for exam generation unless explicitly requested otherwise
+        target_model = selected_model
+        if not selected_model or not selected_model.startswith("hf/"):
+            target_model = "hf/google/flan-t5-base"
+            logger.info(
+                "ExamGenerationModule: overriding pipeline model '%s' with task-optimized 'hf/google/flan-t5-base'.",
+                selected_model or "default"
+            )
 
         logger.info(
-            "ExamGenerationModule: generating %d questions for '%s'.", num_q, subject
+            "ExamGenerationModule: generating %d questions for '%s' using %s.", 
+            num_q, subject, target_model
         )
-        raw_questions = await local_model_service.generate_questions(
-            material_text, num_questions=num_q
+        raw_questions = await self.model_router.generate_questions(
+            material_text, num_questions=num_q, model_id=target_model
         )
 
         # Build structured list from the raw output
@@ -126,8 +136,10 @@ class ExamGenerationModule:
                 "module": "ExamGenerationModule",
                 "questions": questions_list,
                 "backend_result": backend_result,
+                "model_used": target_model,
             },
         )
+
 
     # ------------------------------------------------------------------
     # Helpers
