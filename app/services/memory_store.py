@@ -13,8 +13,13 @@ class MemoryStore:
     """
 
     def __init__(self):
-        self.redis_url = settings.REDIS_URL
-        if self.redis_url:
+        url = settings.REDIS_URL.strip() if settings.REDIS_URL else None
+        if url:
+            url = url.strip('"').strip("'")
+            
+        self.redis_url = url
+        
+        if self.redis_url and self.redis_url.startswith(("redis://", "rediss://", "unix://")):
             # Reusable connection pool
             self.pool = redis.ConnectionPool.from_url(
                 self.redis_url,
@@ -23,7 +28,7 @@ class MemoryStore:
             self.redis_client = redis.Redis(connection_pool=self.pool)
         else:
             self.redis_client = None
-            logger.warning("REDIS_URL not configured. MemoryStore will act as a no-op.")
+            logger.warning(f"REDIS_URL not configured or missing scheme ('{self.redis_url}'). MemoryStore will act as a no-op.")
 
         self.ttl = 3600  # 1 hour
 
