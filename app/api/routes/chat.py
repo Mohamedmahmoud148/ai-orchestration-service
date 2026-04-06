@@ -13,7 +13,8 @@ This file must NEVER:
   - Contain if/else logic based on intent, role, or tool.
 """
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Depends
+from fastapi.security import HTTPBearer
 
 from app.agents.agent import Agent
 from app.agents.execution_context import ExecutionContext
@@ -26,7 +27,7 @@ from app.models.chat import ChatRequest, ChatResponse
 #  in app.state.agent.  The endpoint reads it from there.
 # ─────────────────────────────────────────────────────────────
 router = APIRouter()
-
+security = HTTPBearer(auto_error=False)
 
 def _get_agent(fastapi_request: Request) -> Agent:
     """Retrieve the pre-built Agent from FastAPI app state."""
@@ -37,7 +38,11 @@ def _get_agent(fastapi_request: Request) -> Agent:
 
 
 @router.post("/chat", response_model=ChatResponse, tags=["AI Chat"])
-async def chat_endpoint(request: ChatRequest, fastapi_request: Request):
+async def chat_endpoint(
+    request: ChatRequest, 
+    fastapi_request: Request,
+    token = Depends(security)
+):
     """
     Unified chat entry-point.
 
