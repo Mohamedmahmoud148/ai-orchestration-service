@@ -8,7 +8,7 @@ class Settings(BaseSettings):
     PORT: int = 8000
 
     # AI Config
-    GEMINI_API_KEY: str = ""
+    OPENAI_API_KEY: str = ""
 
     # Backend Config — REQUIRED.  The service cannot operate without this.
     BACKEND_BASE_URL: str = ""
@@ -35,10 +35,10 @@ class Settings(BaseSettings):
             )
         return v.rstrip("/")   # normalize: strip trailing slash once, at load time
 
-    @field_validator("GEMINI_API_KEY")
+    @field_validator("OPENAI_API_KEY")
     @classmethod
-    def _warn_gemini_key(cls, v: str) -> str:
-        """Gemini key is optional at config load but validated again at startup."""
+    def _warn_openai_key(cls, v: str) -> str:
+        """OpenAI key is optional at config load but validated again at startup."""
         return v
 
 

@@ -27,7 +27,7 @@ class ModelRouter:
         self, 
         prompt: str, 
         system_instruction: str, 
-        model_id: str = "gemini-2.5-flash"
+        model_id: str = "gpt-4o-mini"
     ) -> dict | None:
         """Centralized method for prompting language models for strict JSON outputs."""
         logger.debug(f"Routing request to model: {model_id}")
@@ -96,7 +96,7 @@ class ModelRouter:
         self,
         prompt: str,
         system_instruction: str = "",
-        model_id: str = "gemini-2.5-flash"
+        model_id: str = "gpt-4o-mini"
     ) -> str | None:
         """Standard text generation — dispatches to cloud or local HuggingFace model."""
         logger.debug(f"Routing text generation to model: {model_id}")

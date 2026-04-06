@@ -274,11 +274,11 @@ class Agent:
     def _route_model(self, context: ExecutionContext) -> None:
         """Stage 2 — pick the target LLM based on role."""
         role_map = {
-            "admin": "gemini-2.5-pro",
-            "doctor": "gemini-2.5-flash",
-            "student": "gemini-2.5-flash",
+            "admin": "gpt-4o",
+            "doctor": "gpt-4o-mini",
+            "student": "gpt-4o-mini",
         }
-        model = role_map.get(context.role, "gemini-2.5-flash")
+        model = role_map.get(context.role, "gpt-4o-mini")
         context.set_model(model)
         logger.info("[Agent] stage=model_routing selected_model=%r", model)
 

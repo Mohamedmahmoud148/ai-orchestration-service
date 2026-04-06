@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from google import genai
+from openai import AsyncOpenAI
 
 from app.agents.agent import Agent
 from app.agents.executor import PlanExecutor
@@ -47,13 +47,13 @@ async def lifespan(app: FastAPI):
         )
     logger.info("Backend URL: %s", settings.BACKEND_BASE_URL)
 
-    if not settings.GEMINI_API_KEY:
+    if not settings.OPENAI_API_KEY:
         raise RuntimeError(
-            "STARTUP FAILED: GEMINI_API_KEY is not set. "
-            "The Planner requires a valid Gemini API key. "
-            "Set GEMINI_API_KEY in your .env file and restart."
+            "STARTUP FAILED: OPENAI_API_KEY is not set. "
+            "The Planner requires a valid OpenAI API key. "
+            "Set OPENAI_API_KEY in your .env file and restart."
         )
-    logger.info("Gemini API key: configured.")
+    logger.info("OpenAI API key: configured.")
 
     # Confirm BackendClient singleton initialised correctly.
     # (ToolExecutionClient.__init__ raises RuntimeError if URL is missing;
@@ -63,18 +63,17 @@ async def lifespan(app: FastAPI):
     )
 
     # ── 2. Cloud LLM client ────────────────────────────────────────────
-    gemini_client = genai.Client(api_key=settings.GEMINI_API_KEY)
-    logger.info("Gemini client initialised.")
+    openai_client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+    logger.info("OpenAI client initialised.")
 
     # ── 3. Component assembly ─────────────────────────────────────────
     model_router = ModelRouter(
-        gemini_client=gemini_client,
+        openai_client=openai_client,
         local_model_service=local_model_service,
     )
 
     planner = PlannerAgent(
         model_router=model_router,
-        gemini_client=gemini_client,
         ranker=None
     )
 

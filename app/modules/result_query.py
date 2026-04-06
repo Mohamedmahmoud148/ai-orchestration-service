@@ -73,7 +73,7 @@ class ResultQueryModule:
                 result_data = result
 
         # -- 3. Build explanation with LLM ------------------------------------
-        selected_model = context.get("selected_model") or "gemini-2.5-flash"
+        selected_model = context.get("selected_model") or "gpt-4o-mini"
         
         if result_data:
             data_str = str(result_data)

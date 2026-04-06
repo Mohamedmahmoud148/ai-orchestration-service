@@ -1,24 +1,23 @@
 import json
-from google import genai
-from google.genai import types
+from openai import AsyncOpenAI
 from app.core.config import settings
 from app.core.logging import logger
 from app.models.chat import AiIntent
 
 class AiService:
     def __init__(self):
-        # Initialize Gemini Client if API key is provided
-        if settings.GEMINI_API_KEY:
-            self.client = genai.Client(api_key=settings.GEMINI_API_KEY)
-            self.model_name = "gemini-2.5-flash"
+        # Initialize OpenAI Client if API key is provided
+        if settings.OPENAI_API_KEY:
+            self.client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+            self.model_name = "gpt-4o-mini"
         else:
             self.client = None
-            logger.warning("GEMINI_API_KEY is not set. AiService will not function correctly.")
+            logger.warning("OPENAI_API_KEY is not set. AiService will not function correctly.")
 
     async def determine_intent(self, message: str) -> AiIntent:
         if not self.client:
-            logger.error("Attempted to call Gemini without API key.")
-            return AiIntent(intent_name="Error", parameters={"error": "Gemini client not initialized. Check GEMINI_API_KEY."})
+            logger.error("Attempted to call OpenAI without API key.")
+            return AiIntent(intent_name="Error", parameters={"error": "OpenAI client not initialized. Check OPENAI_API_KEY."})
 
         system_instruction = (
             "You are an AI assistant routing user intents to backend tools.\n"

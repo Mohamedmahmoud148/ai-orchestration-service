@@ -1,19 +1,14 @@
 """
-app/agents/planner.py
+planner.py
 
-PlannerAgent — uses Gemini to classify the user's intent and produce
+PlannerAgent — uses the LLM to classify the user's intent and produce
 a validated ExecutionPlan that the Agent pipeline can consume.
-
-Gemini is called via the official google-generativeai SDK and the API key
-is read from the GEMINI_API_KEY environment variable at import time,
-matching the pattern requested in the project spec.
 """
 
 import json
 import os
 from typing import Optional, Protocol
 
-from google import genai
 from pydantic import ValidationError
 
 from app.agents.base_agent import BaseAgent
@@ -88,24 +83,18 @@ class MemoryStore(Protocol):
 
 class PlannerAgent(BaseAgent):
     """
-    Generates an ExecutionPlan by asking Gemini to classify the user's intent.
+    Generates an ExecutionPlan by asking the LLM to classify the user's intent.
 
-    The Gemini API key is read from GEMINI_API_KEY at module load.
-    The model_router dependency is kept for backward compatibility with
-    main.py's DI setup but is NOT used for the planning call — Gemini is
-    called directly so that planning is always available regardless of
-    which cloud clients the ModelRouter has configured.
+    The OpenAI client is accessed via the model_router.
     """
 
     def __init__(
         self,
         model_router,
-        gemini_client: genai.Client,
         ranker=None,
         memory: Optional[MemoryStore] = None,
     ):
         self.model_router = model_router
-        self.gemini_client = gemini_client
         self.ranker = ranker
         self.memory = memory
 
@@ -150,8 +139,8 @@ class PlannerAgent(BaseAgent):
             f"User message: {agent_input.message}"
         )
 
-        # ── Call Gemini ───────────────────────────────────────────────────
-        raw_json = await self._call_gemini(prompt)
+        # ── Call LLM (OpenAI) via ModelRouter ─────────────────────────────
+        raw_json = await self._call_planner_model(prompt)
 
         # ── Parse response → ExecutionPlan ────────────────────────────────
         plan = self._parse_plan(raw_json, agent_input)
@@ -173,44 +162,37 @@ class PlannerAgent(BaseAgent):
     #  Internal helpers
     # ─────────────────────────────────────────────────────────────────────
 
-    async def _call_gemini(self, prompt: str) -> dict | None:
+    async def _call_planner_model(self, prompt: str) -> dict | None:
         """
-        Send the prompt to Gemini and return the parsed JSON dict,
-        or None on any error.
+        Send the prompt to OpenAI via ModelRouter and return the parsed JSON dict,
+        or None on any error. Includes fallback to gpt-3.5-turbo.
         """
         try:
-            response = await self.gemini_client.models.generate_content(
-                model="gemini-2.0-flash",
-                contents=_SYSTEM_PROMPT + "\n\n" + prompt,
-                config={
-                    "response_mime_type": "application/json",
-                    "temperature": 0.1,
-                },
+            logger.debug("PlannerAgent: Requesting JSON from gpt-4o-mini")
+            parsed = await self.model_router.generate_structured_json(
+                prompt=prompt,
+                system_instruction=_SYSTEM_PROMPT,
+                model_id="gpt-4o-mini"
             )
-
-            text = response.text or ""
-            # Strip accidental markdown fences if present
-            text = text.strip()
-            if text.startswith("```"):
-                text = text.split("```")[1]
-                if text.startswith("json"):
-                    text = text[4:]
-                text = text.strip()
-
-            parsed = json.loads(text)
-            logger.debug("PlannerAgent: Gemini raw plan = %s", parsed)
+            
+            if not parsed:
+                logger.warning("PlannerAgent: gpt-4o-mini failed or returned empty. Falling back to gpt-3.5-turbo")
+                parsed = await self.model_router.generate_structured_json(
+                    prompt=prompt,
+                    system_instruction=_SYSTEM_PROMPT,
+                    model_id="gpt-3.5-turbo"
+                )
+                
+            logger.debug("PlannerAgent: Raw plan from model = %s", parsed)
             return parsed
 
-        except json.JSONDecodeError as exc:
-            logger.error("PlannerAgent: Gemini returned invalid JSON — %s", exc)
-            return None
         except Exception as exc:
-            logger.error("PlannerAgent: Gemini call failed — %s", exc, exc_info=True)
+            logger.error("PlannerAgent: Model call failed — %s", exc, exc_info=True)
             return None
 
     def _parse_plan(self, raw: dict | None, agent_input: AgentInput) -> ExecutionPlan:
         """
-        Convert raw Gemini output into a validated ExecutionPlan.
+        Convert raw LLM output into a validated ExecutionPlan.
         Falls back to a general_chat plan on any parse/validation error.
         """
         if not raw:

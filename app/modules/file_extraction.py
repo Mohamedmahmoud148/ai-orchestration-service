@@ -124,7 +124,7 @@ class FileExtractionModule:
         logger.info("FileExtractionModule: extracted %d chars from '%s'.", len(raw_text), file_name)
 
         # -- 3. Optional LLM cleanup ------------------------------------------
-        selected_model = context.get("selected_model") or "gemini-2.5-flash"
+        selected_model = context.get("selected_model") or "gpt-4o-mini"
 
         cleaned = await self.model_router.generate(
             prompt=(
