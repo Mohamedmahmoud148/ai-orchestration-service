@@ -27,14 +27,14 @@ class ExecutionStep(BaseModel):
 
 class ExamParams(BaseModel):
     """Typed parameters extracted from a doctor's exam-generation request."""
-    collegeName: str = Field(..., description="Name of the college/university")
-    departmentName: str = Field(..., description="Academic department name")
-    batchName: str = Field(..., description="Student batch / cohort name")
-    subjectName: str = Field(..., description="Name of the subject for the exam")
-    numberOfQuestions: int = Field(..., description="Total number of questions to generate")
-    examType: Literal["midterm", "final"] = Field(..., description="Type of exam: midterm or final")
-    variationMode: Literal["same_for_all", "different_per_student"] = Field(
-        ..., description="Whether all students receive the same exam or individual variations"
+    collegeName: Optional[str] = Field(None, description="Name of the college/university")
+    departmentName: Optional[str] = Field(None, description="Academic department name")
+    batchName: Optional[str] = Field(None, description="Student batch / cohort name")
+    subjectName: Optional[str] = Field(None, description="Name of the subject for the exam")
+    numberOfQuestions: Optional[int] = Field(None, description="Total number of questions to generate")
+    examType: Optional[Literal["midterm", "final"]] = Field(None, description="Type of exam: midterm or final")
+    variationMode: Optional[Literal["same_for_all", "different_per_student"]] = Field(
+        None, description="Whether all students receive the same exam or individual variations"
     )
     subjectOfferingId: Optional[str] = Field(
         None,
