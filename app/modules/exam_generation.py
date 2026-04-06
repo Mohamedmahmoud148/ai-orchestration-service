@@ -92,11 +92,38 @@ class ExamGenerationModule:
                             auth_header=agent_input.auth_header,
                             params={"subject": subject_name},
                         )
-                        offering_id = (
-                            res.get("subjectOfferingId")
-                            if res and "error" not in res
-                            else None
-                        )
+
+                        # ── Disambiguation: backend returned multiple matches ──────────
+                        if isinstance(res, list) and len(res) > 1:
+                            logger.info(
+                                "ExamGenerationModule: resolve-offering returned %d results "
+                                "— clarification required.", len(res)
+                            )
+                            return AgentOutput(
+                                status="clarification_needed",
+                                response="clarification_needed",
+                                data={
+                                    "options": res,
+                                    "original_intent": getattr(plan, "intent", "generate_exam"),
+                                    "step_context": {
+                                        "module_name": "exam_generation",
+                                        "subjectName": subject_name,
+                                        "exam_params": (
+                                            params.model_dump() if params else {}
+                                        ),
+                                    },
+                                },
+                            )
+
+                        # ── Single result or dict ────────────────────────────────────
+                        if isinstance(res, list) and len(res) == 1:
+                            offering_id = res[0].get("subjectOfferingId") or res[0].get("id")
+                        else:
+                            offering_id = (
+                                res.get("subjectOfferingId")
+                                if res and "error" not in res
+                                else None
+                            )
                         logger.info(
                             "ExamGenerationModule: resolved subjectOfferingId=%s",
                             offering_id,

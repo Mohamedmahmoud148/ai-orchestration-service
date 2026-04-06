@@ -74,8 +74,9 @@ Rules:
      variationMode ("same_for_all"|"different_per_student"),
      subjectOfferingId (string | null)
 
-4. If intent is anything other than generate_exam, keep exam_params as null.
-5. Never output anything outside the JSON object.
+7. If intent is anything other than generate_exam, keep exam_params as null.
+8. If you lack the 'subjectOfferingId' for an exam, 'ResolveSubjectOffering' is a tool you can add to 'pre_execution_steps' to find it.
+9. Never output anything outside the JSON object.
 """
 
 
@@ -135,8 +136,16 @@ class PlannerAgent(BaseAgent):
 
         # ── Build user prompt ─────────────────────────────────────────────
         role = agent_input.context.get("role", "user") if agent_input.context else "user"
+        history_str = ""
+        if agent_input.context and "history" in agent_input.context:
+            for m in agent_input.context["history"]:
+                history_str += f"{m.get('role', 'user')}: {m.get('content', '')}\n"
+        if history_str:
+             history_str = f"[Conversation History]:\n{history_str}\n"
+
         prompt = (
             f"{memory_prefix}"
+            f"{history_str}"
             f"User role: {role}\n"
             f"User message: {agent_input.message}"
         )

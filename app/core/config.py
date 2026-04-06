@@ -13,6 +13,9 @@ class Settings(BaseSettings):
     # Backend Config — REQUIRED.  The service cannot operate without this.
     BACKEND_BASE_URL: str = ""
 
+    # Redis Config
+    REDIS_URL: str = ""
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

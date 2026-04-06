@@ -170,6 +170,8 @@ class PlanExecutor:
                     result_out = await self._run_module(
                         step.module_name or "", plan, input_context
                     )
+                    if result_out.status == "clarification_needed":
+                        return result_out
                     result = {"output": result_out.response, "data": result_out.data}
                 else:
                     result = {"skipped": True, "reason": f"Unknown action '{step.action}'"}

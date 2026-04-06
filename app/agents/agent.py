@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING
 from app.agents.execution_context import ExecutionContext
 from app.agents.schemas import AgentInput
 from app.core.logging import logger
+from app.services.memory_store import MemoryStore
 
 if TYPE_CHECKING:
     from app.agents.planner import PlannerAgent
@@ -63,6 +64,7 @@ class Agent:
         self._tool_registry = tool_registry
         self._model_router = model_router
         self._executor = executor
+        self._memory_store = MemoryStore()
 
     # ──────────────────────────────────────────────────────────────────────
     #  Public entry-point
@@ -84,32 +86,111 @@ class Agent:
         )
         pipeline_start = time.perf_counter()
 
-        # ── Stage 1: Planning ─────────────────────────────────────────────
-        plan = await self._plan(context)
+        # ── Stage 0: Load Memory ──────────────────────────────────────────
+        memory = await self._memory_store.get_conversation(context.user_id)
+        if memory:
+            context.add_metadata("memory", memory)
 
-        # ── INTERCEPTION: Role-based intent validation ───────────────────
-        if not self._validate_role_permissions(context):
-            # If validation failed, _validate_role_permissions has already
-            # overridden the intent and set the permission-denied response.
-            # We skip the rest of the pipeline.
-            elapsed = round(time.perf_counter() - pipeline_start, 4)
-            context.add_metadata("agent_duration_seconds", elapsed)
-            logger.warning(
-                "[Agent] Permission denied: role %r is not allowed to trigger intent %r. "
-                "Returning fallback response.",
-                context.role,
-                context.metadata.get("attempted_intent"),
-            )
-            return context
+        # ── Stage 0.5: Clarification Disambiguation ───────────────────────
+        clarification = await self._memory_store.get_clarification(context.user_id)
+        plan = None
+        module_name = None
 
-        # ── Stage 2: Model Routing ────────────────────────────────────────
-        self._route_model(context)
+        if clarification:
+            msg = context.message.strip().lower()
+            options = clarification.get("options", [])
+            selected_option = None
 
-        # ── Stage 3: Tool / Module Selection ─────────────────────────────
-        module_name = self._select_module(context)
+            if msg.isdigit() and 1 <= int(msg) <= len(options):
+                selected_option = options[int(msg) - 1]
+            else:
+                for opt in options:
+                    name = str(opt.get("name") or opt.get("title") or opt.get("subjectName") or opt.get("id") or "")
+                    if name and msg in name.lower():
+                        selected_option = opt
+                        break
+
+            if selected_option:
+                logger.info("[Agent] Clarification resolved user_id=%s", context.user_id)
+                await self._memory_store.delete_clarification(context.user_id)
+
+                step_context = clarification.get("step_context", {})
+                exam_params = step_context.get("exam_params", {})
+                offering_id = selected_option.get("subjectOfferingId") or selected_option.get("id")
+
+                context.academic_context["subjectOfferingId"] = offering_id
+                if exam_params:
+                    exam_params["subjectOfferingId"] = offering_id
+
+                from app.agents.schemas import ExecutionPlan, ExamParams
+                intent = clarification.get("original_intent", "unknown")
+                plan = ExecutionPlan(
+                    goal_summary="Clarification resolved execution.",
+                    intent=intent,
+                    is_executable=True
+                )
+                if intent == "generate_exam" and exam_params:
+                    plan.exam_params = ExamParams(**exam_params)
+
+                context.set_intent(intent)
+                module_name = step_context.get("module_name", "model_only")
+                context.set_tool(module_name)
+                self._route_model(context)
+            else:
+                logger.warning("[Agent] Invalid clarification choice user_id=%s msg=%r", context.user_id, msg)
+                context.add_metadata("clarification_needed", True)
+                context.add_metadata("clarification_options", options)
+                context.set_result("عذراً، هذا الاختيار غير صحيح.")
+                return context
+
+        if not plan:
+            # ── Stage 1: Planning ─────────────────────────────────────────────
+            plan = await self._plan(context)
+
+            # ── INTERCEPTION: Role-based intent validation ───────────────────
+            if not self._validate_role_permissions(context):
+                elapsed = round(time.perf_counter() - pipeline_start, 4)
+                context.add_metadata("agent_duration_seconds", elapsed)
+                logger.warning(
+                    "[Agent] Permission denied: role %r is not allowed to trigger intent %r.",
+                    context.role,
+                    context.metadata.get("attempted_intent"),
+                )
+                return context
+
+            # ── Stage 2: Model Routing ────────────────────────────────────────
+            self._route_model(context)
+
+            # ── Stage 3: Tool / Module Selection ─────────────────────────────
+            module_name = self._select_module(context)
 
         # ── Stage 4: Execution ────────────────────────────────────────────
         await self._execute(context, plan, module_name)
+
+        # ── Clarification Handling or Save Memory ────────────────────────
+        if context.metadata.get("clarification_needed"):
+            options = context.metadata.get("clarification_options", [])
+            data = {
+                "options": options,
+                "original_intent": context.intent,
+                "step_context": {
+                    "module_name": module_name,
+                    "exam_params": getattr(plan, "exam_params", None).model_dump(exclude_none=True) if getattr(plan, "exam_params", None) else {}
+                }
+            }
+            await self._memory_store.save_clarification(context.user_id, data)
+        else:
+            # ── Stage 5: Save Memory ──────────────────────────────────────────
+            entities = {}
+            if plan and getattr(plan, "exam_params", None):
+                entities = plan.exam_params.model_dump(exclude_none=True)
+
+            memory_data = {
+                "last_intent": context.intent,
+                "last_result": context.result,
+                "entities": entities
+            }
+            await self._memory_store.save_conversation(context.user_id, memory_data)
 
         elapsed = round(time.perf_counter() - pipeline_start, 4)
         context.add_metadata("agent_duration_seconds", elapsed)
@@ -251,5 +332,11 @@ class Agent:
         if executor_output.status in ("failed", "partial_failure"):
             context.set_result(executor_output.response)
             raise _PipelineStageError("executor", executor_output.response)
+
+        if executor_output.status == "clarification_needed":
+            context.add_metadata("clarification_needed", True)
+            context.add_metadata("clarification_options", (executor_output.data or {}).get("options", []))
+            context.set_result(executor_output.response)
+            return
 
         context.set_result(executor_output.response)

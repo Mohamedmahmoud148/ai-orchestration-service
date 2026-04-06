@@ -81,6 +81,25 @@ async def chat_endpoint(request: ChatRequest, fastapi_request: Request):
         raise HTTPException(status_code=500, detail=exc.detail)
 
     # ── Serialise & return ────────────────────────────────────
+    # Handle Clarification Disambiguation
+    if context.metadata and context.metadata.get("clarification_needed"):
+        options = context.metadata.get("clarification_options", [])
+        prefix = str(context.result) + "\n\nتقصد أي واحد من دول؟" if context.result and context.result != "clarification_needed" else "تقصد أي واحد من دول؟"
+        lines = [prefix]
+        for i, opt in enumerate(options, 1):
+            name = opt.get("title") or opt.get("name") or opt.get("subjectName") or "Unknown"
+            id_val = opt.get("id") or opt.get("subjectOfferingId") or "?"
+            lines.append(f"{i}. {name} ({id_val})")
+            
+        return ChatResponse(
+            response="\n".join(lines),
+            conversation_id=context.conversation_id,
+            intent_executed=context.intent,
+            tool_used=context.selected_tool,
+            model_used=context.selected_model,
+            metadata=context.metadata,
+        )
+
     return ChatResponse(
         response=str(context.result or ""),
         conversation_id=context.conversation_id,
