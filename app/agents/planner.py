@@ -13,7 +13,7 @@ import json
 import os
 from typing import Optional, Protocol
 
-import google.generativeai as genai
+from google import genai
 from pydantic import ValidationError
 
 from app.agents.base_agent import BaseAgent
@@ -26,9 +26,8 @@ from app.agents.schemas import (
 )
 from app.core.logging import logger
 
-# ── Gemini SDK setup ──────────────────────────────────────────────────────────
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-_gemini_model = genai.GenerativeModel("gemini-2.5-flash")
+# ── Gemini SDK setup (deprecated module-level init removed) ─────────────
+# Client is now injected via the constructor from main.py.
 
 # ── Valid intent catalogue ────────────────────────────────────────────────────
 VALID_INTENTS = {
@@ -97,8 +96,15 @@ class PlannerAgent(BaseAgent):
     which cloud clients the ModelRouter has configured.
     """
 
-    def __init__(self, model_router, ranker=None, memory: Optional[MemoryStore] = None):
-        self.model_router = model_router   # kept for DI compatibility
+    def __init__(
+        self,
+        model_router,
+        gemini_client: genai.Client,
+        ranker=None,
+        memory: Optional[MemoryStore] = None,
+    ):
+        self.model_router = model_router
+        self.gemini_client = gemini_client
         self.ranker = ranker
         self.memory = memory
 
@@ -164,11 +170,10 @@ class PlannerAgent(BaseAgent):
         or None on any error.
         """
         try:
-            response = await _gemini_model.generate_content_async(
-                contents=[
-                    {"role": "user", "parts": [_SYSTEM_PROMPT + "\n\n" + prompt]}
-                ],
-                generation_config={
+            response = await self.gemini_client.models.generate_content(
+                model="gemini-2.0-flash",
+                contents=_SYSTEM_PROMPT + "\n\n" + prompt,
+                config={
                     "response_mime_type": "application/json",
                     "temperature": 0.1,
                 },
@@ -259,10 +264,9 @@ class PlannerAgent(BaseAgent):
                             "subjectOfferingId is required to generate the exam "
                             "but was not provided by the user"
                         ),
+                        # GET /api/ai-tools/resolve-offering?subject={subjectName}
+                        # Only subjectName is forwarded as the query param.
                         input_payload={
-                            "collegeName": plan.exam_params.collegeName,
-                            "departmentName": plan.exam_params.departmentName,
-                            "batchName": plan.exam_params.batchName,
                             "subjectName": plan.exam_params.subjectName,
                         },
                     )

@@ -72,7 +72,11 @@ async def lifespan(app: FastAPI):
         local_model_service=local_model_service,
     )
 
-    planner = PlannerAgent(model_router=model_router, ranker=None)
+    planner = PlannerAgent(
+        model_router=model_router,
+        gemini_client=gemini_client,
+        ranker=None
+    )
 
     executor = PlanExecutor(
         backend_execution_func=tool_execution_client.execute_tool,

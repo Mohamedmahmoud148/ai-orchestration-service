@@ -1,16 +1,37 @@
 """
 backend_client.py
 
-Provides the ToolExecutionClient for Version 2: Command Bridge architecture.
-All tool execution is forwarded to the .NET backend. The FastAPI service
-has no direct database access and contains zero tool business logic.
+Provides the ToolExecutionClient for the FastAPI AI orchestration service.
+
+Methods
+-------
+execute_tool(route, parameters, auth_header, user_id)
+    POST with the legacy {"parameters": …, "userId": …} envelope.
+    Kept for any remaining legacy endpoints.
+post(route, payload, auth_header)
+    Direct POST — raw JSON body, no wrapper. Used by /api/Exams and
+    other RESTful .NET endpoints that expect a plain DTO body.
+fetch(route, auth_header, params)
+    GET with optional query params. Used for resolve-offering, materials, etc.
 
 Error contract
 --------------
-- RuntimeError        → configuration error at construction time
-- HTTPException(502)  → backend returned an error or a network failure occurred
+- RuntimeError        → configuration error at construction time only.
+- HTTPException(502)  → any HTTP-level or network-level failure.
 
-The pipeline must NEVER silently degrade on backend failures.
+Logging contract
+----------------
+Every method logs (before the call):
+    [METHOD] endpoint=<url>  (+ request_body or query_params)
+Every method logs (after a successful call):
+    [METHOD] endpoint=<url> status=<code> response=<first 500 chars>
+
+Safety
+------
+- All JSON parsing is wrapped with a try/except to handle non-JSON bodies
+  gracefully, so callers never receive a raw JSONDecodeError.
+- HTTP error bodies are truncated to 300 chars in exception details to
+  prevent credential or PII leaks in log aggregators.
 """
 
 from typing import Any, Dict, Optional
@@ -21,15 +42,27 @@ from fastapi import HTTPException
 from app.core.config import settings
 from app.core.logging import logger
 
+_BACKEND_UNAVAILABLE_MSG = (
+    "The backend service is currently unavailable. Please try again later."
+)
+
+
+def _safe_json(response: httpx.Response) -> Any:
+    """Attempt to parse a response body as JSON; return raw text on failure."""
+    try:
+        return response.json()
+    except Exception:
+        return {"_raw_text": response.text}
+
 
 class ToolExecutionClient:
     """
-    HTTP client to securely call the .NET backend AI Execution Layer.
+    HTTP client to securely call the .NET backend.
 
     Raises
     ------
     RuntimeError
-        If ``BACKEND_BASE_URL`` is not set when the client is constructed.
+        If BACKEND_BASE_URL is not set when the client is constructed.
     HTTPException(502)
         On any HTTP-level or network-level failure during a request.
     """
@@ -37,7 +70,6 @@ class ToolExecutionClient:
     def __init__(self) -> None:
         base_url = (settings.BACKEND_BASE_URL or "").rstrip("/")
         if not base_url:
-            # Settings validator should have caught this; guard defensively.
             raise RuntimeError(
                 "ToolExecutionClient: BACKEND_BASE_URL is not configured. "
                 "Set it in your .env file before starting the service."
@@ -45,7 +77,7 @@ class ToolExecutionClient:
         self.base_url = base_url
 
     # ------------------------------------------------------------------
-    # POST — trigger backend actions
+    # POST (legacy envelope) — for old /api/ai/execute/* endpoints
     # ------------------------------------------------------------------
 
     async def execute_tool(
@@ -55,89 +87,130 @@ class ToolExecutionClient:
         auth_header: Optional[str],
         user_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """
-        Execute a backend tool over HTTP POST.
-
-        Parameters
-        ----------
-        route : str
-            Backend path, e.g. ``/api/ai/execute/create-generated-exam``.
-        parameters : dict
-            Payload forwarded to the tool.
-        auth_header : str | None
-            Forwarded ``Authorization`` header (JWT).
-        user_id : str | None
-            Caller's user ID forwarded to the backend.
-
-        Returns
-        -------
-        dict
-            Parsed JSON response from the backend.
-
-        Raises
-        ------
-        HTTPException(502)
-            On any HTTP-level or network-level failure.
-        """
+        """POST with the legacy {parameters, userId} envelope."""
         url = f"{self.base_url}{route}"
-
-        payload = {
-            "parameters": parameters,
-            "userId": user_id,
-        }
-
-        headers: Dict[str, str] = {}
+        payload = {"parameters": parameters, "userId": user_id}
+        headers: Dict[str, str] = {"Content-Type": "application/json"}
         if auth_header:
             headers["Authorization"] = auth_header
 
         logger.info(
-            "BackendClient POST url=%s user_id=%s parameters=%s",
-            url,
-            user_id,
-            parameters,
+            "BackendClient [POST-TOOL] endpoint=%s user_id=%s request_body=%s",
+            url, user_id, parameters,
         )
 
         try:
             async with httpx.AsyncClient() as client:
                 response = await client.post(
-                    url,
-                    json=payload,
-                    headers=headers,
-                    timeout=30.0,
+                    url, json=payload, headers=headers, timeout=30.0
+                )
+                logger.info(
+                    "BackendClient [POST-TOOL] endpoint=%s status=%s response=%s",
+                    url, response.status_code, response.text[:500],
                 )
                 response.raise_for_status()
-                return response.json()
+                return _safe_json(response)
 
         except httpx.HTTPStatusError as exc:
-            text = exc.response.text
+            body = exc.response.text[:300]
             logger.error(
-                "BackendClient POST HTTP %s from %s: %s",
-                exc.response.status_code,
-                url,
-                text,
+                "BackendClient [POST-TOOL] HTTP %s from %s: %s",
+                exc.response.status_code, url, body,
             )
             raise HTTPException(
                 status_code=502,
-                detail=(
-                    f"Backend tool call failed with HTTP {exc.response.status_code}: "
-                    f"{text[:300]}"
-                ),
+                detail=_BACKEND_UNAVAILABLE_MSG,
             ) from exc
 
         except httpx.RequestError as exc:
-            logger.error("BackendClient POST network error at %s: %s", url, str(exc))
-            raise HTTPException(
-                status_code=502,
-                detail=f"Network error communicating with backend at {url}: {exc}",
-            ) from exc
-
-        except Exception as exc:
             logger.error(
-                "BackendClient POST unexpected error: %s", str(exc), exc_info=True
+                "BackendClient [POST-TOOL] network error at %s: %s", url, exc
             )
             raise HTTPException(
                 status_code=502,
-                detail=f"Unexpected error executing backend tool: {exc}",
+                detail=_BACKEND_UNAVAILABLE_MSG,
+            ) from exc
+
+        except HTTPException:
+            raise  # re-raise without wrapping
+
+        except Exception as exc:
+            logger.error(
+                "BackendClient [POST-TOOL] unexpected error: %s",
+                str(exc), exc_info=True,
+            )
+            raise HTTPException(
+                status_code=502,
+                detail=_BACKEND_UNAVAILABLE_MSG,
+            ) from exc
+
+    # ------------------------------------------------------------------
+    # POST (direct) — for RESTful endpoints like POST /api/Exams
+    # ------------------------------------------------------------------
+
+    async def post(
+        self,
+        route: str,
+        payload: Dict[str, Any],
+        auth_header: Optional[str],
+    ) -> Dict[str, Any]:
+        """Direct JSON POST — no envelope wrapper."""
+        url = f"{self.base_url}{route}"
+        headers: Dict[str, str] = {"Content-Type": "application/json"}
+        if auth_header:
+            headers["Authorization"] = auth_header
+
+        logger.info(
+            "BackendClient [POST] endpoint=%s request_body=%s",
+            url, payload,
+        )
+
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    url, json=payload, headers=headers, timeout=30.0
+                )
+                logger.info(
+                    "BackendClient [POST] endpoint=%s status=%s response=%s",
+                    url, response.status_code, response.text[:500],
+                )
+                response.raise_for_status()
+                # 201 / 204 responses may have an empty body — handle safely
+                if not response.content:
+                    return {"status": "created", "http_status": response.status_code}
+                return _safe_json(response)
+
+        except httpx.HTTPStatusError as exc:
+            body = exc.response.text[:300]
+            logger.error(
+                "BackendClient [POST] HTTP %s from %s: %s",
+                exc.response.status_code, url, body,
+            )
+            raise HTTPException(
+                status_code=502,
+                detail=_BACKEND_UNAVAILABLE_MSG,
+            ) from exc
+
+        except httpx.RequestError as exc:
+            logger.error(
+                "BackendClient [POST] network error at %s: %s", url, exc
+            )
+            raise HTTPException(
+                status_code=502,
+                detail=_BACKEND_UNAVAILABLE_MSG,
+            ) from exc
+
+        except HTTPException:
+            raise
+
+        except Exception as exc:
+            logger.error(
+                "BackendClient [POST] unexpected error: %s",
+                str(exc), exc_info=True,
+            )
+            raise HTTPException(
+                status_code=502,
+                detail=_BACKEND_UNAVAILABLE_MSG,
             ) from exc
 
     # ------------------------------------------------------------------
@@ -150,85 +223,73 @@ class ToolExecutionClient:
         auth_header: Optional[str],
         params: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """
-        HTTP GET against a .NET backend route.
-
-        Used by modules that need to *read* data (materials, results, files …)
-        rather than trigger an action.
-
-        Parameters
-        ----------
-        route : str
-            Backend path, e.g. ``/api/Materials/by-offering/42``.
-        auth_header : str | None
-            Forwarded JWT so the backend can authorise the request.
-        params : dict | None
-            Optional query-string parameters.
-
-        Returns
-        -------
-        dict
-            Parsed JSON response, or
-            ``{"_raw_bytes": bytes, "content_type": str}`` for non-JSON
-            responses (e.g. file downloads).
-
-        Raises
-        ------
-        HTTPException(502)
-            On any HTTP-level or network-level failure.
-        """
+        """HTTP GET — returns JSON dict or {_raw_bytes, content_type} for files."""
         url = f"{self.base_url}{route}"
         headers: Dict[str, str] = {}
         if auth_header:
             headers["Authorization"] = auth_header
 
-        logger.info("BackendClient GET url=%s params=%s", url, params)
+        logger.info(
+            "BackendClient [GET] endpoint=%s query_params=%s",
+            url, params,
+        )
 
         try:
             async with httpx.AsyncClient() as client:
                 response = await client.get(
-                    url,
-                    headers=headers,
-                    params=params or {},
-                    timeout=30.0,
+                    url, headers=headers, params=params or {}, timeout=30.0
+                )
+                logger.info(
+                    "BackendClient [GET] endpoint=%s status=%s response=%s",
+                    url, response.status_code, response.text[:500],
                 )
                 response.raise_for_status()
+
                 content_type = response.headers.get("content-type", "")
+                if not response.content:
+                    # Empty 200/204: return empty sentinel rather than crashing
+                    logger.warning(
+                        "BackendClient [GET] endpoint=%s returned empty body", url
+                    )
+                    return {}
+
                 if "application/json" in content_type:
-                    return response.json()
-                # Return raw bytes under a known key for file-like responses
+                    return _safe_json(response)
+
+                # Non-JSON (e.g. PDF, binary): return raw bytes
                 return {"_raw_bytes": response.content, "content_type": content_type}
 
         except httpx.HTTPStatusError as exc:
-            text = exc.response.text
+            body = exc.response.text[:300]
             logger.error(
-                "BackendClient GET HTTP %s from %s: %s",
-                exc.response.status_code,
-                url,
-                text,
+                "BackendClient [GET] HTTP %s from %s: %s",
+                exc.response.status_code, url, body,
             )
             raise HTTPException(
                 status_code=502,
-                detail=(
-                    f"Backend GET failed with HTTP {exc.response.status_code}: "
-                    f"{text[:300]}"
-                ),
+                detail=_BACKEND_UNAVAILABLE_MSG,
             ) from exc
 
         except httpx.RequestError as exc:
-            logger.error("BackendClient GET network error at %s: %s", url, str(exc))
-            raise HTTPException(
-                status_code=502,
-                detail=f"Network error fetching from backend at {url}: {exc}",
-            ) from exc
-
-        except Exception as exc:
             logger.error(
-                "BackendClient GET unexpected error: %s", str(exc), exc_info=True
+                "BackendClient [GET] network error at %s: %s", url, exc
             )
             raise HTTPException(
                 status_code=502,
-                detail=f"Unexpected error in BackendClient.fetch: {exc}",
+                detail=_BACKEND_UNAVAILABLE_MSG,
+            ) from exc
+
+        except HTTPException:
+            raise
+
+        except Exception as exc:
+            logger.error(
+                "BackendClient [GET] unexpected error: %s",
+                str(exc), exc_info=True,
+            )
+            raise HTTPException(
+                status_code=502,
+                detail=_BACKEND_UNAVAILABLE_MSG,
             ) from exc
 
 
