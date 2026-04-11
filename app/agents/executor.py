@@ -43,6 +43,12 @@ _MODULE_CLASS_MAP: Dict[str, tuple[str, str]] = {
     "summarization":   ("app.modules.summarization",   "SummarizationModule"),
     "file_extraction": ("app.modules.file_extraction",  "FileExtractionModule"),
     "result_query":    ("app.modules.result_query",      "ResultQueryModule"),
+    # ── New modules ──
+    "complaint_submit":   ("app.modules.complaint",         "ComplaintModule"),
+    "complaint_summary":  ("app.modules.complaint",         "ComplaintModule"),
+    "file_processing":    ("app.modules.file_processor",    "FileProcessorModule"),
+    "cv_analysis":        ("app.modules.cv_analysis",       "CVAnalysisModule"),
+    "academic_advice":    ("app.modules.academic_advisor",  "AcademicAdvisorModule"),
 }
 
 # ── Tool allowlist ─────────────────────────────────────────────────────────────
@@ -60,6 +66,12 @@ ALLOWED_TOOL_NAMES: frozenset[str] = frozenset({
     "GenerateExam",
     "DistributeExam",
     "GetExamQuestions",
+    # ── New modules ──
+    "SubmitComplaint",
+    "GetComplaints",
+    "GetStudentAcademicSummary",
+    "BulkCreateStudents",
+    "BulkUploadGrades",
 })
 
 # ── Role-specific system prompts ──────────────────────────────────────────────
@@ -129,6 +141,32 @@ _SUGGESTIONS_MAP: Dict[str, Dict[str, List[str]]] = {
         "student": ["Summarize this file", "Ask questions about it", "Extract key topics"],
         "doctor":  ["Generate exam from file", "Extract syllabus topics", "Summarise for students"],
         "admin":   ["Process all pending files", "Extract and archive", "Generate department report"],
+    },
+    # ── New modules ──
+    "complaint_submit": {
+        "student": ["Track my complaint", "Submit another complaint", "Ask about my grades"],
+        "doctor":  ["View complaints about me", "Generate exam", "Check course enrollments"],
+        "admin":   ["View all complaints", "Complaint summary", "Export complaint report"],
+    },
+    "complaint_summary": {
+        "student": ["Check my grades", "View my schedule", "Ask general question"],
+        "doctor":  ["Filter by subject", "View recent complaints", "Export report"],
+        "admin":   ["Filter by department", "View trend analysis", "Resolve complaint"],
+    },
+    "file_processing": {
+        "student": ["Check my grades", "View my profile", "Ask a question"],
+        "doctor":  ["Generate exam", "View enrollments", "Check results"],
+        "admin":   ["Upload another file", "View student list", "Check upload status"],
+    },
+    "cv_analysis": {
+        "student": ["Improve my CV further", "Recommend courses", "Get academic advice"],
+        "doctor":  ["Analyse student CV", "Generate exam", "View enrollments"],
+        "admin":   ["Bulk CV analysis", "Department skill summary", "Generate report"],
+    },
+    "academic_advice": {
+        "student": ["View my grades", "Check my GPA", "Analyse my CV"],
+        "doctor":  ["View class performance", "Generate exam", "Check enrollments"],
+        "admin":   ["Department GPA summary", "At-risk students", "Generate report"],
     },
 }
 

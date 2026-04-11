@@ -38,6 +38,12 @@ VALID_INTENTS = {
     "generate_exam",
     "result_query",
     "file_extraction",
+    # ── New modules ──
+    "complaint_submit",
+    "complaint_summary",
+    "file_processing",
+    "cv_analysis",
+    "academic_advice",
 }
 
 # ── Fallback intent ───────────────────────────────────────────────────────────
@@ -55,6 +61,12 @@ _AVAILABLE_TOOLS = [
     "GetCourseEnrollments",
     "GenerateExam",
     "DistributeExam",
+    # ── New ──
+    "SubmitComplaint",
+    "GetComplaints",
+    "GetStudentAcademicSummary",
+    "BulkCreateStudents",
+    "BulkUploadGrades",
 ]
 
 # ── System prompt ─────────────────────────────────────────────────────────────
@@ -64,11 +76,16 @@ You are an AI Planning Agent for a university management system.
 Your job is to classify the user's request and return a structured JSON plan.
 
 ## Valid Intents
-- general_chat     — conversation, questions, greetings, anything not needing backend data
-- summarization    — summarise a document or text
-- generate_exam    — generate a university exam (doctor/admin only)
-- result_query     — query academic results, grades, GPA, transcripts, schedules
-- file_extraction  — extract information from an uploaded file
+- general_chat       — conversation, questions, greetings, anything not needing backend data
+- summarization      — summarise a document or text
+- generate_exam      — generate a university exam (doctor/admin only)
+- result_query       — query academic results, grades, GPA, transcripts, schedules
+- file_extraction    — extract information from an uploaded file (no bulk ops)
+- complaint_submit   — student submitting a complaint or feedback about a doctor/exam/grade
+- complaint_summary  — admin/doctor requesting a summary of submitted complaints
+- file_processing    — bulk upload of Excel (students/grades) or PDF summarization via fileUrl
+- cv_analysis        — analyzing a student CV to extract skills and give recommendations
+- academic_advice    — personalized academic recommendations based on GPA and enrolled courses
 
 ## Output Schema (return ONLY this JSON, no markdown, no extra text)
 {{
@@ -120,7 +137,37 @@ Your job is to classify the user's request and return a structured JSON plan.
 - If a required field is absent from both the user message AND academic_context,
   only then flag it as missing in goal_summary.
 
-### 5. When in doubt → use general_chat with steps=[].
+### 5. complaint_submit (student only)
+- Use intent=complaint_submit when a student reports a problem, complains,
+  or gives negative feedback about a doctor, exam, grade, or the system.
+- Extract from user message: the complaint content (for "message" field).
+- Required payload fields (MUST be populated from academic_context):
+    userId, subjectOfferingId
+- targetType MUST be one of: "Doctor" | "Exam" | "Grade" | "Other"
+  Infer it from the message (e.g. "doctor" → "Doctor", "exam" → "Exam",
+  "grade" / "mark" → "Grade", anything else → "Other").
+- DoctorId is resolved server-side — do NOT include it in the payload.
+- If role is NOT "student" → use general_chat instead.
+
+### 6. complaint_summary (admin/doctor only)
+- Use intent=complaint_summary when an admin or doctor asks to see, review,
+  or summarize complaints.
+- If role is "student" → use general_chat instead.
+
+### 7. file_processing
+- Use intent=file_processing when the user message contains a fileUrl
+  OR mentions uploading/processing a file for bulk operations.
+- Do NOT use this for single-file text extraction (use file_extraction).
+
+### 8. cv_analysis
+- Use intent=cv_analysis when the user wants their CV reviewed, analyzed,
+  or feedback on skills, experience, or job readiness.
+
+### 9. academic_advice
+- Use intent=academic_advice when a student asks for study advice, course
+  recommendations, or wants to know how to improve their GPA.
+
+### 10. When in doubt → use general_chat with steps=[].
 
 ### Multi-step example (result_query — grades then GPA):
 {{
