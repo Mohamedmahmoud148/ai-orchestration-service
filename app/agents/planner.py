@@ -71,14 +71,14 @@ Your job is to classify the user's request and return a structured JSON plan.
 - file_extraction  — extract information from an uploaded file
 
 ## Output Schema (return ONLY this JSON, no markdown, no extra text)
-{
+{{
   "intent": "<one of the valid intents>",
   "goal_summary": "<one clear sentence describing what the user wants>",
   "is_executable": true,
   "exam_params": null,
   "pre_execution_steps": [],
   "steps": []
-}
+}}
 
 ## Rules
 
