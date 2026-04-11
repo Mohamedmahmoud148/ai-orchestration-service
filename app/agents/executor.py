@@ -318,10 +318,11 @@ class PlanExecutor:
 
         ctx        = input_context.context or {}
         role       = ctx.get("role", "student")
-        model_id   = ctx.get("selected_model", "gpt-4o-mini")
+        model_id   = ctx.get("selected_model", "openai/gpt-4o-mini")
         explain    = ctx.get("explain", False)
         intent     = plan.intent or "general_chat"
         user_id    = input_context.user_id
+        academic_ctx: dict = ctx.get("academic_context", {}) or {}
 
         execution_results: Dict[int, Any] = {}
         successful_steps = 0
@@ -334,7 +335,27 @@ class PlanExecutor:
             )
             payload = self._interpolate(step.input_payload, execution_results)
 
-            # Auto-inject user_id into tool payloads when present and missing
+            # ── Context-aware auto-injection ────────────────────────────
+            # Priority: academic_context values first, then fall back to
+            # top-level user_id.  Values already set in input_payload are
+            # NEVER overridden (planner is authoritative for explicit values).
+            _CONTEXT_FIELD_MAP = {
+                "userId":            ["userId", "studentId"],
+                "studentId":         ["studentId", "userId"],
+                "courseId":          ["courseId"],
+                "subjectOfferingId": ["subjectOfferingId"],
+                "departmentId":      ["departmentId"],
+                "batchId":           ["batchId"],
+            }
+            for payload_key, ctx_keys in _CONTEXT_FIELD_MAP.items():
+                if payload_key not in payload:   # don't overwrite explicit values
+                    for ck in ctx_keys:
+                        val = academic_ctx.get(ck)
+                        if val:
+                            payload[payload_key] = val
+                            break
+
+            # Fallback: inject top-level user_id if still missing
             if user_id and "userId" not in payload:
                 payload["userId"] = user_id
 
@@ -532,7 +553,7 @@ class PlanExecutor:
         self,
         intent: str,
         role: str,
-        model_id: str = "gpt-4o-mini",
+        model_id: str = "openai/gpt-4o-mini",
     ) -> AgentOutput:
         """
         Generate a user-friendly error message via LLM.
@@ -574,7 +595,7 @@ class PlanExecutor:
 
         try:
             response = await self.model_router.generate_with_messages(
-                messages=messages, model_id="gpt-4o-mini"
+                messages=messages, model_id="openai/gpt-4o-mini"
             )
             return AgentOutput(
                 status="failed",
@@ -616,9 +637,10 @@ class PlanExecutor:
         ctx          = input_context.context or {}
         role         = ctx.get("role", "student")
         raw_history  = ctx.get("history", []) or []
-        model_id     = ctx.get("selected_model", "gpt-4o-mini")
+        model_id     = ctx.get("selected_model", "openai/gpt-4o-mini")
         explain      = ctx.get("explain", False)
         prefs        = ctx.get("preferences", {}) or {}
+        academic_ctx: dict = ctx.get("academic_context", {}) or {}
         intent       = "general_chat"
 
         # ── Role-specific system prompt ───────────────────────────────────
@@ -638,6 +660,23 @@ class PlanExecutor:
             base_prompt += (
                 f"\nUser academic interests: {', '.join(interests[:5])}. "
                 "Tailor responses to these interests when relevant."
+            )
+
+        # ── Academic context injection (critical: always prefer this over guessing) ──
+        # Safe keys only — never expose passwords, tokens, or internal IDs unnecessarily
+        _SAFE_AC_KEYS = [
+            "userId", "studentId", "courseId", "subjectOfferingId",
+            "departmentId", "batchId", "collegeName", "departmentName",
+            "batchName", "subjectName", "studentName",
+        ]
+        relevant_ac = {k: v for k, v in academic_ctx.items() if k in _SAFE_AC_KEYS and v}
+        if relevant_ac:
+            import json as _json
+            base_prompt += (
+                "\n\nIMPORTANT — The following academic context has been verified from the "
+                "user's account and MUST be used to answer their question directly "
+                "without asking for information they already provided:\n"
+                + _json.dumps(relevant_ac, ensure_ascii=False)
             )
 
         # ── Build messages[] ──────────────────────────────────────────────

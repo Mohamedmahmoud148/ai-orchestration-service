@@ -12,6 +12,10 @@ class Settings(BaseSettings):
     OPENROUTER_FALLBACK_MODEL_1: str = "openai/gpt-4o-mini"
     OPENROUTER_FALLBACK_MODEL_2: str = ""  # e.g. "mistralai/mistral-7b-instruct"
 
+    # CORS — comma-separated allowed origins (leave empty to default to BACKEND_BASE_URL)
+    # Example: "https://app.example.com,http://localhost:3000"
+    ALLOWED_ORIGINS: str = ""
+
     # Backend Config — REQUIRED.  The service cannot operate without this.
     BACKEND_BASE_URL: str = ""
 

@@ -117,9 +117,31 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# ── CORS origins ───────────────────────────────────────────────────────────────
+# Priority: ALLOWED_ORIGINS env var →  BACKEND_BASE_URL  → localhost only
+def _build_cors_origins() -> list[str]:
+    if settings.ALLOWED_ORIGINS.strip():
+        origins = [o.strip() for o in settings.ALLOWED_ORIGINS.split(",") if o.strip()]
+    elif settings.BACKEND_BASE_URL:
+        origins = [settings.BACKEND_BASE_URL]
+    else:
+        origins = []
+
+    # Always permit localhost in development so developers aren't blocked
+    if settings.ENVIRONMENT == "development":
+        for port in ("3000", "5000", "8000"):
+            for scheme in ("http", "https"):
+                candidate = f"{scheme}://localhost:{port}"
+                if candidate not in origins:
+                    origins.append(candidate)
+
+    logger.info("CORS allowed origins: %s", origins)
+    return origins
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # tighten for production
+    allow_origins=_build_cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

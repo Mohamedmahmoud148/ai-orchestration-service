@@ -109,11 +109,16 @@ Your job is to classify the user's request and return a structured JSON plan.
   subjectOfferingId (string|null).
 - If subjectOfferingId is unknown, add ResolveSubjectOffering to pre_execution_steps.
 
-### 4. Context-aware auto-fill
-- If the user's message refers to "my" data (e.g. "my grades", "my schedule"),
-  use the academic_context provided to fill in userId, courseId, etc.
-  automatically — do NOT ask the user for parameters they already implicitly
-  provided through context.
+### 4. Context-aware auto-fill (MANDATORY)
+- The caller has already authenticated and their academic record is embedded in
+  the request under academic_context.
+- You MUST extract userId, studentId, courseId, subjectOfferingId,
+  departmentId, batchId, collegeName, departmentName, batchName from
+  academic_context and inject them into the relevant tool input_payload fields.
+- NEVER ask the user for parameters already present in academic_context.
+- NEVER leave userId or studentId blank when they exist in academic_context.
+- If a required field is absent from both the user message AND academic_context,
+  only then flag it as missing in goal_summary.
 
 ### 5. When in doubt → use general_chat with steps=[].
 
