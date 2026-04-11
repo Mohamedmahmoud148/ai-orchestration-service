@@ -1,15 +1,24 @@
 import json
-from typing import Optional, Any
+from typing import List, Optional, Any
 from app.core.logging import logger
 
 
 class ModelRouter:
     """
     Abstracts LLM selection away from agents and modules.
-    Supports Gemini, OpenAI, Anthropic (cloud), and HuggingFace (local) models.
 
-    Local models are addressed with the 'hf/' prefix, e.g. 'hf/TinyLlama'.
-    Any other model_id is dispatched to the appropriate cloud client.
+    Primary backend : OpenAI (gpt-4o, gpt-4o-mini, gpt-3.5-turbo …)
+    Optional extras : Gemini, Anthropic, HuggingFace (local).
+
+    Key methods
+    -----------
+    generate(prompt, system_instruction, model_id)
+        Single-turn text generation — convenience wrapper.
+    generate_with_messages(messages, model_id)
+        Multi-turn structured generation.  Accepts a list of
+        ``{"role": …, "content": …}`` dicts (OpenAI chat format).
+    generate_structured_json(prompt, system_instruction, model_id)
+        Returns a parsed dict; enforces JSON response format.
     """
     def __init__(
         self,
@@ -92,62 +101,95 @@ class ModelRouter:
             logger.error(f"Error in ModelRouter generation for {model_id}: {e}")
             return None
             
+    async def generate_with_messages(
+        self,
+        messages: List[dict],
+        model_id: str = "gpt-4o-mini",
+    ) -> str | None:
+        """
+        Multi-turn generation using a pre-built messages list.
+
+        ``messages`` must follow the OpenAI chat format::
+
+            [
+                {"role": "system",    "content": "…"},
+                {"role": "user",      "content": "…"},
+                {"role": "assistant", "content": "…"},
+                …
+            ]
+
+        This is the preferred method for the fallback LLM call because it
+        preserves conversation history without lossy string concatenation.
+        """
+        logger.debug("ModelRouter.generate_with_messages: model=%s messages=%d", model_id, len(messages))
+        try:
+            if model_id.startswith("hf/") and self.local_model_service:
+                # Local models receive the last user message only
+                user_msg = next(
+                    (m["content"] for m in reversed(messages) if m["role"] == "user"), ""
+                )
+                sys_msg = next(
+                    (m["content"] for m in messages if m["role"] == "system"), ""
+                )
+                return await self.local_model_service.generate_text(
+                    prompt=user_msg, system_instruction=sys_msg
+                )
+
+            if ("gpt" in model_id.lower() or "o1" in model_id.lower() or "o3" in model_id.lower()) and self.openai_client:
+                response = await self.openai_client.chat.completions.create(
+                    model=model_id,
+                    messages=messages,
+                )
+                return response.choices[0].message.content
+
+            if "gemini" in model_id.lower() and self.gemini_client:
+                # Flatten to a single combined prompt for Gemini
+                combined = "\n".join(
+                    f"{m['role'].upper()}: {m['content']}" for m in messages if m["role"] != "system"
+                )
+                sys_msg = next(
+                    (m["content"] for m in messages if m["role"] == "system"), ""
+                )
+                from google.genai import types
+                response = await self.gemini_client.aio.models.generate_content(
+                    model=model_id,
+                    contents=combined,
+                    config=types.GenerateContentConfig(system_instruction=sys_msg),
+                )
+                return response.text
+
+            if "claude" in model_id.lower() and self.anthropic_client:
+                sys_msg = next(
+                    (m["content"] for m in messages if m["role"] == "system"), ""
+                )
+                non_sys = [m for m in messages if m["role"] != "system"]
+                response = await self.anthropic_client.messages.create(
+                    model=model_id,
+                    max_tokens=4096,
+                    system=sys_msg,
+                    messages=non_sys,
+                )
+                return response.content[0].text
+
+            logger.error("ModelRouter.generate_with_messages: no client for model_id=%s", model_id)
+            return None
+
+        except Exception as exc:
+            logger.error("ModelRouter.generate_with_messages error: %s", exc, exc_info=True)
+            return None
+
     async def generate(
         self,
         prompt: str,
         system_instruction: str = "",
-        model_id: str = "gpt-4o-mini"
+        model_id: str = "gpt-4o-mini",
     ) -> str | None:
-        """Standard text generation — dispatches to cloud or local HuggingFace model."""
-        logger.debug(f"Routing text generation to model: {model_id}")
-        try:
-            # ── HuggingFace (local) ────────────────────────────────────────
-            if model_id.startswith("hf/") and self.local_model_service:
-                return await self.local_model_service.generate_text(
-                    prompt=prompt,
-                    system_instruction=system_instruction,
-                )
-
-            # ── Gemini ─────────────────────────────────────────────────
-            elif "gemini" in model_id.lower() and self.gemini_client:
-                from google.genai import types
-                response = await self.gemini_client.aio.models.generate_content(
-                    model=model_id,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        system_instruction=system_instruction,
-                    ),
-                )
-                return response.text
-                
-            elif ("gpt" in model_id.lower() or "o1" in model_id.lower() or "o3" in model_id.lower()) and self.openai_client:
-                response = await self.openai_client.chat.completions.create(
-                    model=model_id,
-                    messages=[
-                        {"role": "system", "content": system_instruction},
-                        {"role": "user", "content": prompt}
-                    ]
-                )
-                return response.choices[0].message.content
-                
-            elif "claude" in model_id.lower() and self.anthropic_client:
-                response = await self.anthropic_client.messages.create(
-                    model=model_id,
-                    max_tokens=4096,
-                    system=system_instruction,
-                    messages=[
-                        {"role": "user", "content": prompt}
-                    ]
-                )
-                return response.content[0].text
-                
-            else:
-                logger.error(f"No configured client found for model_id: {model_id}")
-                return None
-                
-        except Exception as e:
-            logger.error(f"Error in ModelRouter text generation for {model_id}: {e}")
-            return None
+        """Single-turn text generation — thin wrapper around generate_with_messages."""
+        messages: List[dict] = []
+        if system_instruction:
+            messages.append({"role": "system", "content": system_instruction})
+        messages.append({"role": "user", "content": prompt})
+        return await self.generate_with_messages(messages, model_id=model_id)
 
     async def summarize(
         self,

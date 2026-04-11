@@ -18,6 +18,7 @@ the existing chat route.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import TYPE_CHECKING
 
@@ -36,7 +37,7 @@ if TYPE_CHECKING:
 # ── Role-based intent mapping ──────────────────────────────────────────────────
 ROLE_PERMITTED_INTENTS = {
     "student": {"general_chat", "summarization", "result_query", "file_extraction"},
-    "doctor": {"general_chat", "summarization", "generate_exam", "file_extraction"},
+    "doctor":  {"general_chat", "summarization", "generate_exam", "file_extraction"},
     "admin": {
         "general_chat",
         "summarization",
@@ -45,6 +46,9 @@ ROLE_PERMITTED_INTENTS = {
         "file_extraction",
     },
 }
+
+# Number of conversation turns that triggers background summarisation
+_SUMMARY_THRESHOLD = 12
 
 
 class Agent:
@@ -86,10 +90,17 @@ class Agent:
         )
         pipeline_start = time.perf_counter()
 
-        # ── Stage 0: Load Memory ──────────────────────────────────────────
+        # ── Stage 0: Load Memory + User Preferences ─────────────────────
         memory = await self._memory_store.get_conversation(context.user_id)
+        prefs  = await self._memory_store.get_preferences(context.user_id)
         if memory:
             context.add_metadata("memory", memory)
+        if prefs:
+            context.add_metadata("preferences", prefs)
+            logger.info(
+                "[Agent] Loaded preferences for user_id=%s keys=%s",
+                context.user_id, list(prefs.keys()),
+            )
 
         # ── Stage 0.5: Clarification Disambiguation ───────────────────────
         clarification = await self._memory_store.get_clarification(context.user_id)
@@ -180,7 +191,7 @@ class Agent:
             }
             await self._memory_store.save_clarification(context.user_id, data)
         else:
-            # ── Stage 5: Save Memory ──────────────────────────────────────────
+            # ── Stage 5: Save Memory + async summarisation ───────────────────
             entities = {}
             if plan and getattr(plan, "exam_params", None):
                 entities = plan.exam_params.model_dump(exclude_none=True)
@@ -188,9 +199,13 @@ class Agent:
             memory_data = {
                 "last_intent": context.intent,
                 "last_result": context.result,
-                "entities": entities
+                "entities":    entities,
             }
             await self._memory_store.save_conversation(context.user_id, memory_data)
+
+            # Fire-and-forget: compress long conversations in the background
+            if len(context.history) >= _SUMMARY_THRESHOLD:
+                asyncio.create_task(self._summarize_and_save(context))
 
         elapsed = round(time.perf_counter() - pipeline_start, 4)
         context.add_metadata("agent_duration_seconds", elapsed)
@@ -272,15 +287,34 @@ class Agent:
         return plan
 
     def _route_model(self, context: ExecutionContext) -> None:
-        """Stage 2 — pick the target LLM based on role."""
-        role_map = {
-            "admin": "gpt-4o",
-            "doctor": "gpt-4o-mini",
-            "student": "gpt-4o-mini",
-        }
-        model = role_map.get(context.role, "gpt-4o-mini")
+        """
+        Stage 2 — intent + role aware model selection.
+
+        Routing table:
+          summarization                        → HuggingFace BART (local, free)
+          generate_exam  + doctor/admin        → gpt-4o   (higher quality needed)
+          result_query   + admin               → gpt-4o
+          admin role (any other intent)        → gpt-4o
+          everything else                      → gpt-4o-mini
+        """
+        intent = context.intent or "general_chat"
+        role   = context.role   or "student"
+
+        if intent == "summarization":
+            # Route to local HuggingFace BART — free, no API cost
+            model = "hf/facebook/bart-large-cnn"
+        elif intent == "generate_exam" and role in ("doctor", "admin"):
+            model = "gpt-4o"
+        elif role == "admin":
+            model = "gpt-4o"
+        else:
+            model = "gpt-4o-mini"
+
         context.set_model(model)
-        logger.info("[Agent] stage=model_routing selected_model=%r", model)
+        logger.info(
+            "[Agent] stage=model_routing intent=%r role=%r selected_model=%r",
+            intent, role, model,
+        )
 
     def _select_module(self, context: ExecutionContext) -> str:
         """Stage 3 — resolve intent → module name via ToolRegistry."""
@@ -309,9 +343,13 @@ class Agent:
             user_id=context.user_id,
             auth_header=context.metadata.get("auth_header"),
             context={
-                "role": context.role,
-                "selected_tool": context.selected_tool,
-                "selected_model": context.selected_model,
+                "role":             context.role,
+                "selected_tool":    context.selected_tool,
+                "selected_model":   context.selected_model,
+                "explain":          context.metadata.get("explain", False),
+                "preferences":      context.metadata.get("preferences", {}),
+                "academic_context": context.academic_context,
+                "history":          context.history,
             },
         )
 
@@ -328,6 +366,8 @@ class Agent:
         elapsed = round(time.perf_counter() - t0, 4)
         context.add_metadata("executor_duration_seconds", elapsed)
         context.add_metadata("executor_status", executor_output.status)
+        # Store executor data (suggestions, actions_available, raw results)
+        context.add_metadata("executor_data", executor_output.data or {})
 
         if executor_output.status in ("failed", "partial_failure"):
             context.set_result(executor_output.response)
@@ -340,3 +380,42 @@ class Agent:
             return
 
         context.set_result(executor_output.response)
+
+    # ──────────────────────────────────────────────────────────────────────
+    #  Background summarisation (fire-and-forget)
+    # ──────────────────────────────────────────────────────────────────────
+
+    async def _summarize_and_save(self, context: ExecutionContext) -> None:
+        """
+        Compress long conversation history into a concise summary and
+        persist it in Redis with a 24-hour TTL.
+
+        Called as an asyncio background task — never blocks the response.
+        Uses the local HuggingFace BART model (free, no OpenAI cost).
+        """
+        try:
+            history_text = "\n".join(
+                f"{t.get('role', 'user')}: {t.get('content', '')}"
+                for t in context.history[-20:]
+            )
+            if not history_text.strip():
+                return
+
+            summary = await self._model_router.summarize(
+                text=history_text,
+                model_id="hf/facebook/bart-large-cnn",
+            )
+
+            if summary:
+                await self._memory_store.save_summary(context.user_id, summary)
+                logger.info(
+                    "[Agent] Background summarisation complete: "
+                    "user_id=%s turns=%d summary_chars=%d",
+                    context.user_id, len(context.history), len(summary),
+                )
+        except Exception as exc:
+            # Never propagate — this is best-effort background work
+            logger.warning(
+                "[Agent] Background summarisation failed for user_id=%s: %s",
+                context.user_id, exc,
+            )

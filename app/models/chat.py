@@ -21,7 +21,14 @@ class ChatRequest(BaseModel):
     )
     academic_context: Dict[str, Any] = Field(
         default_factory=dict,
-        description="Domain-specific context (syllabus, grades, …)",
+        description="Domain-specific context (syllabus, grades, user IDs, …)",
+    )
+    explain: bool = Field(
+        default=False,
+        description=(
+            "When True, the AI appends a transparency note explaining how "
+            "it produced the response (data sources, tools used)."
+        ),
     )
 
     @field_validator("user_id")
@@ -50,3 +57,11 @@ class ChatResponse(BaseModel):
     tool_used: Optional[str] = Field(None, description="Tool selected by the pipeline (route or 'model_only')")
     model_used: Optional[str] = Field(None, description="Model identifier selected by the pipeline")
     metadata: Optional[Dict[str, Any]] = Field(None, description="Per-stage timing and debug info")
+    suggestions: List[str] = Field(
+        default_factory=list,
+        description="Contextual follow-up suggestions for the user's next action",
+    )
+    actions_available: List[str] = Field(
+        default_factory=list,
+        description="Quick-action labels for UI buttons or prompts",
+    )

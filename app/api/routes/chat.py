@@ -68,7 +68,10 @@ async def chat_endpoint(
         conversation_id=request.conversation_id or "",
         history=request.history,
         academic_context=request.academic_context,
-        metadata={"auth_header": auth_header},
+        metadata={
+            "auth_header": auth_header,
+            "explain":     request.explain,
+        },
     )
 
     # ── Delegate to Agent ─────────────────────────────────────
@@ -105,6 +108,11 @@ async def chat_endpoint(
             metadata=context.metadata,
         )
 
+    # Extract suggestions / actions injected by the executor
+    executor_data    = (context.metadata or {}).get("executor_data", {}) or {}
+    suggestions      = executor_data.get("suggestions",       [])
+    actions_avail    = executor_data.get("actions_available", [])
+
     return ChatResponse(
         response=str(context.result or ""),
         conversation_id=context.conversation_id,
@@ -112,4 +120,6 @@ async def chat_endpoint(
         tool_used=context.selected_tool,
         model_used=context.selected_model,
         metadata=context.metadata,
+        suggestions=suggestions,
+        actions_available=actions_avail,
     )

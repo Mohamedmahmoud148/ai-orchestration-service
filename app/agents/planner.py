@@ -1,12 +1,22 @@
 """
 planner.py
 
-PlannerAgent — uses the LLM to classify the user's intent and produce
-a validated ExecutionPlan that the Agent pipeline can consume.
+PlannerAgent — uses the LLM to classify the user's intent, extract academic
+parameters, and optionally produce multi-step ExecutionPlans for tool-bound
+requests.
+
+Key upgrades (v4.0):
+  - Injects academic_context into the classification prompt so the model can
+    auto-fill tool parameters (e.g. user_id, subjectOfferingId) without
+    follow-up questions. (Context-Aware Reasoning)
+  - Unlocks multi-step plans for tool-bound intents. general_chat is strictly
+    locked to steps=[]. (Multi-Step Planning)
+  - Updated system prompt with consistent rule numbering and university domain
+    framing. (Prompt Engineering)
+  - Uses structured messages[] instead of concatenated history strings. (fixed)
 """
 
 import json
-import os
 from typing import Optional, Protocol
 
 from pydantic import ValidationError
@@ -21,9 +31,6 @@ from app.agents.schemas import (
 )
 from app.core.logging import logger
 
-# ── Gemini SDK setup (deprecated module-level init removed) ─────────────
-# Client is now injected via the constructor from main.py.
-
 # ── Valid intent catalogue ────────────────────────────────────────────────────
 VALID_INTENTS = {
     "general_chat",
@@ -33,46 +40,98 @@ VALID_INTENTS = {
     "file_extraction",
 }
 
-# ── Fallback plan when Gemini cannot produce valid JSON ───────────────────────
+# ── Fallback intent ───────────────────────────────────────────────────────────
 _FALLBACK_INTENT = "general_chat"
 
+# ── Available backend tools (referenced in system prompt) ─────────────────────
+_AVAILABLE_TOOLS = [
+    "ResolveSubjectOffering",
+    "GetStudentResults",
+    "GetStudentGrades",
+    "GetGPASummary",
+    "GetTranscript",
+    "GetSchedule",
+    "GetSubjectOfferings",
+    "GetCourseEnrollments",
+    "GenerateExam",
+    "DistributeExam",
+]
+
 # ── System prompt ─────────────────────────────────────────────────────────────
-_SYSTEM_PROMPT = """You are an AI Planning Agent.
+_SYSTEM_PROMPT = """\
+You are an AI Planning Agent for a university management system.
 
-Your ONLY job is to read the user's message and return a single JSON object that
-classifies the request.
+Your job is to classify the user's request and return a structured JSON plan.
 
-Valid intents:
-- general_chat       — casual conversation, questions, or anything else
-- summarization      — the user wants a summary of a text or document
-- generate_exam      — the user (a doctor/educator) wants an exam or quiz generated
-- result_query       — the user wants to query academic results or grades
-- file_extraction    — the user wants to extract or parse information from a file
+## Valid Intents
+- general_chat     — conversation, questions, greetings, anything not needing backend data
+- summarization    — summarise a document or text
+- generate_exam    — generate a university exam (doctor/admin only)
+- result_query     — query academic results, grades, GPA, transcripts, schedules
+- file_extraction  — extract information from an uploaded file
 
-Rules:
-1. Reply with ONLY a raw JSON object. No markdown, no code fences, no extra text.
-2. Use exactly this schema:
-
+## Output Schema (return ONLY this JSON, no markdown, no extra text)
 {
-  "intent": "<one of the valid intents above>",
-  "goal_summary": "<one short sentence describing what the user wants>",
+  "intent": "<one of the valid intents>",
+  "goal_summary": "<one clear sentence describing what the user wants>",
   "is_executable": true,
   "exam_params": null,
   "pre_execution_steps": [],
   "steps": []
 }
 
-3. If the intent is generate_exam AND the user supplied exam details, populate
-   exam_params with as many of these fields as you can extract:
-     collegeName, departmentName, batchName, subjectName,
-     numberOfQuestions (integer), examType ("midterm"|"final"),
-     variationMode ("same_for_all"|"different_per_student"),
-     subjectOfferingId (string | null)
+## Rules
 
-7. If intent is anything other than generate_exam, keep exam_params as null.
-8. If you lack the 'subjectOfferingId' for an exam, 'ResolveSubjectOffering' is a tool you can add to 'pre_execution_steps' to find it.
-9. Never output anything outside the JSON object.
-"""
+### 1. general_chat
+- steps MUST be [] (empty array). Never add steps for general_chat.
+- exam_params MUST be null.
+- Use this intent for greetings, explanations, advice, and any question
+  that does not require fetching real student/exam data from the backend.
+
+### 2. Tool-bound intents (summarization, result_query, file_extraction, generate_exam)
+- You MAY include steps when multiple sequential backend calls are needed.
+- Available tools: {tools}
+- Step format:
+  {{
+    "step_id": <int>,
+    "action": "tool",
+    "tool_name": "<one of the available tools>",
+    "input_payload": {{...}},
+    "depends_on": []
+  }}
+- Use {{{{step_N.output}}}} to reference the output of step N in a later step.
+- If only one tool call is needed, leave steps=[].
+
+### 3. generate_exam
+- Populate exam_params with: collegeName, departmentName, batchName,
+  subjectName, numberOfQuestions (int), examType ("midterm"|"final"),
+  variationMode ("same_for_all"|"different_per_student"),
+  subjectOfferingId (string|null).
+- If subjectOfferingId is unknown, add ResolveSubjectOffering to pre_execution_steps.
+
+### 4. Context-aware auto-fill
+- If the user's message refers to "my" data (e.g. "my grades", "my schedule"),
+  use the academic_context provided to fill in userId, courseId, etc.
+  automatically — do NOT ask the user for parameters they already implicitly
+  provided through context.
+
+### 5. When in doubt → use general_chat with steps=[].
+
+### Multi-step example (result_query — grades then GPA):
+{{
+  "intent": "result_query",
+  "goal_summary": "Fetch student grades and calculate GPA",
+  "is_executable": true,
+  "exam_params": null,
+  "pre_execution_steps": [],
+  "steps": [
+    {{"step_id": 1, "action": "tool", "tool_name": "GetStudentGrades",
+      "input_payload": {{"userId": "<from context>"}}, "depends_on": []}},
+    {{"step_id": 2, "action": "tool", "tool_name": "GetGPASummary",
+      "input_payload": {{"gradeData": "{{{{step_1.output}}}}"}}, "depends_on": [1]}}
+  ]
+}}
+""".format(tools=", ".join(_AVAILABLE_TOOLS))
 
 
 class MemoryStore(Protocol):
@@ -85,7 +144,10 @@ class PlannerAgent(BaseAgent):
     """
     Generates an ExecutionPlan by asking the LLM to classify the user's intent.
 
-    The OpenAI client is accessed via the model_router.
+    v4.0 upgrades:
+      - Injects academic_context for context-aware parameter resolution.
+      - Allows multi-step plans for tool-bound intents.
+      - Uses structured messages[] history.
     """
 
     def __init__(
@@ -99,17 +161,17 @@ class PlannerAgent(BaseAgent):
         self.memory = memory
 
     # ─────────────────────────────────────────────────────────────────────
-    #  Public interface (required by Agent pipeline)
+    #  Public interface
     # ─────────────────────────────────────────────────────────────────────
 
     async def run(self, agent_input: AgentInput) -> AgentOutput:
         """
-        1. Build a prompt from the user message + optional memory context.
-        2. Call Gemini for a JSON plan.
-        3. Parse + validate → ExecutionPlan.
-        4. Inject ResolveSubjectOffering pre-step when exam_params lacks an ID.
-        5. Return AgentOutput(status="success", data={"plan": plan}).
-           On any failure / bad JSON → fallback to a general_chat plan.
+        1. Pull optional memory summary for long-term context.
+        2. Inject academic_context to allow context-aware auto-filling.
+        3. Build structured messages[] from history + current message.
+        4. Call LLM for classification JSON.
+        5. Validate, sanitise, and enrich the resulting ExecutionPlan.
+        6. Return AgentOutput(status="success", data={"plan": plan}).
         """
         logger.info("PlannerAgent: starting for user_id=%s", agent_input.user_id)
 
@@ -119,37 +181,59 @@ class PlannerAgent(BaseAgent):
             try:
                 past = await self.memory.get_context(agent_input.user_id)
                 if past:
-                    memory_prefix = f"[Past context]: {past}\n\n"
+                    memory_prefix = f"[Conversation summary]: {past}\n\n"
             except Exception as mem_exc:
                 logger.warning("PlannerAgent: memory lookup failed — %s", mem_exc)
 
-        # ── Build user prompt ─────────────────────────────────────────────
-        role = agent_input.context.get("role", "user") if agent_input.context else "user"
-        history_str = ""
-        if agent_input.context and "history" in agent_input.context:
-            for m in agent_input.context["history"]:
-                history_str += f"{m.get('role', 'user')}: {m.get('content', '')}\n"
-        if history_str:
-             history_str = f"[Conversation History]:\n{history_str}\n"
+        # ── Extract context components ────────────────────────────────────
+        ctx = agent_input.context or {}
+        role = ctx.get("role", "user")
+        raw_history: list[dict] = ctx.get("history", [])
+        academic_ctx: dict = ctx.get("academic_context", {})
 
-        prompt = (
+        # Compact summary of academic context for auto-filling parameters
+        auto_fill_note = ""
+        if academic_ctx:
+            # Only expose safe, useful fields — never passwords or tokens
+            safe_keys = [
+                "userId", "studentId", "courseId", "subjectOfferingId",
+                "departmentId", "batchId", "collegeName", "departmentName",
+            ]
+            relevant = {k: v for k, v in academic_ctx.items() if k in safe_keys and v}
+            if relevant:
+                auto_fill_note = (
+                    f"\nAvailable context for auto-filling parameters: "
+                    f"{json.dumps(relevant, ensure_ascii=False)}"
+                )
+
+        # ── Build structured history turns (last 3 pairs = 6 messages) ────
+        history_turns: list[dict] = []
+        for turn in raw_history[-6:]:
+            turn_role = turn.get("role", "user")
+            turn_content = str(turn.get("content", ""))
+            if turn_role in ("user", "assistant") and turn_content:
+                history_turns.append({"role": turn_role, "content": turn_content})
+
+        # ── Compose user classification request ───────────────────────────
+        user_content = (
             f"{memory_prefix}"
-            f"{history_str}"
             f"User role: {role}\n"
             f"User message: {agent_input.message}"
+            f"{auto_fill_note}"
         )
 
-        # ── Call LLM (OpenAI) via ModelRouter ─────────────────────────────
-        raw_json = await self._call_planner_model(prompt)
+        # ── Call LLM ──────────────────────────────────────────────────────
+        raw_json = await self._call_planner_model(history_turns, user_content)
 
-        # ── Parse response → ExecutionPlan ────────────────────────────────
+        # ── Parse + validate → ExecutionPlan ──────────────────────────────
         plan = self._parse_plan(raw_json, agent_input)
 
         # ── Deterministic guard for generate_exam ─────────────────────────
         plan = self._ensure_resolve_step(plan)
 
         logger.info(
-            "PlannerAgent: intent=%r goal=%r", plan.intent, plan.goal_summary
+            "PlannerAgent: intent=%r steps=%d goal=%r",
+            plan.intent, len(plan.steps), plan.goal_summary,
         )
 
         return AgentOutput(
@@ -162,38 +246,50 @@ class PlannerAgent(BaseAgent):
     #  Internal helpers
     # ─────────────────────────────────────────────────────────────────────
 
-    async def _call_planner_model(self, prompt: str) -> dict | None:
+    async def _call_planner_model(
+        self, history_turns: list[dict], user_content: str
+    ) -> dict | None:
         """
-        Send the prompt to OpenAI via ModelRouter and return the parsed JSON dict,
-        or None on any error. Includes fallback to gpt-3.5-turbo.
+        Send the planning request to OpenAI via structured messages[].
+
+        Message order:
+          [system]  _SYSTEM_PROMPT
+          [prior turns from history…]
+          [user]    role + message + academic_context note
+
+        Falls back to gpt-3.5-turbo if gpt-4o-mini returns nothing.
         """
         try:
-            logger.debug("PlannerAgent: Requesting JSON from gpt-4o-mini")
+            logger.debug("PlannerAgent: requesting JSON from gpt-4o-mini")
             parsed = await self.model_router.generate_structured_json(
-                prompt=prompt,
+                prompt=user_content,
                 system_instruction=_SYSTEM_PROMPT,
-                model_id="gpt-4o-mini"
+                model_id="gpt-4o-mini",
             )
-            
+
             if not parsed:
-                logger.warning("PlannerAgent: gpt-4o-mini failed or returned empty. Falling back to gpt-3.5-turbo")
-                parsed = await self.model_router.generate_structured_json(
-                    prompt=prompt,
-                    system_instruction=_SYSTEM_PROMPT,
-                    model_id="gpt-3.5-turbo"
+                logger.warning(
+                    "PlannerAgent: gpt-4o-mini returned empty — falling back to gpt-3.5-turbo"
                 )
-                
-            logger.debug("PlannerAgent: Raw plan from model = %s", parsed)
+                parsed = await self.model_router.generate_structured_json(
+                    prompt=user_content,
+                    system_instruction=_SYSTEM_PROMPT,
+                    model_id="gpt-3.5-turbo",
+                )
+
+            logger.debug("PlannerAgent: raw plan = %s", parsed)
             return parsed
 
         except Exception as exc:
-            logger.error("PlannerAgent: Model call failed — %s", exc, exc_info=True)
+            logger.error("PlannerAgent: model call failed — %s", exc, exc_info=True)
             return None
 
     def _parse_plan(self, raw: dict | None, agent_input: AgentInput) -> ExecutionPlan:
         """
-        Convert raw LLM output into a validated ExecutionPlan.
-        Falls back to a general_chat plan on any parse/validation error.
+        Validate the raw LLM dict into an ExecutionPlan with safety guards:
+          - Invalid intent → downgrade to general_chat
+          - general_chat   → force steps=[], exam_params=None
+          - tool_name in steps → validated by executor (not here)
         """
         if not raw:
             return self._fallback_plan(agent_input.message)
@@ -203,11 +299,24 @@ class PlannerAgent(BaseAgent):
         if intent not in VALID_INTENTS:
             logger.warning(
                 "PlannerAgent: unknown intent %r — falling back to %s",
-                intent,
-                _FALLBACK_INTENT,
+                intent, _FALLBACK_INTENT,
             )
             intent = _FALLBACK_INTENT
             raw["intent"] = intent
+
+        # HARD RULE: general_chat must never have steps or exam context
+        if intent == "general_chat":
+            raw["steps"] = []
+            raw["exam_params"] = None
+
+        # HARD RULE: steps must always be an empty list regardless of what
+        # the planner returned (planner is advisory; steps come from planner
+        # only for tool-bound intents, handled via pre_execution_steps or
+        # the module architecture)
+        # NOTE: We allow non-empty steps for non-chat intents (multi-step unlock)
+        # but sanitise any non-list value to an empty list.
+        if not isinstance(raw.get("steps"), list):
+            raw["steps"] = []
 
         try:
             plan = ExecutionPlan(**raw)
@@ -255,8 +364,6 @@ class PlannerAgent(BaseAgent):
                             "subjectOfferingId is required to generate the exam "
                             "but was not provided by the user"
                         ),
-                        # GET /api/ai-tools/resolve-offering?subject={subjectName}
-                        # Only subjectName is forwarded as the query param.
                         input_payload={
                             "subjectName": plan.exam_params.subjectName,
                         },

@@ -1,21 +1,34 @@
 """
-app/agents/executor.py
+app/agents/executor.py  —  v4.0 Production-Grade Dispatcher
 
-PlanExecutor — the dynamic module dispatcher.
+Capabilities in this version:
+  1. Context-Aware Reasoning    — user_id + academic_context auto-injected into tool payloads
+  2. Multi-Step Planning        — sequential tool chaining with {{step_N.output}} interpolation
+  3. Tool Result Reasoning      — LLM narrates raw tool data in natural, role-appropriate language
+  4. Memory                     — preferences injected into system prompt (set by Agent)
+  5. Explainability Mode        — optional transparency block appended to responses
+  6. Role-Specific Behaviour    — three distinct system prompts (student / doctor / admin)
+  7. Error Recovery             — 1 automatic retry; graceful LLM fallback on persistent failure
+  8. Smart Follow-Up Suggestions— deterministic suggestions per intent+role, no LLM cost
+  9. Hybrid Model Usage         — model_id selected by Agent routing, passed in via context
+ 10. Structured Response        — AgentOutput.data carries {suggestions, actions_available}
 
-Responsibilities:
-  - Accept an ExecutionPlan + a module_name resolved by the Agent.
-  - Look up (or lazily instantiate) the correct Module from app.modules.
-  - Call module.run(agent_input, plan) and return an AgentOutput.
-  - Fall back to a generic step-by-step executor for plans without a
-    dedicated module (model-only or multi-tool flows).
+Routing order in execute() (strictly enforced):
+  1. Dedicated module (exam_generation, summarization, …) → _run_module()
+  2. general_chat OR empty steps                          → _fallback_model_call()
+  3. Non-empty steps (multi-step plan)                    → _run_plan()
+  4. No plan                                              → _fallback_model_call()
 """
 
 from __future__ import annotations
 
+import asyncio
+import html
 import importlib
+import inspect
+import json
 import re
-from typing import Any, Callable, Dict, Optional, Awaitable, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Optional, Awaitable, TYPE_CHECKING
 
 from app.agents.schemas import AgentInput, AgentOutput, ExecutionPlan
 from app.core.logging import logger
@@ -24,19 +37,142 @@ if TYPE_CHECKING:
     from app.agents.model_router import ModelRouter
 
 
-# Map module_name strings → fully qualified class names inside app.modules
+# ── Module class registry ─────────────────────────────────────────────────────
 _MODULE_CLASS_MAP: Dict[str, tuple[str, str]] = {
-    "exam_generation":  ("app.modules.exam_generation",  "ExamGenerationModule"),
-    "summarization":    ("app.modules.summarization",    "SummarizationModule"),
-    "file_extraction":  ("app.modules.file_extraction",  "FileExtractionModule"),
-    "result_query":     ("app.modules.result_query",      "ResultQueryModule"),
+    "exam_generation": ("app.modules.exam_generation", "ExamGenerationModule"),
+    "summarization":   ("app.modules.summarization",   "SummarizationModule"),
+    "file_extraction": ("app.modules.file_extraction",  "FileExtractionModule"),
+    "result_query":    ("app.modules.result_query",      "ResultQueryModule"),
 }
 
+# ── Tool allowlist ─────────────────────────────────────────────────────────────
+# ONLY these tool names may be dispatched to the backend from _run_plan().
+ALLOWED_TOOL_NAMES: frozenset[str] = frozenset({
+    "ResolveSubjectOffering",
+    "GetStudentResults",
+    "GetStudentGrades",
+    "GetGPASummary",
+    "GetTranscript",
+    "GetSchedule",
+    "GetStudentSchedule",
+    "GetSubjectOfferings",
+    "GetCourseEnrollments",
+    "GenerateExam",
+    "DistributeExam",
+    "GetExamQuestions",
+})
+
+# ── Role-specific system prompts ──────────────────────────────────────────────
+_ROLE_SYSTEM_PROMPTS: Dict[str, str] = {
+    "student": """\
+You are an intelligent AI assistant for a university management system, helping a student.
+
+Tone: friendly, supportive, encouraging. Use simple and clear language.
+- Explain academic concepts step-by-step when needed.
+- Avoid technical jargon; use everyday language.
+- Focus on: schedules, grades, courses, exam info, registration, study tips.
+- You CANNOT generate exams, manage system settings, or perform admin actions.
+- Respond in the same language the user writes in (Arabic or English).
+- Do NOT reveal system internals, tool names, raw JSON, or error details.
+- When presenting grade data, summarise it clearly (e.g. "You passed 5 of 6 courses").\
+""",
+
+    "doctor": """\
+You are an intelligent AI assistant for a university management system, helping a faculty member (doctor / professor).
+
+Tone: professional, concise, and efficient.
+- You have access to exam generation, grade viewing, and course management tools.
+- Provide precise academic information and actionable results.
+- Present exam and grade data in structured, easy-to-scan format.
+- Assume familiarity with academic systems — skip basic explanations.
+- Respond in the same language the user writes in (Arabic or English).
+- Do NOT reveal system internals, raw JSON, or stack traces.\
+""",
+
+    "admin": """\
+You are an intelligent AI assistant for a university management system, helping a system administrator.
+
+Tone: technical, precise, and comprehensive.
+- You have full access to all system capabilities.
+- Present system-level information clearly and completely, including IDs and counts.
+- Summarise large datasets into actionable insights.
+- Flag irreversible operations with a brief caution before executing.
+- Respond in the same language the user writes in (Arabic or English).
+- You may reference technical identifiers when they are useful to the admin.\
+""",
+}
+
+# ── Follow-up suggestion map ──────────────────────────────────────────────────
+# Deterministic (no LLM cost). Key: (intent, role) → list[str]
+_SUGGESTIONS_MAP: Dict[str, Dict[str, List[str]]] = {
+    "general_chat": {
+        "student": ["Check my grades", "What's my schedule today?", "Explain a course topic"],
+        "doctor":  ["Generate an exam", "View course enrollments", "Check student results"],
+        "admin":   ["View system stats", "List all departments", "Check pending actions"],
+    },
+    "result_query": {
+        "student": ["View full transcript", "Calculate my GPA", "Which courses did I pass?"],
+        "doctor":  ["Export results report", "Compare batch results", "View top students"],
+        "admin":   ["Export all results", "View department summary", "Filter by GPA range"],
+    },
+    "generate_exam": {
+        "student": ["View exam schedule", "Ask about exam topics", "Get study tips"],
+        "doctor":  ["Distribute this exam", "Preview questions", "Generate for another subject"],
+        "admin":   ["Review all exams", "Export exam report", "View submitted exams"],
+    },
+    "summarization": {
+        "student": ["Ask questions about this content", "Get key points only", "Explain in simpler terms"],
+        "doctor":  ["Generate questions from this", "Create exam from content", "Save as notes"],
+        "admin":   ["Archive this summary", "Share with department", "Generate report"],
+    },
+    "file_extraction": {
+        "student": ["Summarize this file", "Ask questions about it", "Extract key topics"],
+        "doctor":  ["Generate exam from file", "Extract syllabus topics", "Summarise for students"],
+        "admin":   ["Process all pending files", "Extract and archive", "Generate department report"],
+    },
+}
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+_MAX_HISTORY_TURNS = 10
+_MAX_INPUT_LENGTH  = 4_000
+_TOOL_RETRY_DELAY  = 1.0    # seconds between retry attempts
+
+
+# ── Input sanitisation ────────────────────────────────────────────────────────
+
+def _sanitise(text: str) -> str:
+    """
+    Sanitise user content before injecting into LLM prompts.
+      1. Strip whitespace.
+      2. Truncate to _MAX_INPUT_LENGTH characters.
+      3. HTML-escape special characters to defuse common prompt-injection tricks.
+    """
+    if not isinstance(text, str):
+        text = str(text)
+    return html.escape(text.strip()[:_MAX_INPUT_LENGTH])
+
+
+def _build_explain_block(steps_narrative: List[str], intent: str) -> str:
+    """Build a brief transparency note for explainability mode."""
+    if not steps_narrative:
+        return "\n\nℹ️ *I used my general knowledge to answer this question.*"
+    steps_text = "; ".join(steps_narrative)
+    return (
+        f"\n\nℹ️ *Transparency: To answer your request about **{intent.replace('_', ' ')}**, "
+        f"I performed the following: {steps_text}. "
+        f"The response above is based on the data retrieved from your academic records.*"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  PlanExecutor
+# ─────────────────────────────────────────────────────────────────────────────
 
 class PlanExecutor:
     """
-    Iterates through an ExecutionPlan and dispatches work to the
-    appropriate Module, model call, or backend tool call.
+    Routes each orchestration request to the correct execution path and
+    enriches responses with natural-language reasoning, follow-up
+    suggestions, and optional explainability notes.
     """
 
     def __init__(
@@ -49,11 +185,10 @@ class PlanExecutor:
     ) -> None:
         self.backend_execution_func = backend_execution_func
         self.model_router = model_router
-        # Cache for lazily instantiated module objects
         self._module_cache: Dict[str, Any] = {}
 
     # ──────────────────────────────────────────────────────────────────────
-    #  Public API (called by Agent)
+    #  Public API
     # ──────────────────────────────────────────────────────────────────────
 
     async def execute(
@@ -63,18 +198,40 @@ class PlanExecutor:
         module_name: str = "model_only",
     ) -> AgentOutput:
         """
-        Dispatch to the correct Module if one is registered, otherwise
-        fall back to the generic step-by-step plan runner.
+        Dispatch to the correct handler.
+
+        Priority order (strictly enforced):
+          1. Dedicated module            → _run_module()
+          2. general_chat / empty steps  → _fallback_model_call()  [NO ECHO PATH]
+          3. Non-empty steps             → _run_plan()
+          4. No plan                     → _fallback_model_call()
         """
-        # ── 1. Dedicated module flow ───────────────────────────────────
+        # 1. Module dispatch ──────────────────────────────────────────────
         if module_name in _MODULE_CLASS_MAP:
+            logger.info("PlanExecutor: module route → '%s'", module_name)
             return await self._run_module(module_name, plan, input_context)
 
-        # ── 2. Generic plan step-loop (model-only or multi-tool) ──────
+        # 2. general_chat OR empty steps → LLM (no echo path) ─────────────
         if plan and isinstance(plan, ExecutionPlan):
+            is_chat   = plan.intent == "general_chat"
+            has_steps = bool(plan.steps)
+
+            if is_chat or not has_steps:
+                logger.info(
+                    "PlanExecutor: intent=%r steps=0 → _fallback_model_call",
+                    plan.intent,
+                )
+                return await self._fallback_model_call(input_context)
+
+            # 3. Multi-step plan → step runner ───────────────────────────
+            logger.info(
+                "PlanExecutor: intent=%r steps=%d → _run_plan",
+                plan.intent, len(plan.steps),
+            )
             return await self._run_plan(plan, input_context)
 
-        # ── 3. Bare LLM call (no plan, no module) ─────────────────────
+        # 4. No plan → LLM ─────────────────────────────────────────────────
+        logger.info("PlanExecutor: no plan → _fallback_model_call")
         return await self._fallback_model_call(input_context)
 
     # ──────────────────────────────────────────────────────────────────────
@@ -88,14 +245,11 @@ class PlanExecutor:
             mod = importlib.import_module(mod_path)
             cls = getattr(mod, class_name)
 
-            # Inject only the dependencies that the class accepts
-            import inspect
             init_params = inspect.signature(cls.__init__).parameters
             kwargs: Dict[str, Any] = {}
             if "model_router" in init_params:
                 kwargs["model_router"] = self.model_router
             if "backend_client" in init_params:
-                # Manufacture a thin wrapper that matches the module interface
                 from app.services.backend_client import tool_execution_client
                 kwargs["backend_client"] = tool_execution_client
 
@@ -110,39 +264,68 @@ class PlanExecutor:
         plan: Any,
         input_context: AgentInput,
     ) -> AgentOutput:
-        """Instantiate (or fetch from cache) and run the named module."""
+        """Fetch (or load) and run the named module."""
         logger.info("PlanExecutor: dispatching to module '%s'.", module_name)
         try:
             module = self._get_module(module_name)
-            return await module.run(input_context, plan)
+            result = await module.run(input_context, plan)
+            # Inject suggestions if not already present
+            if result.status == "success":
+                role   = (input_context.context or {}).get("role", "student")
+                intent = getattr(plan, "intent", module_name) or module_name
+                suggestions = self._get_suggestions(intent, role)
+                data = result.data or {}
+                data.setdefault("suggestions", suggestions)
+                data.setdefault("actions_available", suggestions)
+                return AgentOutput(
+                    status=result.status,
+                    response=result.response,
+                    data=data,
+                )
+            return result
+
         except Exception as exc:
             logger.error(
                 "PlanExecutor: module '%s' raised an error: %s",
-                module_name,
-                exc,
-                exc_info=True,
+                module_name, exc, exc_info=True,
             )
-            return AgentOutput(
-                status="failed",
-                response=f"Module '{module_name}' failed: {exc}",
+            role     = (input_context.context or {}).get("role", "student")
+            model_id = (input_context.context or {}).get("selected_model", "gpt-4o-mini")
+            return await self._graceful_error_response(
+                module_name, role, model_id,
             )
 
     # ──────────────────────────────────────────────────────────────────────
-    #  Generic step-loop (fallback for multi-tool / model-only plans)
+    #  Multi-step plan runner
     # ──────────────────────────────────────────────────────────────────────
 
     async def _run_plan(
         self, plan: ExecutionPlan, input_context: AgentInput
     ) -> AgentOutput:
-        """Execute a generic ExecutionPlan step by step."""
+        """
+        Execute an ExecutionPlan step-by-step with:
+          - Allowlist validation per tool step
+          - Automatic 1-retry on transient tool failures
+          - Tool result narration via LLM
+          - Follow-up suggestions
+          - Optional explainability block
+        """
         if not plan.is_executable:
             return AgentOutput(
                 status="failed",
-                response="Plan is marked as non-executable.",
+                response="This plan is marked as non-executable.",
             )
+
+        ctx        = input_context.context or {}
+        role       = ctx.get("role", "student")
+        model_id   = ctx.get("selected_model", "gpt-4o-mini")
+        explain    = ctx.get("explain", False)
+        intent     = plan.intent or "general_chat"
+        user_id    = input_context.user_id
 
         execution_results: Dict[int, Any] = {}
         successful_steps = 0
+        steps_narrative: List[str] = []
         ordered_steps = sorted(plan.steps, key=lambda s: s.step_id)
 
         for step in ordered_steps:
@@ -151,21 +334,47 @@ class PlanExecutor:
             )
             payload = self._interpolate(step.input_payload, execution_results)
 
+            # Auto-inject user_id into tool payloads when present and missing
+            if user_id and "userId" not in payload:
+                payload["userId"] = user_id
+
             try:
                 if step.action == "tool":
-                    result = await self.backend_execution_func(
-                        step.tool_name,
-                        payload,
-                        input_context.auth_header,
-                        input_context.user_id,
+                    # ── Allowlist validation ─────────────────────────────
+                    if step.tool_name not in ALLOWED_TOOL_NAMES:
+                        logger.warning(
+                            "PlanExecutor: BLOCKED disallowed tool '%s' at step %s",
+                            step.tool_name, step.step_id,
+                        )
+                        return AgentOutput(
+                            status="failed",
+                            response=(
+                                "I'm unable to perform that action — "
+                                "the requested operation is not permitted."
+                            ),
+                        )
+
+                    result = await self._execute_tool_with_retry(
+                        step.tool_name, payload,
+                        input_context.auth_header, user_id,
                     )
+                    steps_narrative.append(f"retrieved data via {step.tool_name}")
+                    logger.info(
+                        "PlanExecutor: step %s → tool='%s' success",
+                        step.step_id, step.tool_name,
+                    )
+
                 elif step.action == "model":
-                    prompt = payload.get("prompt", str(payload))
-                    sys_inst = payload.get("system_instruction", "")
-                    text = await self.model_router.generate(
-                        prompt=prompt, system_instruction=sys_inst
+                    prompt  = _sanitise(payload.get("prompt", str(payload)))
+                    sys_ins = payload.get("system_instruction", "")
+                    text    = await self.model_router.generate(
+                        prompt=prompt,
+                        system_instruction=sys_ins,
+                        model_id=model_id,
                     )
                     result = {"output": text}
+                    steps_narrative.append("generated AI text")
+
                 elif step.action == "agent_module":
                     result_out = await self._run_module(
                         step.module_name or "", plan, input_context
@@ -173,48 +382,321 @@ class PlanExecutor:
                     if result_out.status == "clarification_needed":
                         return result_out
                     result = {"output": result_out.response, "data": result_out.data}
+                    steps_narrative.append(f"processed via {step.module_name} module")
+
                 else:
                     result = {"skipped": True, "reason": f"Unknown action '{step.action}'"}
 
                 execution_results[step.step_id] = result
 
                 if isinstance(result, dict) and "error" in result:
-                    return AgentOutput(
-                        status="partial_failure",
-                        response=f"Halted at step {step.step_id}: {result['error']}",
-                        data={"results": execution_results},
+                    logger.warning(
+                        "PlanExecutor: step %s returned error in result", step.step_id
                     )
+                    return await self._graceful_error_response(intent, role, model_id)
+
                 successful_steps += 1
 
             except Exception as exc:
-                return AgentOutput(
-                    status="failed",
-                    response=f"Step {step.step_id} failed: {exc}",
-                    data={"error": str(exc)},
+                logger.error(
+                    "PlanExecutor: step %s failed after retry: %s",
+                    step.step_id, exc, exc_info=True,
                 )
+                return await self._graceful_error_response(intent, role, model_id)
+
+        # ── Narrate results via LLM ───────────────────────────────────────
+        narrative = await self._reason_about_results(
+            execution_results, intent, role, model_id
+        )
+
+        # ── Explainability block ──────────────────────────────────────────
+        if explain and steps_narrative:
+            narrative += _build_explain_block(steps_narrative, intent)
+
+        suggestions = self._get_suggestions(intent, role)
 
         return AgentOutput(
             status="success",
-            response=plan.goal_summary or f"Executed {successful_steps} steps.",
-            data={"results": execution_results},
-        )
-
-    async def _fallback_model_call(self, input_context: AgentInput) -> AgentOutput:
-        """Pure LLM call when there's no plan and no module."""
-        if not self.model_router:
-            return AgentOutput(status="failed", response="No model router available.")
-
-        response = await self.model_router.generate(
-            prompt=input_context.message,
-            system_instruction="You are a helpful AI assistant.",
-        )
-        return AgentOutput(
-            status="success",
-            response=response or "I could not generate a response.",
+            response=narrative,
+            data={
+                "results":           execution_results,
+                "suggestions":       suggestions,
+                "actions_available": suggestions,
+            },
         )
 
     # ──────────────────────────────────────────────────────────────────────
-    #  Helpers
+    #  Tool retry
+    # ──────────────────────────────────────────────────────────────────────
+
+    async def _execute_tool_with_retry(
+        self,
+        tool_name: str,
+        payload: Dict[str, Any],
+        auth_header: Optional[str],
+        user_id: Optional[str],
+    ) -> Dict[str, Any]:
+        """
+        Execute a backend tool call with one automatic retry on any failure.
+
+        Attempt 1 → failure → sleep 1 s → Attempt 2 → failure → raise.
+        """
+        last_exc: Exception = RuntimeError("Tool did not execute.")
+        for attempt in range(2):
+            try:
+                return await self.backend_execution_func(
+                    tool_name, payload, auth_header, user_id
+                )
+            except Exception as exc:
+                last_exc = exc
+                if attempt == 0:
+                    logger.warning(
+                        "PlanExecutor: tool '%s' failed (attempt 1), retrying in %.1fs: %s",
+                        tool_name, _TOOL_RETRY_DELAY, exc,
+                    )
+                    await asyncio.sleep(_TOOL_RETRY_DELAY)
+        raise last_exc
+
+    # ──────────────────────────────────────────────────────────────────────
+    #  Tool result reasoning (LLM narration)
+    # ──────────────────────────────────────────────────────────────────────
+
+    async def _reason_about_results(
+        self,
+        execution_results: Dict[int, Any],
+        intent: str,
+        role: str,
+        model_id: str,
+    ) -> str:
+        """
+        Ask the LLM to narrate raw tool results in natural, role-appropriate language.
+
+        Raw JSON is never shown to the user — the LLM extracts the meaningful
+        information and presents it conversationally.
+        """
+        if not self.model_router or not execution_results:
+            return "The operation completed successfully."
+
+        # Build compact, safe result representation
+        result_parts: List[str] = []
+        for step_id, result in sorted(execution_results.items()):
+            if isinstance(result, dict):
+                # Strip binary/internal keys before sending to LLM
+                clean = {
+                    k: v for k, v in result.items()
+                    if k not in ("_raw_bytes", "skipped", "content_type")
+                }
+                if clean:
+                    result_parts.append(
+                        f"Step {step_id} data:\n"
+                        + json.dumps(clean, ensure_ascii=False)[:1_200]
+                    )
+            elif isinstance(result, str) and result.strip():
+                result_parts.append(f"Step {step_id} result: {result[:600]}")
+
+        if not result_parts:
+            return "The operation completed successfully."
+
+        results_str = "\n\n".join(result_parts)
+        role_prompt = _ROLE_SYSTEM_PROMPTS.get(role, _ROLE_SYSTEM_PROMPTS["student"])
+
+        messages = [
+            {"role": "system", "content": role_prompt},
+            {
+                "role": "user",
+                "content": (
+                    f"I just retrieved the following data for a {role}. "
+                    "Please present it clearly and naturally — "
+                    "do NOT show raw JSON or field names. "
+                    "Extract the meaningful information and explain it conversationally. "
+                    "Be concise but complete.\n\n"
+                    f"Retrieved data:\n{results_str}"
+                ),
+            },
+        ]
+
+        try:
+            response = await self.model_router.generate_with_messages(
+                messages=messages, model_id=model_id
+            )
+            return response or "The operation completed successfully."
+        except Exception as exc:
+            logger.error("PlanExecutor._reason_about_results error: %s", exc)
+            return "The operation completed successfully."
+
+    # ──────────────────────────────────────────────────────────────────────
+    #  Graceful error recovery
+    # ──────────────────────────────────────────────────────────────────────
+
+    async def _graceful_error_response(
+        self,
+        intent: str,
+        role: str,
+        model_id: str = "gpt-4o-mini",
+    ) -> AgentOutput:
+        """
+        Generate a user-friendly error message via LLM.
+
+        NEVER exposes raw error strings, stack traces, or backend responses
+        to the end user. Always offers a constructive alternative.
+        """
+        logger.info(
+            "PlanExecutor: graceful error recovery → intent=%s role=%s", intent, role
+        )
+
+        if not self.model_router:
+            return AgentOutput(
+                status="failed",
+                response=(
+                    "I'm sorry, I encountered a temporary issue processing your request. "
+                    "Please try again in a moment."
+                ),
+            )
+
+        role_prompt = _ROLE_SYSTEM_PROMPTS.get(role, _ROLE_SYSTEM_PROMPTS["student"])
+        intent_label = intent.replace("_", " ")
+
+        messages = [
+            {"role": "system", "content": role_prompt},
+            {
+                "role": "user",
+                "content": (
+                    f"The system encountered a temporary issue while completing a "
+                    f"'{intent_label}' request. Please generate a friendly, helpful "
+                    "message that:\n"
+                    "1. Apologises briefly without being excessive.\n"
+                    "2. Suggests a concrete alternative the user can try.\n"
+                    "3. Does NOT reveal any technical details, error codes, or system internals.\n"
+                    "Respond in the same language the user would expect (Arabic or English)."
+                ),
+            },
+        ]
+
+        try:
+            response = await self.model_router.generate_with_messages(
+                messages=messages, model_id="gpt-4o-mini"
+            )
+            return AgentOutput(
+                status="failed",
+                response=(
+                    response
+                    or "I'm sorry, I encountered a temporary issue. Please try again in a moment."
+                ),
+            )
+        except Exception as exc:
+            logger.error("PlanExecutor._graceful_error_response LLM call failed: %s", exc)
+            return AgentOutput(
+                status="failed",
+                response=(
+                    "I'm sorry, I encountered a temporary issue. "
+                    "Please try again in a moment."
+                ),
+            )
+
+    # ──────────────────────────────────────────────────────────────────────
+    #  Fallback LLM call (general_chat + no-plan paths)
+    # ──────────────────────────────────────────────────────────────────────
+
+    async def _fallback_model_call(self, input_context: AgentInput) -> AgentOutput:
+        """
+        Direct LLM call for general_chat and all cases without a step plan.
+
+        Builds structured messages[] with:
+          - Role-specific system prompt (student / doctor / admin)
+          - Language preference injected if stored in user preferences
+          - Up to _MAX_HISTORY_TURNS of sanitised conversation history
+          - Sanitised current user message
+
+        Appends explainability block if explain=True.
+        Attaches deterministic follow-up suggestions.
+        """
+        if not self.model_router:
+            return AgentOutput(status="failed", response="No model router available.")
+
+        ctx          = input_context.context or {}
+        role         = ctx.get("role", "student")
+        raw_history  = ctx.get("history", []) or []
+        model_id     = ctx.get("selected_model", "gpt-4o-mini")
+        explain      = ctx.get("explain", False)
+        prefs        = ctx.get("preferences", {}) or {}
+        intent       = "general_chat"
+
+        # ── Role-specific system prompt ───────────────────────────────────
+        base_prompt = _ROLE_SYSTEM_PROMPTS.get(role, _ROLE_SYSTEM_PROMPTS["student"])
+
+        # Inject language preference if stored
+        lang_pref = prefs.get("language", "")
+        if lang_pref:
+            base_prompt += (
+                f"\n\nUser language preference: {lang_pref}. "
+                "Respond in that language whenever possible."
+            )
+
+        # Inject any interests for personalisation
+        interests = prefs.get("interests", [])
+        if interests:
+            base_prompt += (
+                f"\nUser academic interests: {', '.join(interests[:5])}. "
+                "Tailor responses to these interests when relevant."
+            )
+
+        # ── Build messages[] ──────────────────────────────────────────────
+        messages: List[dict] = [{"role": "system", "content": base_prompt}]
+
+        for turn in raw_history[-_MAX_HISTORY_TURNS:]:
+            turn_role    = turn.get("role", "user")
+            turn_content = _sanitise(turn.get("content", ""))
+            if turn_role in ("user", "assistant") and turn_content:
+                messages.append({"role": turn_role, "content": turn_content})
+
+        messages.append({"role": "user", "content": _sanitise(input_context.message)})
+
+        logger.info(
+            "PlanExecutor._fallback_model_call: role=%r model=%r history=%d explain=%s",
+            role, model_id, len(raw_history), explain,
+        )
+
+        # ── LLM call ─────────────────────────────────────────────────────
+        response = await self.model_router.generate_with_messages(
+            messages=messages, model_id=model_id
+        )
+        final_response = (
+            response
+            or "I'm sorry, I could not generate a response. Please try again."
+        )
+
+        # ── Explainability block ──────────────────────────────────────────
+        if explain:
+            final_response += (
+                "\n\nℹ️ *I answered this using my general knowledge "
+                "and your conversation history — no backend data was retrieved.*"
+            )
+
+        suggestions = self._get_suggestions(intent, role)
+
+        return AgentOutput(
+            status="success",
+            response=final_response,
+            data={
+                "suggestions":       suggestions,
+                "actions_available": suggestions,
+            },
+        )
+
+    # ──────────────────────────────────────────────────────────────────────
+    #  Follow-up suggestion helper
+    # ──────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _get_suggestions(intent: str, role: str) -> List[str]:
+        """Return deterministic follow-up suggestions for the given intent+role."""
+        intent_map = _SUGGESTIONS_MAP.get(intent)
+        if not intent_map:
+            intent_map = _SUGGESTIONS_MAP.get("general_chat", {})
+        return intent_map.get(role) or intent_map.get("student", [])
+
+    # ──────────────────────────────────────────────────────────────────────
+    #  Payload interpolation helper
     # ──────────────────────────────────────────────────────────────────────
 
     @staticmethod
@@ -230,7 +712,11 @@ class PlanExecutor:
                 if match:
                     step_id = int(match.group(1))
                     sub = results.get(step_id, v)
-                    out[k] = sub if v.strip() == match.group(0) else v.replace(match.group(0), str(sub))
+                    out[k] = (
+                        sub
+                        if v.strip() == match.group(0)
+                        else v.replace(match.group(0), str(sub))
+                    )
                 else:
                     out[k] = v
             else:
