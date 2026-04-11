@@ -1,5 +1,5 @@
 """
-app/agents/executor.py  —  v4.0 Production-Grade Dispatcher
+app/agents/executor.py  —  v4.1 Production-Grade Dispatcher
 
 Capabilities in this version:
   1. Context-Aware Reasoning    — user_id + academic_context auto-injected into tool payloads
@@ -12,12 +12,16 @@ Capabilities in this version:
   8. Smart Follow-Up Suggestions— deterministic suggestions per intent+role, no LLM cost
   9. Hybrid Model Usage         — model_id selected by Agent routing, passed in via context
  10. Structured Response        — AgentOutput.data carries {suggestions, actions_available}
+ 11. Strict RBAC               — single source of truth via app/core/rbac.py:
+                                  log_blocked_attempt() emits structured WARNING for monitoring
 
 Routing order in execute() (strictly enforced):
-  1. Dedicated module (exam_generation, summarization, …) → _run_module()
-  2. general_chat OR empty steps                          → _fallback_model_call()
-  3. Non-empty steps (multi-step plan)                    → _run_plan()
-  4. No plan                                              → _fallback_model_call()
+  0. RBAC gate              → immediate forbidden if role not permitted
+                              (calls rbac.log_blocked_attempt() for audit trail)
+  1. Dedicated module       → _run_module()
+  2. general_chat OR empty  → _fallback_model_call()  [NO ECHO PATH]
+  3. Non-empty steps        → _run_plan()
+  4. No plan                → _fallback_model_call()
 """
 
 from __future__ import annotations
@@ -44,11 +48,12 @@ _MODULE_CLASS_MAP: Dict[str, tuple[str, str]] = {
     "file_extraction": ("app.modules.file_extraction",  "FileExtractionModule"),
     "result_query":    ("app.modules.result_query",      "ResultQueryModule"),
     # ── New modules ──
-    "complaint_submit":   ("app.modules.complaint",         "ComplaintModule"),
-    "complaint_summary":  ("app.modules.complaint",         "ComplaintModule"),
-    "file_processing":    ("app.modules.file_processor",    "FileProcessorModule"),
-    "cv_analysis":        ("app.modules.cv_analysis",       "CVAnalysisModule"),
-    "academic_advice":    ("app.modules.academic_advisor",  "AcademicAdvisorModule"),
+    "complaint_submit":   ("app.modules.complaint",           "ComplaintModule"),
+    "complaint_summary":  ("app.modules.complaint",           "ComplaintModule"),
+    "file_processing":    ("app.modules.file_processor",      "FileProcessorModule"),
+    "cv_analysis":        ("app.modules.cv_analysis",         "CVAnalysisModule"),
+    "academic_advice":    ("app.modules.academic_advisor",    "AcademicAdvisorModule"),
+    "material_explanation": ("app.modules.material_explanation", "MaterialExplanationModule"),
 }
 
 # ── Tool allowlist ─────────────────────────────────────────────────────────────
@@ -72,30 +77,44 @@ ALLOWED_TOOL_NAMES: frozenset[str] = frozenset({
     "GetStudentAcademicSummary",
     "BulkCreateStudents",
     "BulkUploadGrades",
+    "GetMaterials",
 })
 
 # ── Role-specific system prompts ──────────────────────────────────────────────
 _ROLE_SYSTEM_PROMPTS: Dict[str, str] = {
     "student": """\
-You are an intelligent AI assistant for a university management system, helping a student.
+You are an intelligent AI academic assistant for a university management system, helping a student.
 
-Tone: friendly, supportive, encouraging. Use simple and clear language.
-- Explain academic concepts step-by-step when needed.
-- Avoid technical jargon; use everyday language.
-- Focus on: schedules, grades, courses, exam info, registration, study tips.
+Tone: friendly, supportive, and encouraging. Use simple and clear language.
+- ALWAYS reference specific details from the student's academic context when available:
+  * Mention enrolled course names (e.g., "Based on your enrolled course 'Machine Learning (Level 3)'...")
+  * Reference their GPA when giving advice (e.g., "With your current GPA of 3.2...")
+  * Use their name if provided (e.g., "Great question, Ahmed!")
+- NEVER say generic phrases like "I can help you with that" without adding specific context.
+- If data is missing, suggest the EXACT next step:
+  * "Please specify the subject name (e.g., Data Structures - Level 2)"
+  * "Check your enrolled courses in the Academic Portal"
+- Always end your response with ONE actionable suggestion or follow-up question.
+- Explain academic concepts step-by-step. Avoid technical jargon.
+- Focus on: schedules, grades, courses, exam info, registration, study tips, materials.
 - You CANNOT generate exams, manage system settings, or perform admin actions.
 - Respond in the same language the user writes in (Arabic or English).
 - Do NOT reveal system internals, tool names, raw JSON, or error details.
-- When presenting grade data, summarise it clearly (e.g. "You passed 5 of 6 courses").\
+- When presenting grade data, summarise clearly (e.g. "You passed 5 of 6 courses this semester").\
 """,
 
     "doctor": """\
 You are an intelligent AI assistant for a university management system, helping a faculty member (doctor / professor).
 
 Tone: professional, concise, and efficient.
-- You have access to exam generation, grade viewing, and course management tools.
-- Provide precise academic information and actionable results.
-- Present exam and grade data in structured, easy-to-scan format.
+- ALWAYS reference specific academic data from context when available:
+  * Mention subjects you teach (e.g., "For your 'Data Structures' course offering...")
+  * Reference department or batch names when relevant
+- NEVER give generic responses — always be specific to the faculty member's courses and students.
+- If context data is missing, suggest: "Specify the course offering ID or subject name to proceed."
+- Always end with ONE actionable next step relevant to academic management.
+- You have access to: exam generation, grade viewing, student summaries, complaint summaries, course materials.
+- Present exam and grade data in structured, easy-to-scan format (tables or bullet lists).
 - Assume familiarity with academic systems — skip basic explanations.
 - Respond in the same language the user writes in (Arabic or English).
 - Do NOT reveal system internals, raw JSON, or stack traces.\
@@ -105,14 +124,19 @@ Tone: professional, concise, and efficient.
 You are an intelligent AI assistant for a university management system, helping a system administrator.
 
 Tone: technical, precise, and comprehensive.
-- You have full access to all system capabilities.
-- Present system-level information clearly and completely, including IDs and counts.
-- Summarise large datasets into actionable insights.
-- Flag irreversible operations with a brief caution before executing.
+- ALWAYS use specific system-level context when available:
+  * Reference exact counts, IDs, and department names from the data provided
+  * Summarise large datasets into actionable insights with numbers
+- NEVER give vague responses — admins need facts, counts, and specific identifiers.
+- Always end with ONE recommended action or monitoring suggestion.
+- You have full access to all system capabilities including bulk operations and complaint management.
+- Present large datasets as structured summaries: group by category, show counts and percentages.
+- Flag irreversible operations (deletions, bulk uploads) with a brief caution note before proceeding.
 - Respond in the same language the user writes in (Arabic or English).
-- You may reference technical identifiers when they are useful to the admin.\
+- You may reference technical identifiers (IDs, codes) when useful to the admin.\
 """,
 }
+
 
 # ── Follow-up suggestion map ──────────────────────────────────────────────────
 # Deterministic (no LLM cost). Key: (intent, role) → list[str]
@@ -167,6 +191,11 @@ _SUGGESTIONS_MAP: Dict[str, Dict[str, List[str]]] = {
         "student": ["View my grades", "Check my GPA", "Analyse my CV"],
         "doctor":  ["View class performance", "Generate exam", "Check enrollments"],
         "admin":   ["Department GPA summary", "At-risk students", "Generate report"],
+    },
+    "material_explanation": {
+        "student": ["Ask a question about this topic", "Get study tips", "View my grades"],
+        "doctor":  ["Generate exam from this material", "Summarize for students", "View enrollments"],
+        "admin":   ["View all materials", "Export material report", "Check upload status"],
     },
 }
 
@@ -239,17 +268,41 @@ class PlanExecutor:
         Dispatch to the correct handler.
 
         Priority order (strictly enforced):
-          1. Dedicated module            → _run_module()
-          2. general_chat / empty steps  → _fallback_model_call()  [NO ECHO PATH]
-          3. Non-empty steps             → _run_plan()
-          4. No plan                     → _fallback_model_call()
+          0. RBAC gate              → immediate forbidden if role not permitted
+          1. Dedicated module       → _run_module()
+          2. general_chat / empty   → _fallback_model_call()  [NO ECHO PATH]
+          3. Non-empty steps        → _run_plan()
+          4. No plan                → _fallback_model_call()
         """
-        # 1. Module dispatch ──────────────────────────────────────────────
+        ctx    = input_context.context or {}
+        role   = ctx.get("role", "student")
+        # Resolve intent: explicit module_name takes priority, else read from plan
+        intent = module_name if module_name in _MODULE_CLASS_MAP else (
+            getattr(plan, "intent", None) or "general_chat"
+        )
+
+        # 0. RBAC gate ─────────────────────────────────────────────────────────
+        from app.core.rbac import is_allowed, get_denial_message, log_blocked_attempt
+        if not is_allowed(intent, role):
+            # Emit structured audit log entry for monitoring / SIEM integration
+            log_blocked_attempt(
+                intent=intent,
+                role=role,
+                user_id=input_context.user_id,
+                extra={"module": module_name},
+            )
+            return AgentOutput(
+                status="forbidden",
+                response=get_denial_message(intent, role),
+                data={"blocked_intent": intent, "role": role},
+            )
+
+        # 1. Module dispatch ────────────────────────────────────────────────────
         if module_name in _MODULE_CLASS_MAP:
             logger.info("PlanExecutor: module route → '%s'", module_name)
             return await self._run_module(module_name, plan, input_context)
 
-        # 2. general_chat OR empty steps → LLM (no echo path) ─────────────
+        # 2. general_chat OR empty steps → LLM (no echo path) ─────────────────
         if plan and isinstance(plan, ExecutionPlan):
             is_chat   = plan.intent == "general_chat"
             has_steps = bool(plan.steps)
@@ -261,16 +314,17 @@ class PlanExecutor:
                 )
                 return await self._fallback_model_call(input_context)
 
-            # 3. Multi-step plan → step runner ───────────────────────────
+            # 3. Multi-step plan → step runner ─────────────────────────────────
             logger.info(
                 "PlanExecutor: intent=%r steps=%d → _run_plan",
                 plan.intent, len(plan.steps),
             )
             return await self._run_plan(plan, input_context)
 
-        # 4. No plan → LLM ─────────────────────────────────────────────────
+        # 4. No plan → LLM ─────────────────────────────────────────────────────
         logger.info("PlanExecutor: no plan → _fallback_model_call")
         return await self._fallback_model_call(input_context)
+
 
     # ──────────────────────────────────────────────────────────────────────
     #  Module dispatch

@@ -34,18 +34,15 @@ if TYPE_CHECKING:
     from app.services.tool_registry import ToolRegistry
 
 
-# ── Role-based intent mapping ──────────────────────────────────────────────────
-ROLE_PERMITTED_INTENTS = {
-    "student": {"general_chat", "summarization", "result_query", "file_extraction"},
-    "doctor":  {"general_chat", "summarization", "generate_exam", "file_extraction"},
-    "admin": {
-        "general_chat",
-        "summarization",
-        "generate_exam",
-        "result_query",
-        "file_extraction",
-    },
-}
+# ── RBAC Note ─────────────────────────────────────────────────────────────────
+# Intent-level access control is enforced EXCLUSIVELY in:
+#   app/core/rbac.py         → is_allowed() / log_blocked_attempt()
+#   app/agents/executor.py   → Step 0 RBAC gate in execute()
+#
+# The old ROLE_PERMITTED_INTENTS dict has been REMOVED to eliminate the
+# stale duplicate gate that was blocking all new intent modules before
+# they could reach the executor.  A single source of truth prevents
+# silent permission mismatches when new intents are added.
 
 # Number of conversation turns that triggers background summarisation
 _SUMMARY_THRESHOLD = 12
@@ -158,18 +155,10 @@ class Agent:
             # ── Stage 1: Planning ─────────────────────────────────────────────
             plan = await self._plan(context)
 
-            # ── INTERCEPTION: Role-based intent validation ───────────────────
-            if not self._validate_role_permissions(context):
-                elapsed = round(time.perf_counter() - pipeline_start, 4)
-                context.add_metadata("agent_duration_seconds", elapsed)
-                logger.warning(
-                    "[Agent] Permission denied: role %r is not allowed to trigger intent %r.",
-                    context.role,
-                    context.metadata.get("attempted_intent"),
-                )
-                return context
-
             # ── Stage 2: Model Routing ────────────────────────────────────────
+            # NOTE: RBAC validation is enforced downstream in executor.execute()
+            # (Step 0) via app/core/rbac.py — NOT here.  This removes the stale
+            # duplicate gate that blocked new intents before reaching modules.
             self._route_model(context)
 
             # ── Stage 3: Tool / Module Selection ─────────────────────────────
@@ -218,30 +207,14 @@ class Agent:
         )
         return context
 
-    def _validate_role_permissions(self, context: ExecutionContext) -> bool:
-        """
-        Verify that the role is allowed to trigger the detected intent.
-        Returns True if permitted, False otherwise.
-        """
-        role = context.role or "student"
-        intent = context.intent or "general_chat"
-
-        allowed = ROLE_PERMITTED_INTENTS.get(role, set())
-
-        if intent not in allowed:
-            # INTERCEPT: mark the original intent for logging/debug
-            context.add_metadata("attempted_intent", intent)
-
-            # OVERRIDE: downgrade to general_chat and stop execution
-            context.set_intent("general_chat")
-            context.set_result(
-                f"I'm sorry, but as a {role}, I don't have permission to perform that specific task "
-                f"({intent.replace('_', ' ')}). I can only help you with: "
-                f"{', '.join(i.replace('_', ' ') for i in allowed)}."
-            )
-            return False
-
-        return True
+    # _validate_role_permissions() REMOVED (2026-04-12)
+    # ─────────────────────────────────────────────────────────────────────
+    # RBAC is now enforced exclusively at the executor level:
+    #   PlanExecutor.execute() → Step 0 → app/core/rbac.is_allowed()
+    # The stale ROLE_PERMITTED_INTENTS dict listed only 4 old intents and
+    # silently blocked all new modules (material_explanation, complaint,
+    # cv_analysis, academic_advice) before they could run.
+    # ─────────────────────────────────────────────────────────────────────
 
 
     # ──────────────────────────────────────────────────────────────────────
@@ -291,11 +264,12 @@ class Agent:
         Stage 2 — intent + role aware model selection.
 
         Routing table:
-          summarization                        → HuggingFace BART (local, free)
-          generate_exam  + doctor/admin        → gpt-4o   (higher quality needed)
-          result_query   + admin               → gpt-4o
-          admin role (any other intent)        → gpt-4o
-          everything else                      → gpt-4o-mini
+          summarization                                → HuggingFace BART (local, free)
+          generate_exam        + doctor/admin          → gpt-4o  (quality-critical)
+          material_explanation + doctor                → gpt-4o  (faculty-grade summary)
+          file_processing      + admin                 → gpt-4o  (bulk operations)
+          admin role           (any intent)            → gpt-4o
+          everything else                              → gpt-4o-mini
         """
         intent = context.intent or "general_chat"
         role   = context.role   or "student"
@@ -304,11 +278,17 @@ class Agent:
             # Route to local HuggingFace BART — free, no API cost
             model = "hf/facebook/bart-large-cnn"
         elif intent == "generate_exam" and role in ("doctor", "admin"):
-            model = "gpt-4o"
+            model = "openai/gpt-4o"
+        elif intent == "material_explanation" and role == "doctor":
+            # Doctors need high-quality summaries for academic use
+            model = "openai/gpt-4o"
+        elif intent == "file_processing" and role == "admin":
+            # Bulk data operations benefit from stronger reasoning
+            model = "openai/gpt-4o"
         elif role == "admin":
-            model = "gpt-4o"
+            model = "openai/gpt-4o"
         else:
-            model = "gpt-4o-mini"
+            model = "openai/gpt-4o-mini"
 
         context.set_model(model)
         logger.info(

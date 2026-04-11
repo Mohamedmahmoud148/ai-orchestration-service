@@ -44,6 +44,7 @@ VALID_INTENTS = {
     "file_processing",
     "cv_analysis",
     "academic_advice",
+    "material_explanation",
 }
 
 # ── Fallback intent ───────────────────────────────────────────────────────────
@@ -67,6 +68,7 @@ _AVAILABLE_TOOLS = [
     "GetStudentAcademicSummary",
     "BulkCreateStudents",
     "BulkUploadGrades",
+    "GetMaterials",
 ]
 
 # ── System prompt ─────────────────────────────────────────────────────────────
@@ -86,6 +88,7 @@ Your job is to classify the user's request and return a structured JSON plan.
 - file_processing    — bulk upload of Excel (students/grades) or PDF summarization via fileUrl
 - cv_analysis        — analyzing a student CV to extract skills and give recommendations
 - academic_advice    — personalized academic recommendations based on GPA and enrolled courses
+- material_explanation — explain or summarize real course material fetched from the backend
 
 ## Output Schema (return ONLY this JSON, no markdown, no extra text)
 {{
@@ -167,7 +170,35 @@ Your job is to classify the user's request and return a structured JSON plan.
 - Use intent=academic_advice when a student asks for study advice, course
   recommendations, or wants to know how to improve their GPA.
 
-### 10. When in doubt → use general_chat with steps=[].
+### 10. material_explanation (STRICT DATA-FIRST — HIGHEST PRIORITY INTENT)
+- ALWAYS use intent=material_explanation when the user asks to EXPLAIN, SUMMARIZE,
+  DESCRIBE, UNDERSTAND, or REVIEW a specific subject, course, topic, or lecture.
+
+- English triggers (non-exhaustive):
+    "explain course", "explain subject", "explain this topic",
+    "summarize material", "summarize course", "summarize this subject",
+    "what does this material say", "what is this course about",
+    "understand this subject", "review the material", "study material",
+    "give me a summary of", "help me understand", "break down this course"
+
+- Arabic triggers (non-exhaustive):
+    "شرح مادة", "اشرح المادة", "شرح الموضوع", "اشرح موضوع",
+    "لخص المادة", "ملخص المادة", "لخص هذه المادة",
+    "فهم المادة", "ما محتوى المادة", "عايز أفهم المادة",
+    "ساعدني أفهم", "شرح الدرس", "اشرح لي", "ما هو محتوى",
+    "راجع المادة", "شرح موضوع الامتحان", "عايز ملخص"
+
+- MANDATORY: This intent triggers a real backend fetch of course materials.
+    * The subjectOfferingId MUST be injected from academic_context.
+    * If subjectOfferingId is NOT available in academic_context, set:
+      goal_summary = "Need to clarify which subject offering to fetch materials for."
+      and leave steps=[] — the module will prompt the user.
+    * NEVER use general_chat for these triggers — always use material_explanation.
+    * NEVER add tool steps for this intent — the MaterialExplanationModule handles
+      the backend fetch internally.
+
+### 11. When in doubt → use general_chat with steps=[].
+
 
 ### Multi-step example (result_query — grades then GPA):
 {{
