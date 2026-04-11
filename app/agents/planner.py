@@ -260,21 +260,16 @@ class PlannerAgent(BaseAgent):
         Falls back to gpt-3.5-turbo if gpt-4o-mini returns nothing.
         """
         try:
-            logger.debug("PlannerAgent: requesting JSON from gpt-4o-mini")
+            logger.debug("PlannerAgent: requesting JSON from openai/gpt-4o-mini")
             parsed = await self.model_router.generate_structured_json(
                 prompt=user_content,
                 system_instruction=_SYSTEM_PROMPT,
-                model_id="gpt-4o-mini",
+                model_id="openai/gpt-4o-mini",
             )
 
             if not parsed:
                 logger.warning(
-                    "PlannerAgent: gpt-4o-mini returned empty — falling back to gpt-3.5-turbo"
-                )
-                parsed = await self.model_router.generate_structured_json(
-                    prompt=user_content,
-                    system_instruction=_SYSTEM_PROMPT,
-                    model_id="gpt-3.5-turbo",
+                    "PlannerAgent: openai/gpt-4o-mini returned empty — fallback chain will handle it"
                 )
 
             logger.debug("PlannerAgent: raw plan = %s", parsed)

@@ -47,13 +47,14 @@ async def lifespan(app: FastAPI):
         )
     logger.info("Backend URL: %s", settings.BACKEND_BASE_URL)
 
-    if not settings.OPENAI_API_KEY:
+    if not settings.OPENROUTER_API_KEY:
         raise RuntimeError(
-            "STARTUP FAILED: OPENAI_API_KEY is not set. "
-            "The Planner requires a valid OpenAI API key. "
-            "Set OPENAI_API_KEY in your .env file and restart."
+            "STARTUP FAILED: OPENROUTER_API_KEY is not set. "
+            "The Planner requires a valid OpenRouter API key. "
+            "Set OPENROUTER_API_KEY in your .env file and restart. "
+            "Get one at https://openrouter.ai/keys"
         )
-    logger.info("OpenAI API key: configured.")
+    logger.info("OpenRouter API key: configured.")
 
     # Confirm BackendClient singleton initialised correctly.
     # (ToolExecutionClient.__init__ raises RuntimeError if URL is missing;
@@ -62,9 +63,16 @@ async def lifespan(app: FastAPI):
         "ToolExecutionClient ready (base_url=%s).", tool_execution_client.base_url
     )
 
-    # ── 2. Cloud LLM client ────────────────────────────────────────────
-    openai_client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
-    logger.info("OpenAI client initialised.")
+    # ── 2. OpenRouter LLM client (OpenAI-compatible) ──────────────────
+    openai_client = AsyncOpenAI(
+        api_key=settings.OPENROUTER_API_KEY,
+        base_url="https://openrouter.ai/api/v1",
+        default_headers={
+            "HTTP-Referer": "University AI System",
+            "X-Title": "University AI Agent",
+        },
+    )
+    logger.info("OpenRouter client initialised (base_url=https://openrouter.ai/api/v1).")
 
     # ── 3. Component assembly ─────────────────────────────────────────
     model_router = ModelRouter(

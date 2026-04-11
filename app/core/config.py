@@ -7,8 +7,10 @@ class Settings(BaseSettings):
     ENVIRONMENT: Literal["development", "staging", "production"] = "development"
     PORT: int = 8000
 
-    # AI Config
-    OPENAI_API_KEY: str = ""
+    # AI Config — OpenRouter
+    OPENROUTER_API_KEY: str = ""
+    OPENROUTER_FALLBACK_MODEL_1: str = "openai/gpt-4o-mini"
+    OPENROUTER_FALLBACK_MODEL_2: str = ""  # e.g. "mistralai/mistral-7b-instruct"
 
     # Backend Config — REQUIRED.  The service cannot operate without this.
     BACKEND_BASE_URL: str = ""
@@ -35,10 +37,10 @@ class Settings(BaseSettings):
             )
         return v.rstrip("/")   # normalize: strip trailing slash once, at load time
 
-    @field_validator("OPENAI_API_KEY")
+    @field_validator("OPENROUTER_API_KEY")
     @classmethod
-    def _warn_openai_key(cls, v: str) -> str:
-        """OpenAI key is optional at config load but validated again at startup."""
+    def _warn_openrouter_key(cls, v: str) -> str:
+        """OpenRouter key is optional at config load but validated again at startup."""
         return v
 
 
