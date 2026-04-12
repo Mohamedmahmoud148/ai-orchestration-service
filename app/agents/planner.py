@@ -47,10 +47,80 @@ VALID_INTENTS = {
     "material_explanation",
 }
 
+
 # ── Fallback intent ───────────────────────────────────────────────────────────
 _FALLBACK_INTENT = "general_chat"
 
+# ── Deterministic exam-intent keyword sets (Layer-2 LLM override) ─────────────
+# Matched AFTER LLM classification so any LLM misclassification of exam-creation
+# requests is caught and corrected deterministically. Case-insensitive substring match.
+_EXAM_KEYWORDS_EN: frozenset[str] = frozenset({
+    "generate exam",    "create exam",     "make exam",
+    "build exam",       "write exam",      "prepare exam",
+    "prepare test",     "create test",     "generate test",
+    "make test",        "build test",      "write test",
+    "exam for subject", "exam for course", "new exam",
+    "draft exam",       "design exam",     "set exam",
+    "set a test",       "produce exam",    "develop exam",
+})
+
+# Action verbs that, combined with "exam" or "test" anywhere in the message,
+# confirm exam-creation intent  (covers "create a new ... exam" patterns)
+_EXAM_ACTION_VERBS_EN: frozenset[str] = frozenset({
+    "create", "generate", "make", "build", "write",
+    "prepare", "draft", "design", "produce", "develop",
+    "compose", "set",
+})
+_EXAM_TARGET_WORDS_EN: frozenset[str] = frozenset({"exam", "test", "quiz", "assessment"})
+
+_EXAM_KEYWORDS_AR: frozenset[str] = frozenset({
+    "اعمل امتحان",  "انشئ امتحان",  "سوي امتحان",
+    "حضّر امتحان",   "اكتب امتحان",  "امتحان لمادة",
+    "عمل امتحان",    "أنشئ امتحان",  "صمّم امتحان",
+    "عايز امتحان",   "نعمل امتحان",  "جهّز امتحان",
+    "جهّز اختبار",  "عمل اختبار",   "انشئ اختبار",
+    "طوّر امتحان",  "اكتب اختبار",  "حضر امتحان",
+    "انشئ امتحان",  "صمم امتحان",
+})
+
+
+def _detect_generate_exam(message: str) -> bool:
+    """
+    Two-pass deterministic scan for exam-creation intent.
+
+    Pass 1 — direct phrase match: catches "generate exam", "create test", etc.
+    Pass 2 — loose match: catches "create a new introduction to ML exam"
+             by checking if BOTH an action verb AND an exam target word
+             appear anywhere in the message (order-independent).
+
+    Never fires on passive phrases like "view exam", "exam results",
+    "I failed the exam", or "when is the exam?" because those lack
+    a creation action verb.
+    """
+    msg = message.strip().lower()
+
+    # Pass 1: direct phrase substring match
+    for kw in _EXAM_KEYWORDS_EN:
+        if kw in msg:
+            return True
+    for kw in _EXAM_KEYWORDS_AR:
+        if kw in msg:
+            return True
+
+    # Pass 2: verb + target word loose match (handles inserted adjectives)
+    import re
+    words = set(re.findall(r"\b\w+\b", msg))
+    has_action = bool(words & _EXAM_ACTION_VERBS_EN)
+    has_target = bool(words & _EXAM_TARGET_WORDS_EN)
+    if has_action and has_target:
+        return True
+
+    return False
+
+
+
 # ── Available backend tools (referenced in system prompt) ─────────────────────
+
 _AVAILABLE_TOOLS = [
     "ResolveSubjectOffering",
     "GetStudentResults",
@@ -122,12 +192,35 @@ Your job is to classify the user's request and return a structured JSON plan.
 - Use {{{{step_N.output}}}} to reference the output of step N in a later step.
 - If only one tool call is needed, leave steps=[].
 
-### 3. generate_exam
-- Populate exam_params with: collegeName, departmentName, batchName,
-  subjectName, numberOfQuestions (int), examType ("midterm"|"final"),
-  variationMode ("same_for_all"|"different_per_student"),
-  subjectOfferingId (string|null).
+### 3. generate_exam — HIGHEST PRIORITY INTENT FOR EXAM CREATION
+
+⚠️ CRITICAL: The following phrases ALWAYS mean intent = "generate_exam".
+NEVER classify them as general_chat. The executor enforces role permissions separately.
+
+English triggers (ANY of these = generate_exam):
+  "create exam", "generate exam", "make exam", "build exam",
+  "write exam",  "prepare exam",  "prepare test", "new exam",
+  "draft exam",  "design exam",  "set exam",    "produce exam",
+  "exam for subject", "exam for course", "create test", "generate test"
+
+Arabic triggers (ANY of these = generate_exam):
+  "اعمل امتحان", "انشئ امتحان", "سوي امتحان", "حضّر امتحان",
+  "اكتب امتحان", "امتحان لمادة", "عمل امتحان", "جهّز امتحان"
+
+Rules for generate_exam:
+- Use intent=generate_exam whenever the user wants to CREATE or GENERATE any exam/test.
+- Role does NOT affect intent classification. Even if role=student, use generate_exam.
+  The executor will enforce the RBAC denial if the role is not permitted.
+- If subject details are missing, STILL use intent=generate_exam and fill exam_params
+  with whatever IS available. Leave missing fields as null.
+- Populate exam_params with:
+    collegeName, departmentName, batchName, subjectName,
+    numberOfQuestions (int, default 10 if not specified),
+    examType ("midterm"|"final", default "midterm" if not specified),
+    variationMode ("same_for_all"|"different_per_student"),
+    subjectOfferingId (string|null)
 - If subjectOfferingId is unknown, add ResolveSubjectOffering to pre_execution_steps.
+- NEVER leave intent=general_chat when the user's action is exam creation.
 
 ### 4. Context-aware auto-fill (MANDATORY)
 - The caller has already authenticated and their academic record is embedded in
@@ -311,7 +404,30 @@ class PlannerAgent(BaseAgent):
         # ── Parse + validate → ExecutionPlan ──────────────────────────────
         plan = self._parse_plan(raw_json, agent_input)
 
-        # ── Deterministic guard for generate_exam ─────────────────────────
+        # ── Layer 2: Deterministic exam-intent override ────────────────────
+        # Fires ONLY when the LLM returned general_chat but the message matches
+        # a confirmed exam-creation keyword.  Zero false-positive risk because
+        # the keyword list is restricted to create/generate action verbs.
+        if plan.intent == "general_chat" and _detect_generate_exam(agent_input.message):
+            logger.warning(
+                "PlannerAgent [Layer-2 override]: LLM misclassified exam request as "
+                "general_chat — correcting to generate_exam (message=%.100r)",
+                agent_input.message,
+            )
+            plan.intent = "generate_exam"
+            plan.goal_summary = (
+                f"Generate an exam for: {agent_input.message[:120]}"
+            )
+            # Bootstrap exam_params if the LLM didn't populate them
+            if plan.exam_params is None:
+                plan.exam_params = ExamParams(
+                    subjectName=None,
+                    numberOfQuestions=10,
+                    examType="midterm",
+                    variationMode="same_for_all",
+                )
+
+        # ── Deterministic guard: ensure ResolveSubjectOffering pre-step ───
         plan = self._ensure_resolve_step(plan)
 
         logger.info(
