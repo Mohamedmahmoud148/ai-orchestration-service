@@ -196,7 +196,8 @@ class DynamicApiModule:
             )
             return AgentOutput(
                 status="failed",
-                response="مش قادر أوصل للبيانات دلوقتي، حاول تاني"
+                response=f"مش قادر أوصل للبيانات دلوقتي، حاول تاني (Backend Error on {method} {endpoint})",
+                data={"exec_route": endpoint, "error": str(exc)}
             )
 
         if not raw_data:
