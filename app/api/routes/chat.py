@@ -86,6 +86,20 @@ async def chat_endpoint(
             context.conversation_id,
             exc.detail,
         )
+        # Executor/module failures (failed/forbidden) are user-facing messages,
+        # NOT server crashes. Return them as 200 so the client can display them.
+        if exc.stage == "executor":
+            return ChatResponse(
+                response=exc.detail,
+                conversation_id=context.conversation_id,
+                intent_executed=context.intent or "unknown",
+                tool_used=context.selected_tool or "none",
+                model_used=context.selected_model or "unknown",
+                metadata=context.metadata,
+                suggestions=[],
+                actions_available=[],
+            )
+        # Planning/infrastructure failures are real 500s
         raise HTTPException(status_code=500, detail=exc.detail)
 
     # ── Serialise & return ────────────────────────────────────
