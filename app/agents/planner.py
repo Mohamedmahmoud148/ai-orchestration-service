@@ -118,6 +118,19 @@ def _detect_generate_exam(message: str) -> bool:
 
     return False
 
+def _detect_backend_query(message: str) -> bool:
+    """Detect if the user is asking a data query like counts, lists, or system stats."""
+    msg = message.strip().lower()
+    
+    _ARABIC_DATA_KEYWORDS = {
+        "كم عدد", "كام بدرس", "عدد الدكاترة", "نسبة", "احصائيات", 
+        "مين هم", "قائمة", "عدد الطلاب", "اللي بيدرس"
+    }
+    for kw in _ARABIC_DATA_KEYWORDS:
+        if kw in msg:
+            return True
+    return False
+
 
 
 # ── Available backend tools (referenced in system prompt) ─────────────────────
@@ -150,7 +163,7 @@ Your job is to classify the user's request and return a structured JSON plan.
 
 ## Valid Intents
 - general_chat       — conversation, questions, greetings, anything not needing backend data
-- backend_api_query  — dynamically route queries for system stats, users, numbers, and general database retrieval
+- backend_api_query  — MANDATORY for querying system stats, counting numbers (كم عدد), user lists, or any database retrieval.
 - summarization      — summarise a document or text
 - generate_exam      — generate a university exam (doctor/admin only)
 - result_query       — query academic results, grades, GPA, transcripts, schedules
@@ -428,6 +441,13 @@ class PlannerAgent(BaseAgent):
                     examType="midterm",
                     variationMode="same_for_all",
                 )
+
+        if plan.intent == "general_chat" and _detect_backend_query(agent_input.message):
+            logger.warning(
+                "PlannerAgent [Layer-2 override]: Correcting general_chat to backend_api_query for data request."
+            )
+            plan.intent = "backend_api_query"
+            plan.goal_summary = "Query dynamic backend APIs to answer the user request."
 
         # ── Deterministic guard: ensure ResolveSubjectOffering pre-step ───
         plan = self._ensure_resolve_step(plan)
