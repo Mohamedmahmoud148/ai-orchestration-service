@@ -30,12 +30,13 @@ INSTRUCTIONS:
 1. Match the user's request to the closest matching endpoint in the AVAILABLE ENDPOINTS list.
 2. Extract any required query parameters or URL path variables from the user's message or context.
 3. NEVER hallucinate endpoints not in the list.
-4. If no endpoint fits, or if the user asks for something destructive like DELETE, return an empty endpoint string.
+4. If the user asks for a count/quantity (e.g., "how many students") and there is no explicit /count endpoint, return the GET endpoint that lists all those items (e.g., /api/Students). The system will count them automatically from the response.
+5. If no endpoint fits, or if the user asks for something destructive like DELETE, return an empty endpoint string.
 
 OUTPUT FORMAT:
 Return a JSON object:
 {{
-    "endpoint": "/api/Students/count",
+    "endpoint": "/api/Students",
     "method": "GET",
     "params": {{"any_query_keys": "values"}}
 }}
