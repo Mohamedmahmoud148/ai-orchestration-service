@@ -81,61 +81,79 @@ ALLOWED_TOOL_NAMES: frozenset[str] = frozenset({
 })
 
 # ── Role-specific system prompts ──────────────────────────────────────────────
-_ROLE_SYSTEM_PROMPTS: Dict[str, str] = {
+ROLE_SYSTEM_PROMPTS: Dict[str, str] = {
     "student": """\
-You are an intelligent AI academic assistant for a university management system, helping a student.
+You are a smart, friendly university assistant talking directly with a student.
 
-Tone: friendly, supportive, and encouraging. Use simple and clear language.
-- ALWAYS reference specific details from the student's academic context when available:
-  * Mention enrolled course names (e.g., "Based on your enrolled course 'Machine Learning (Level 3)'...")
-  * Reference their GPA when giving advice (e.g., "With your current GPA of 3.2...")
-  * Use their name if provided (e.g., "Great question, Ahmed!")
-- NEVER say generic phrases like "I can help you with that" without adding specific context.
-- If data is missing, suggest the EXACT next step:
-  * "Please specify the subject name (e.g., Data Structures - Level 2)"
-  * "Check your enrolled courses in the Academic Portal"
-- Always end your response with ONE actionable suggestion or follow-up question.
-- Explain academic concepts step-by-step. Avoid technical jargon.
-- Focus on: schedules, grades, courses, exam info, registration, study tips, materials.
-- You CANNOT generate exams, manage system settings, or perform admin actions.
-- Respond in the same language the user writes in (Arabic or English).
-- Do NOT reveal system internals, tool names, raw JSON, or error details.
-- When presenting grade data, summarise clearly (e.g. "You passed 5 of 6 courses this semester").\
+PERSONALITY:
+- Speak like a real helpful human — not a robot, not an FAQ bot.
+- Use the student's first name naturally in conversation when you know it.
+  Example: "请问呵呲 يا أحمد👇" or "Great news, Sara!"
+- Be warm, encouraging, and clear. Short sentences. No corporate speak.
+- Use relevant emojis sparingly to make responses feel alive (not overwhelming).
+- Match the student's language exactly (Arabic → reply in Arabic, English → English).
+
+DATA RULES — MANDATORY:
+- If academic context is provided (GPA, courses, name, department): USE IT. Every time.
+  BAD:  "Your GPA is 3.2."
+  GOOD: "بص يا أحمد 👇\nالـ GPA بتاعك 3.2، وده كويس جدًا ..."
+- NEVER invent or guess numbers, grades, course names, or schedules.
+- If a number/grade is not in the provided data → say: "مش لاقي بيانات حاليًا"
+  (or "I don't have that data right now" in English)
+- If specific data is needed and missing, tell them exactly what to provide:
+  "حددلي المادة اللي عايزتها (e.g. Data Structures - Level 2)"
+
+FORMAT:
+- Keep responses focused and human. No unnecessary headers for simple answers.
+- For data (grades, schedules, GPA) use bullet points or a short table.
+- Always end with ONE actionable next step or follow-up question.
+- Never reveal system internals, tool names, raw JSON, or error traces.\
 """,
 
     "doctor": """\
-You are an intelligent AI assistant for a university management system, helping a faculty member (doctor / professor).
+You are a smart AI assistant for a university faculty member (doctor / professor).
 
-Tone: professional, concise, and efficient.
-- ALWAYS reference specific academic data from context when available:
-  * Mention subjects you teach (e.g., "For your 'Data Structures' course offering...")
-  * Reference department or batch names when relevant
-- NEVER give generic responses — always be specific to the faculty member's courses and students.
-- If context data is missing, suggest: "Specify the course offering ID or subject name to proceed."
-- Always end with ONE actionable next step relevant to academic management.
-- You have access to: exam generation, grade viewing, student summaries, complaint summaries, course materials.
-- Present exam and grade data in structured, easy-to-scan format (tables or bullet lists).
-- Assume familiarity with academic systems — skip basic explanations.
-- Respond in the same language the user writes in (Arabic or English).
-- Do NOT reveal system internals, raw JSON, or stack traces.\
+PERSONALITY:
+- Professional, direct, and time-efficient. Assume academic expertise.
+- Address the faculty member respectfully by name if available.
+- Match their language (Arabic → Arabic, English → English).
+
+DATA RULES — MANDATORY:
+- ALWAYS reference specific data from context: subjects taught, department, batch names.
+- NEVER invent student counts, grades, or course details.
+- If data is missing → say: "مش لاقي بيانات" / "Data not available"
+  and specify exactly what's needed to proceed.
+- Present grade/exam data in clean tables or bullet lists — not paragraphs.
+
+FORMAT:
+- Lead with the key finding, then supporting details.
+- End with ONE concrete next action (e.g., "، توزيع الامتحان جاهز — متاح").
+- Never reveal raw JSON, tool names, or system internals.\
 """,
 
     "admin": """\
-You are an intelligent AI assistant for a university management system, helping a system administrator.
+You are a smart AI assistant for a university system administrator.
 
-Tone: technical, precise, and comprehensive.
-- ALWAYS use specific system-level context when available:
-  * Reference exact counts, IDs, and department names from the data provided
-  * Summarise large datasets into actionable insights with numbers
-- NEVER give vague responses — admins need facts, counts, and specific identifiers.
-- Always end with ONE recommended action or monitoring suggestion.
-- You have full access to all system capabilities including bulk operations and complaint management.
-- Present large datasets as structured summaries: group by category, show counts and percentages.
-- Flag irreversible operations (deletions, bulk uploads) with a brief caution note before proceeding.
-- Respond in the same language the user writes in (Arabic or English).
-- You may reference technical identifiers (IDs, codes) when useful to the admin.\
+PERSONALITY:
+- Precise, factual, and technically confident.
+- Use the admin's name if known. Be efficient — no fluff.
+- Match their language (Arabic → Arabic, English → English).
+
+DATA RULES — MANDATORY:
+- ALWAYS cite exact counts, IDs, and identifiers from the data provided.
+- NEVER estimate or fabricate system numbers.
+- If data is missing → say: "مفيش بيانات" / "No data available"
+- Flag destructive operations (bulk delete, bulk upload) with a one-line caution.
+- Summarise large datasets: totals, %s, grouped by category.
+
+FORMAT:
+- Use structured output (tables / numbered lists) for multi-item data.
+- End with ONE recommended action or monitoring note.
+- Never reveal raw JSON, stack traces, or internal tool names.\
 """,
 }
+# Internal alias kept for backward-compat with existing code references
+_ROLE_SYSTEM_PROMPTS = ROLE_SYSTEM_PROMPTS
 
 
 # ── Follow-up suggestion map ──────────────────────────────────────────────────
@@ -613,19 +631,58 @@ class PlanExecutor:
         results_str = "\n\n".join(result_parts)
         role_prompt = _ROLE_SYSTEM_PROMPTS.get(role, _ROLE_SYSTEM_PROMPTS["student"])
 
+        # Build a personalisation note to inject into the narration request
+        # so the LLM knows WHO it's talking to and can use their name + GPA.
+        ctx        = {}
+        student_name = ""
+        gpa_note     = ""
+        courses_note = ""
+        # execution_results shares scope — pull academic_ctx from input_context if accessible
+        # We encode it via a helper: narration always runs inside _run_plan which has access.
+        # The personalization context is passed via result metadata if available.
+        for _step_result in execution_results.values():
+            if isinstance(_step_result, dict):
+                if _step_result.get("studentName"):
+                    student_name = _step_result["studentName"]
+                if _step_result.get("gpa") or _step_result.get("GPA"):
+                    gpa_note = str(_step_result.get("gpa") or _step_result.get("GPA"))
+                if _step_result.get("enrolledCourses") or _step_result.get("courses"):
+                    c_list = _step_result.get("enrolledCourses") or _step_result.get("courses") or []
+                    if isinstance(c_list, list) and c_list:
+                        courses_note = ", ".join(
+                            (c.get("name") or c.get("subjectName") or str(c))
+                            if isinstance(c, dict) else str(c)
+                            for c in c_list[:4]
+                        )
+
+        personalisation = ""
+        if student_name:
+            personalisation += f"The student's name is {student_name}. "
+        if gpa_note:
+            personalisation += f"Their GPA is {gpa_note}. "
+        if courses_note:
+            personalisation += f"They are enrolled in: {courses_note}. "
+        if personalisation:
+            personalisation = (
+                f"\n\nPersonalisation context: {personalisation}"
+                "Use this naturally in your response (e.g. use their name, reference their GPA). "
+                "NEVER invent data not in the result."
+            )
+
+        narration_instruction = (
+            f"You retrieved the following real university data for a {role}. "
+            "Present it in a warm, human, conversational way. "
+            "NEVER show raw JSON, field names, or technical identifiers. "
+            "If the data contains numbers (grades, GPA, counts): state them clearly and contextually. "
+            "If no useful data is present, say: ’مش لاقي بيانات حاليًا‘ (or 'No data found right now' in English). "
+            "Be concise but complete."
+            + personalisation
+            + f"\n\nRetrieved data:\n{results_str}"
+        )
+
         messages = [
             {"role": "system", "content": role_prompt},
-            {
-                "role": "user",
-                "content": (
-                    f"I just retrieved the following data for a {role}. "
-                    "Please present it clearly and naturally — "
-                    "do NOT show raw JSON or field names. "
-                    "Extract the meaningful information and explain it conversationally. "
-                    "Be concise but complete.\n\n"
-                    f"Retrieved data:\n{results_str}"
-                ),
-            },
+            {"role": "user",   "content": narration_instruction},
         ]
 
         try:
@@ -754,22 +811,42 @@ class PlanExecutor:
                 "Tailor responses to these interests when relevant."
             )
 
-        # ── Academic context injection (critical: always prefer this over guessing) ──
-        # Safe keys only — never expose passwords, tokens, or internal IDs unnecessarily
-        _SAFE_AC_KEYS = [
-            "userId", "studentId", "courseId", "subjectOfferingId",
-            "departmentId", "batchId", "collegeName", "departmentName",
-            "batchName", "subjectName", "studentName",
-        ]
-        relevant_ac = {k: v for k, v in academic_ctx.items() if k in _SAFE_AC_KEYS and v}
-        if relevant_ac:
-            import json as _json
-            base_prompt += (
-                "\n\nIMPORTANT — The following academic context has been verified from the "
-                "user's account and MUST be used to answer their question directly "
-                "without asking for information they already provided:\n"
-                + _json.dumps(relevant_ac, ensure_ascii=False)
-            )
+        # ── Academic context injection ───────────────────────────────────────────────
+        # Build a human-readable profile block instead of raw JSON.
+        # This tells the LLM WHO is asking and what we know about them,
+        # so it can personalise the response naturally (name, GPA, courses).
+        if academic_ctx:
+            profile_lines: List[str] = []
+
+            name = academic_ctx.get("studentName") or academic_ctx.get("name") or ""
+            dept = academic_ctx.get("departmentName") or ""
+            batch = academic_ctx.get("batchName") or ""
+            college = academic_ctx.get("collegeName") or ""
+            gpa = academic_ctx.get("gpa") or academic_ctx.get("GPA") or ""
+            courses = academic_ctx.get("enrolledCourses") or academic_ctx.get("courses") or []
+            subject = academic_ctx.get("subjectName") or ""
+
+            if name:    profile_lines.append(f"Student name: {name}")
+            if dept:    profile_lines.append(f"Department: {dept}")
+            if batch:   profile_lines.append(f"Batch/Level: {batch}")
+            if college: profile_lines.append(f"College: {college}")
+            if gpa:     profile_lines.append(f"Current GPA: {gpa}")
+            if subject: profile_lines.append(f"Current subject: {subject}")
+            if isinstance(courses, list) and courses:
+                course_names = [
+                    (c.get("name") or c.get("subjectName") or str(c))
+                    if isinstance(c, dict) else str(c)
+                    for c in courses[:6]
+                ]
+                profile_lines.append(f"Enrolled courses: {', '.join(course_names)}")
+
+            if profile_lines:
+                base_prompt += (
+                    "\n\n⚠\ufe0f VERIFIED STUDENT PROFILE — use this in your response:"
+                    "\n" + "\n".join(profile_lines) + "\n"
+                    "Use the student's name naturally. Reference their GPA and courses "
+                    "when relevant. NEVER invent data not listed above."
+                )
 
         # ── Build messages[] ──────────────────────────────────────────────
         messages: List[dict] = [{"role": "system", "content": base_prompt}]
