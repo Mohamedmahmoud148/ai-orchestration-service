@@ -186,6 +186,7 @@ class ModelRouter:
         self,
         messages: List[dict],
         model_id: str = DEFAULT_MODEL,
+        response_format: Optional[dict] = None,
     ) -> str | None:
         """
         Multi-turn generation using a pre-built messages list.
@@ -198,10 +199,13 @@ class ModelRouter:
                 {"role": "assistant", "content": "…"},
                 …
             ]
+
+        If ``response_format={"type": "json_object"}`` is passed, returns raw
+        JSON string (suitable for json.loads by the caller).
         """
         logger.debug(
-            "ModelRouter.generate_with_messages: model=%s messages=%d",
-            model_id, len(messages),
+            "ModelRouter.generate_with_messages: model=%s messages=%d json_mode=%s",
+            model_id, len(messages), response_format is not None,
         )
         try:
             # ── HuggingFace local ───────────────────────────────────────────
@@ -249,6 +253,11 @@ class ModelRouter:
 
             # ── OpenRouter (default — handles gpt-*, openai/*, mistralai/*, etc.) ──
             if self.openai_client:
+                if response_format and response_format.get("type") == "json_object":
+                    # JSON mode: call openrouter_json and return as string
+                    result = await self._call_with_fallback_json(model_id, messages)
+                    import json as _json
+                    return _json.dumps(result, ensure_ascii=False) if result else None
                 return await self._call_with_fallback_text(model_id, messages)
 
             logger.error(
