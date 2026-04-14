@@ -16,7 +16,7 @@ from app.core.api_discovery import get_allowed_endpoints_schema, validate_endpoi
 from app.core.logging import logger
 
 _ROUTING_PROMPT = """\
-You are an intelligent API Router mapping a user's natural language request to a backend API endpoint.
+You are a STRICT API Router mapping a user's natural language request to a backend API endpoint.
 
 AVAILABLE ENDPOINTS:
 {schema}
@@ -26,21 +26,33 @@ USER ROLE: {role}
 USER ACADEMIC CONTEXT:
 {academic_context}
 
-INSTRUCTIONS:
-1. Match the user's request to the closest matching endpoint in the AVAILABLE ENDPOINTS list.
-2. Extract any required query parameters or URL path variables from the user's message or context.
-3. NEVER hallucinate endpoints not in the list.
-4. If the user asks for a count/quantity (e.g., "how many students") and there is no explicit /count endpoint, return the GET endpoint that lists all those items (e.g., /api/Students). The system will count them automatically from the response.
-5. If no endpoint fits, or if the user asks for something destructive like DELETE, return an empty endpoint string.
+CRITICAL RULES - STRICT SEMANTIC MAPPING:
+
+1. COUNT DETECTION:
+If user query contains "كم عدد", "عدد", "كام", "count", or "how many":
+- You MUST prioritize selecting an endpoint related to `count`, `total`, or `statistics`.
+- Do NOT select endpoints containing `Results`, `Summary`, `Profile`, or `Details`.
+- If no explicit /count endpoint exists, use the GET endpoint that lists all those items (e.g., /api/Students) and the system will count them automatically. 
+
+2. RESULTS DETECTION:
+- ONLY use endpoints relating to results/grades if the user explicitly asks for "نتايج", "درجات", "results", or "grades".
+
+3. HARD FILTER:
+- Reject ANY endpoint containing "Result", "Summary", or "Profile" UNLESS the user specifically asked for them.
+
+4. FAIL SAFE:
+- Accuracy is more important than answering. If no correct endpoint mathematically fits the user's request, DO NOT GUESS.
+- Return an empty endpoint string.
 
 OUTPUT FORMAT:
-Return a JSON object:
+Return ONLY this JSON object:
 {{
-    "endpoint": "/api/Students",
+    "endpoint": "<chosen_endpoint_path>",
     "method": "GET",
-    "params": {{"any_query_keys": "values"}}
+    "params": {{"<query_key>": "<value>"}}
 }}
-For path parameters (e.g. /api/Admins/{{id}}), replace {{id}} with the actual value directly in the endpoint string (e.g. "/api/Admins/123"), and do NOT put it in "params".
+For path parameters (e.g. /api/Admins/{{id}}), replace {{id}} with the actual value directly in the endpoint string. Do NOT put it in "params".
+If no endpoint fits perfectly, return "endpoint": "".
 """
 
 _SUMMARY_PROMPT = """\
