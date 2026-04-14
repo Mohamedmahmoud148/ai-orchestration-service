@@ -45,6 +45,7 @@ VALID_INTENTS = {
     "cv_analysis",
     "academic_advice",
     "material_explanation",
+    "backend_api_query",
 }
 
 
