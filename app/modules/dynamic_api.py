@@ -40,7 +40,11 @@ If user query contains "كم عدد", "عدد", "كام", "count", or "how many"
 3. HARD FILTER:
 - Reject ANY endpoint containing "Result", "Summary", or "Profile" UNLESS the user specifically asked for them.
 
-4. FAIL SAFE:
+4. PARAMETERS Rule:
+- NEVER return empty strings `""` for parameters. If a parameter is optional and you don't know the value, completely OMIT it from the JSON.
+- If pagination is required, inject default values: `page=1`, `size=10`.
+
+5. FAIL SAFE:
 - Accuracy is more important than answering. If no correct endpoint mathematically fits the user's request, DO NOT GUESS.
 - Return an empty endpoint string.
 
@@ -174,19 +178,34 @@ class DynamicApiModule:
                 response="Requested operation is not allowed or endpoint does not exist."
             )
 
-        # 4. Execute Backend Request
+        # 4. Clean and Safely Process Parameters
+        clean_params = {}
+        for k, v in params.items():
+            # Skip empty parameters to prevent .NET 400 Bad Request
+            if v == "" or v is None:
+                continue
+            clean_params[k] = v
+
+        # Default Pagination Injection: If it's a GET request and missing pagination, safely inject
+        if method == "GET":
+            if "page" not in clean_params:
+                clean_params["page"] = 1
+            if "size" not in clean_params:
+                clean_params["size"] = 10
+
+        # 5. Execute Backend Request
         auth_header = ctx.get("auth_header")
-        logger.info("DynamicApiModule: Executing %s %s", method, endpoint)
+        logger.info("DynamicApiModule: Executing %s %s with params %s", method, endpoint, clean_params)
         
         try:
             if method == "GET":
                 raw_data = await self.backend_client.fetch(
-                    route=endpoint, auth_header=auth_header, params=params
+                    route=endpoint, auth_header=auth_header, params=clean_params
                 )
             else:
                 # Safe POSTs
                 raw_data = await self.backend_client.post(
-                    route=endpoint, payload=params, auth_header=auth_header
+                    route=endpoint, payload=clean_params, auth_header=auth_header
                 )
         except Exception as exc:
             duration = round(time.time() - start_time, 4)
