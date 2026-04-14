@@ -63,6 +63,11 @@ async def lifespan(app: FastAPI):
         "ToolExecutionClient ready (base_url=%s).", tool_execution_client.base_url
     )
 
+    # ── 1.5 Fetch and Cache Dynamic API Schema ────────────────────────
+    from app.core import api_discovery
+    logger.info("Fetching Dynamic API Schema from Backend...")
+    await api_discovery.fetch_and_filter_schema()
+
     # ── 2. OpenRouter LLM client (OpenAI-compatible) ──────────────────
     openai_client = AsyncOpenAI(
         api_key=settings.OPENROUTER_API_KEY,

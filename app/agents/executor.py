@@ -54,6 +54,7 @@ _MODULE_CLASS_MAP: Dict[str, tuple[str, str]] = {
     "cv_analysis":        ("app.modules.cv_analysis",         "CVAnalysisModule"),
     "academic_advice":    ("app.modules.academic_advisor",    "AcademicAdvisorModule"),
     "material_explanation": ("app.modules.material_explanation", "MaterialExplanationModule"),
+    "dynamic_api_module": ("app.modules.dynamic_api",         "DynamicApiModule"),
 }
 
 # ── Tool allowlist ─────────────────────────────────────────────────────────────
@@ -226,7 +227,7 @@ _TOOL_RETRY_DELAY  = 1.0    # seconds between retry attempts
 # If any of these arrive at _fallback_model_call() without a tool having run,
 # the AI is BLOCKED from answering from its training memory.
 _DATA_SENSITIVE_INTENTS: frozenset[str] = frozenset({
-    "result_query",       # grades, GPA, transcripts, schedules
+    "backend_api_query",  # grades, stats, records dynamically read from Swagger
     "complaint_summary",  # complaint records from DB
     "file_processing",    # bulk DB operations
     "generate_exam",      # must invoke backend exam service

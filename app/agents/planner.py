@@ -149,6 +149,7 @@ Your job is to classify the user's request and return a structured JSON plan.
 
 ## Valid Intents
 - general_chat       — conversation, questions, greetings, anything not needing backend data
+- backend_api_query  — dynamically route queries for system stats, users, numbers, and general database retrieval
 - summarization      — summarise a document or text
 - generate_exam      — generate a university exam (doctor/admin only)
 - result_query       — query academic results, grades, GPA, transcripts, schedules

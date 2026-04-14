@@ -42,6 +42,7 @@ class ToolRegistry:
             "cv_analysis":          "cv_analysis",
             "academic_advice":      "academic_advice",
             "material_explanation": "material_explanation",
+            "backend_api_query":    "dynamic_api_module",
             # ── general_chat is intentionally NOT registered:
             #    it routes directly to LLM fallback (no backend call needed)
         }
