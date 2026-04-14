@@ -222,6 +222,25 @@ _MAX_HISTORY_TURNS = 10
 _MAX_INPUT_LENGTH  = 4_000
 _TOOL_RETRY_DELAY  = 1.0    # seconds between retry attempts
 
+# ── Data-sensitive intents — MUST have backend data before LLM responds ────────
+# If any of these arrive at _fallback_model_call() without a tool having run,
+# the AI is BLOCKED from answering from its training memory.
+_DATA_SENSITIVE_INTENTS: frozenset[str] = frozenset({
+    "result_query",       # grades, GPA, transcripts, schedules
+    "complaint_summary",  # complaint records from DB
+    "file_processing",    # bulk DB operations
+    "generate_exam",      # must invoke backend exam service
+    "academic_advice",    # requires real GPA / grade data
+})
+
+# Bilingual blocked-data message (shown to user when gate fires).
+_NO_BACKEND_DATA_MSG = (
+    "مش لاقي بيانات من السيستم حالياً، حاول تاني. "
+    "لو المشكلة فاضلت، تواصل مع الدعم التقني.\n"
+    "(No data retrieved from the system right now — please try again.)"
+)
+
+
 
 # ── Input sanitisation ────────────────────────────────────────────────────────
 
@@ -330,7 +349,7 @@ class PlanExecutor:
                     "PlanExecutor: intent=%r steps=0 → _fallback_model_call",
                     plan.intent,
                 )
-                return await self._fallback_model_call(input_context)
+                return await self._fallback_model_call(input_context, intent=plan.intent)
 
             # 3. Multi-step plan → step runner ─────────────────────────────────
             logger.info(
@@ -341,7 +360,7 @@ class PlanExecutor:
 
         # 4. No plan → LLM ─────────────────────────────────────────────────────
         logger.info("PlanExecutor: no plan → _fallback_model_call")
-        return await self._fallback_model_call(input_context)
+        return await self._fallback_model_call(input_context, intent=intent)
 
 
     # ──────────────────────────────────────────────────────────────────────
@@ -767,9 +786,20 @@ class PlanExecutor:
     #  Fallback LLM call (general_chat + no-plan paths)
     # ──────────────────────────────────────────────────────────────────────
 
-    async def _fallback_model_call(self, input_context: AgentInput) -> AgentOutput:
+    async def _fallback_model_call(
+        self,
+        input_context: AgentInput,
+        intent: str = "general_chat",
+    ) -> AgentOutput:
         """
         Direct LLM call for general_chat and all cases without a step plan.
+
+        DATA-FIRST GATE (Step 0)
+        ────────────────────────
+        If `intent` is in _DATA_SENSITIVE_INTENTS and this method is called
+        (meaning no backend tool was executed), we BLOCK the response.
+        The AI is FORBIDDEN from fabricating grades, GPA, counts, or any
+        student/system data from its training memory.
 
         Builds structured messages[] with:
           - Role-specific system prompt (student / doctor / admin)
@@ -780,6 +810,26 @@ class PlanExecutor:
         Appends explainability block if explain=True.
         Attaches deterministic follow-up suggestions.
         """
+        # ── Step 0: Data-sensitive intent gate ───────────────────────────────────────
+        if intent in _DATA_SENSITIVE_INTENTS:
+            logger.warning(
+                "PlanExecutor [DATA-GATE]: intent=%r reached fallback with no backend data — "
+                "BLOCKED to prevent fabrication. user_id=%s",
+                intent, input_context.user_id,
+            )
+            role = (input_context.context or {}).get("role", "student")
+            suggestions = self._get_suggestions(intent, role)
+            return AgentOutput(
+                status="no_data",
+                response=_NO_BACKEND_DATA_MSG,
+                data={
+                    "blocked_intent":   intent,
+                    "reason":           "data_sensitive_no_backend_call",
+                    "suggestions":      suggestions,
+                    "actions_available": suggestions,
+                },
+            )
+
         if not self.model_router:
             return AgentOutput(status="failed", response="No model router available.")
 
@@ -790,7 +840,6 @@ class PlanExecutor:
         explain      = ctx.get("explain", False)
         prefs        = ctx.get("preferences", {}) or {}
         academic_ctx: dict = ctx.get("academic_context", {}) or {}
-        intent       = "general_chat"
 
         # ── Role-specific system prompt ───────────────────────────────────
         base_prompt = _ROLE_SYSTEM_PROMPTS.get(role, _ROLE_SYSTEM_PROMPTS["student"])
