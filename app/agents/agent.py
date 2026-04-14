@@ -330,6 +330,8 @@ class Agent:
                 "preferences":      context.metadata.get("preferences", {}),
                 "academic_context": context.academic_context,
                 "history":          context.history,
+                # Forward auth header into context so DynamicApiModule can use it
+                "auth_header":      context.metadata.get("auth_header"),
             },
         )
 
@@ -349,7 +351,7 @@ class Agent:
         # Store executor data (suggestions, actions_available, raw results)
         context.add_metadata("executor_data", executor_output.data or {})
 
-        if executor_output.status in ("failed", "partial_failure"):
+        if executor_output.status in ("failed", "partial_failure", "forbidden"):
             context.set_result(executor_output.response)
             raise _PipelineStageError("executor", executor_output.response)
 

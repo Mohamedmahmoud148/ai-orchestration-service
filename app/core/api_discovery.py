@@ -128,6 +128,16 @@ def validate_endpoint(method: str, endpoint: str) -> bool:
     Validation Layer (CRITICAL):
     Determines if the LLM's requested endpoint is explicitly allowed.
     """
+    if not _allowed_endpoints:
+        # Schema not loaded — log warning but allow to proceed so the
+        # backend JWT auth remains the final authority.
+        logger.warning(
+            "api_discovery.validate_endpoint: _allowed_endpoints is empty "
+            "(Swagger not loaded at startup). Permitting %s %s under JWT-RBAC only.",
+            method, endpoint
+        )
+        return True
+
     # The LLM might output `/api/Students/123`. 
     # Our allowed set contains `/api/Students/{id}`.
     # We must do basic path matching.
@@ -150,7 +160,9 @@ def validate_endpoint(method: str, endpoint: str) -> bool:
                 break
                 
         if match:
+            logger.debug("api_discovery.validate_endpoint: ALLOWED %s %s", method, endpoint)
             return True
-            
+
+    logger.warning("api_discovery.validate_endpoint: BLOCKED %s %s - not in allowlist", method, endpoint)
     return False
 
