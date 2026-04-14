@@ -118,7 +118,7 @@ class DynamicApiModule:
         logger.info("DynamicApiModule: Requesting API routing choice from model...")
         routing_response = await self.model_router.generate_with_messages(
             messages=routing_messages,
-            model=selected_model,
+            model_id=selected_model,
             response_format={"type": "json_object"}
         )
         
@@ -216,7 +216,7 @@ class DynamicApiModule:
         logger.info("DynamicApiModule: Summarizing backend data...")
         summary_payload = await self.model_router.generate_with_messages(
             messages=summary_messages,
-            model=selected_model,
+            model_id=selected_model,
             response_format={"type": "json_object"}
         )
         
