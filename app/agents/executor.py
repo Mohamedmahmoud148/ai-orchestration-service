@@ -786,6 +786,26 @@ class PlanExecutor:
     #  Fallback LLM call (general_chat + no-plan paths)
     # ──────────────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _is_raw_data_request(message: str) -> bool:
+        """
+        CRITICAL GLOBAL DATA GUARD:
+        Scans the raw user message for data-seeking keywords.
+        If the user asks for numbers, grades, schedules, or system facts,
+        this override prevents the LLM from fabricating an answer, regardless
+        of what the planner classified the intent as.
+        """
+        msg = message.lower()
+        keywords = {
+            "كم", "عدد", "total", "count",          # numbers requests
+            "درجات", "درجة", "gpa", "result",       # student data
+            "جدول", "مواعيد", "timetable",          # schedules
+            "مين", "ايه البيانات", "بيانات"           # system queries
+        }
+        # We do simple substring matching to catch prefixed Arabic words
+        # (e.g. "درجاتي", "الجدول")
+        return any(kw in msg for kw in keywords)
+
     async def _fallback_model_call(
         self,
         input_context: AgentInput,
@@ -811,11 +831,11 @@ class PlanExecutor:
         Attaches deterministic follow-up suggestions.
         """
         # ── Step 0: Data-sensitive intent gate ───────────────────────────────────────
-        if intent in _DATA_SENSITIVE_INTENTS:
+        if intent in _DATA_SENSITIVE_INTENTS or self._is_raw_data_request(input_context.message):
             logger.warning(
-                "PlanExecutor [DATA-GATE]: intent=%r reached fallback with no backend data — "
-                "BLOCKED to prevent fabrication. user_id=%s",
-                intent, input_context.user_id,
+                "PlanExecutor [GLOBAL DATA-GATE]: blocked fallback with no backend data — "
+                "intent=%r, message=%r, user_id=%s",
+                intent, input_context.message, input_context.user_id,
             )
             role = (input_context.context or {}).get("role", "student")
             suggestions = self._get_suggestions(intent, role)
@@ -824,13 +844,14 @@ class PlanExecutor:
                 response=_NO_BACKEND_DATA_MSG,
                 data={
                     "blocked_intent":   intent,
-                    "reason":           "data_sensitive_no_backend_call",
+                    "reason":           "global_data_guard_no_backend_call",
                     "suggestions":      suggestions,
                     "actions_available": suggestions,
                 },
             )
 
         if not self.model_router:
+
             return AgentOutput(status="failed", response="No model router available.")
 
         ctx          = input_context.context or {}
