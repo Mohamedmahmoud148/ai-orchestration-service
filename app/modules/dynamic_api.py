@@ -45,8 +45,10 @@ For path parameters (e.g. /api/Admins/{{id}}), replace {{id}} with the actual va
 _SUMMARY_PROMPT = """\
 You are a helpful university AI assistant. An API call was just made to fetch data to answer the user's request.
 
-USER MESSAGE: {user_message}
+USER MESSAGE: "{user_message}"
 API ENDPOINT CALLED: {method} {endpoint}
+USER ROLE: {role}
+USER ACADEMIC CONTEXT: {academic_context}
 
 RAW JSON FROM BACKEND:
 ```json
@@ -54,10 +56,19 @@ RAW JSON FROM BACKEND:
 ```
 
 INSTRUCTIONS:
-1. Summarize the answer to the user completely naturally and concisely.
-2. DO NOT expose the raw json. Extract only the numbers, statuses, or relevant information.
-3. If the user is a student, speak naturally using their name if present. If they are an admin, be precise and direct.
-4. If the JSON implies an error or empty data, inform the user clearly that the data could not be found.
+1. Summarize the answer completely naturally and concisely. DO NOT expose raw technical details or JSON.
+2. If the user is a student, speak naturally using their name if present in the context. If they are an admin, be precise and direct.
+3. If the JSON implies an error or empty data, inform the user clearly that the data could not be found.
+4. Smart Suggestions: Provide 3 short (max 6 words), actionable follow-up questions the user might ask based on this data.
+5. Explainability Layer: Provide a short, human-friendly 1-liner explaining where you got this data (e.g. "جبتلك البيانات دي من نظام الطلبة في السيستم"). Avoid raw endpoints.
+
+OUTPUT FORMAT:
+Return a JSON object strictly following this structure:
+{{
+    "narrative": "<your natural spoken response>",
+    "suggestions": ["<suggestion 1>", "<suggestion 2>", "<suggestion 3>"],
+    "explain_text": "<explain layer message>"
+}}
 """
 
 
@@ -75,11 +86,17 @@ class DynamicApiModule:
         self, input_context: AgentInput, plan: ExecutionPlan
     ) -> AgentOutput:
         
+        import time
+        start_time = time.time()
+        
         ctx          = input_context.context or {}
         role         = ctx.get("role", "student")
         selected_model = ctx.get("selected_model", "openai/gpt-4o-mini")
+        explain_mode = ctx.get("explain", False)
+        debug_mode   = ctx.get("debug", False)
         academic_ctx = json.dumps(ctx.get("academic_context", {}), ensure_ascii=False)
         message      = input_context.message
+        intent       = plan.intent or "backend_api_query"
 
         # 1. Fetch available endpoints
         schema_text = get_allowed_endpoints_schema()
@@ -111,15 +128,22 @@ class DynamicApiModule:
             method   = route_data.get("method", "").upper()
             params   = route_data.get("params", {})
         except Exception as exc:
-            logger.error("DynamicApiModule: Failed to parse routing JSON: %s", exc)
+            duration = round(time.time() - start_time, 4)
+            logger.error(
+                "[AI] Intent: %s\n[AI] Endpoint: LLM Fallback\n[AI] Method: N/A\n[AI] Status: Failed - LLM Parsing Error\n[AI] Duration: %s",
+                intent, duration
+            )
             return AgentOutput(
                 status="failed",
                 response="أنا واجهت مشكلة في تحديد البيانات المطلوبة. لو سمحت وضح طلبك تاني."
             )
             
         if not endpoint:
-            # Fallback Safety check
-            logger.warning("DynamicApiModule: Model returned empty endpoint.")
+            duration = round(time.time() - start_time, 4)
+            logger.warning(
+                "[AI] Intent: %s\n[AI] Endpoint: N/A\n[AI] Method: N/A\n[AI] Status: Blocked - Empty Route\n[AI] Duration: %s",
+                intent, duration
+            )
             return AgentOutput(
                 status="failed",
                 response="مش قادر ألاقي جزء النظام الخاص بطلبك دة. ممكن توضح أكتر إنت محتاج إيه؟"
@@ -127,9 +151,10 @@ class DynamicApiModule:
 
         # 3. Execution Validation Layer (CRITICAL CHECK)
         if not validate_endpoint(method, endpoint):
+            duration = round(time.time() - start_time, 4)
             logger.warning(
-                "DynamicApiModule: SECURITY BLOCKED %s %s. Not in allowlist.", 
-                method, endpoint
+                "[AI] Intent: %s\n[AI] Endpoint: %s\n[AI] Method: %s\n[AI] Status: Blocked - Not Allowed\n[AI] Duration: %s",
+                intent, endpoint, method, duration
             )
             return AgentOutput(
                 status="forbidden",
@@ -151,13 +176,22 @@ class DynamicApiModule:
                     route=endpoint, payload=params, auth_header=auth_header
                 )
         except Exception as exc:
-            logger.error("DynamicApiModule: Execution error mapping to %s: %s", endpoint, exc)
+            duration = round(time.time() - start_time, 4)
+            logger.error(
+                "[AI] Intent: %s\n[AI] Endpoint: %s\n[AI] Method: %s\n[AI] Status: Failed - Backend Error (%s)\n[AI] Duration: %s",
+                intent, endpoint, method, str(exc), duration
+            )
             return AgentOutput(
                 status="failed",
-                response="حاولت أستعلم السيستم بس واجهت مشكلة. حاول كمان شوية."
+                response="مش قادر أوصل للبيانات دلوقتي، حاول تاني"
             )
 
         if not raw_data:
+            duration = round(time.time() - start_time, 4)
+            logger.info(
+                "[AI] Intent: %s\n[AI] Endpoint: %s\n[AI] Method: %s\n[AI] Status: Success - Empty Data\n[AI] Duration: %s",
+                intent, endpoint, method, duration
+            )
             return AgentOutput(
                 status="success",
                 response="مش لاقي أي بيانات مطابقة لطلبك في السيستم حالياً.",
@@ -172,16 +206,48 @@ class DynamicApiModule:
                     user_message=message,
                     method=method,
                     endpoint=endpoint,
+                    role=role,
+                    academic_context=academic_ctx,
                     raw_response=json.dumps(raw_data, ensure_ascii=False)[:3000] # Cap size
                 )
             }
         ]
         
         logger.info("DynamicApiModule: Summarizing backend data...")
-        narrative = await self.model_router.generate_with_messages(
+        summary_payload = await self.model_router.generate_with_messages(
             messages=summary_messages,
-            model=selected_model
+            model=selected_model,
+            response_format={"type": "json_object"}
         )
+        
+        try:
+            out_data = json.loads(summary_payload)
+            narrative = out_data.get("narrative", "تم جلب البيانات بنجاح.")
+            suggestions = out_data.get("suggestions", [])
+            explain_text = out_data.get("explain_text", "")
+        except Exception:
+            narrative = "تمت العملية بنجاح."
+            suggestions = []
+            explain_text = ""
+            
+        if explain_mode and explain_text:
+            narrative += f"\n\nℹ️ *{explain_text}*"
+            
+        duration = round(time.time() - start_time, 4)
+        logger.info(
+            "[AI] Intent: %s\n[AI] Endpoint: %s\n[AI] Method: %s\n[AI] Status: Success\n[AI] Duration: %ss",
+            intent, endpoint, method, duration
+        )
+        
+        # 8. Debug Mode support
+        metadata = {}
+        if debug_mode:
+            metadata = {
+                "endpoint": endpoint,
+                "method": method,
+                "execution_time_seconds": duration,
+                "intent_detected": intent
+            }
         
         return AgentOutput(
             status="success",
@@ -189,6 +255,9 @@ class DynamicApiModule:
             data={
                 "endpoint_called": endpoint,
                 "method_called": method,
-                "raw_backend_data": raw_data
+                "raw_backend_data": raw_data,
+                "suggestions": suggestions,
+                "actions_available": suggestions,
+                "debug_info": metadata
             }
         )
