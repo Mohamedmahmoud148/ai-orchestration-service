@@ -124,7 +124,9 @@ def _detect_backend_query(message: str) -> bool:
     
     _ARABIC_DATA_KEYWORDS = {
         "كم عدد", "كام بدرس", "عدد الدكاترة", "نسبة", "احصائيات", 
-        "مين هم", "قائمة", "عدد الطلاب", "اللي بيدرس"
+        "مين هم", "قائمة", "عدد الطلاب", "اللي بيدرس", "كليات", 
+        "الكليات", "دكاترة", "الدكاترة", "قسم", "اقسام", "الأقسام", 
+        "اسم", "اسمي", "بيانات", "جامعه", "جامعة"
     }
     for kw in _ARABIC_DATA_KEYWORDS:
         if kw in msg:
@@ -305,7 +307,12 @@ Rules for generate_exam:
     * NEVER add tool steps for this intent — the MaterialExplanationModule handles
       the backend fetch internally.
 
-### 11. When in doubt → use general_chat with steps=[].
+### 11. backend_api_query (Dynamic API Fetching)
+- Use intent=backend_api_query for ANY question requesting data from the university system.
+- Triggers include asking about: users, names, colleges, departments, subjects, students, doctors, counts, lists.
+- Examples: "ما هي الكليات", "من هم الدكاترة", "انا اسمي ايه", "كم عدد الطلاب", "what are the colleges"
+
+### 12. When in doubt → use general_chat with steps=[].
 
 
 ### Multi-step example (result_query — grades then GPA):
