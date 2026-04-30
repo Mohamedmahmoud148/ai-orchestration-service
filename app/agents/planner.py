@@ -123,10 +123,20 @@ def _detect_backend_query(message: str) -> bool:
     msg = message.strip().lower()
     
     _ARABIC_DATA_KEYWORDS = {
-        "كم عدد", "كام بدرس", "عدد الدكاترة", "نسبة", "احصائيات", 
-        "مين هم", "قائمة", "عدد الطلاب", "اللي بيدرس", "كليات", 
-        "الكليات", "دكاترة", "الدكاترة", "قسم", "اقسام", "الأقسام", 
-        "اسم", "اسمي", "بيانات", "جامعه", "جامعة"
+        # Data/count queries
+        "كم عدد", "كام بدرس", "عدد الدكاترة", "نسبة", "احصائيات",
+        "مين هم", "قائمة", "عدد الطلاب", "اللي بيدرس",
+        # Entity names
+        "كليات", "الكليات", "دكاترة", "الدكاترة",
+        "قسم", "اقسام", "الأقسام", "الاقسام",
+        "طلاب", "الطلاب", "مواد", "المواد",
+        # Identity / profile queries
+        "اسمي", "اسم", "انا مين", "أنا مين",
+        "من انا", "من أنا", "مين انا", "مين أنا",
+        "معلوماتي", "بياناتي", "بروفايلي", "حسابي",
+        "profile", "who am i", "my name", "my info",
+        # University/system data
+        "بيانات", "جامعه", "جامعة", "السيستم",
     }
     for kw in _ARABIC_DATA_KEYWORDS:
         if kw in msg:
@@ -312,7 +322,22 @@ Rules for generate_exam:
 - Triggers include asking about: users, names, colleges, departments, subjects, students, doctors, counts, lists.
 - Examples: "ما هي الكليات", "من هم الدكاترة", "انا اسمي ايه", "كم عدد الطلاب", "what are the colleges"
 
-### 12. When in doubt → use general_chat with steps=[].
+### 12. Identity & Profile Queries → ALWAYS backend_api_query
+⚠️ CRITICAL: Questions about the user's own identity, name, or profile data MUST use backend_api_query.
+NEVER answer identity questions from LLM knowledge — always fetch from the backend.
+
+Arabic triggers (ANY of these = backend_api_query):
+  "انا مين", "أنا مين", "مين انا", "مين أنا",
+  "من انا", "من أنا", "اسمي ايه", "اسمي إيه",
+  "معلوماتي", "بياناتي", "بروفايلي", "حسابي"
+
+English triggers (ANY of these = backend_api_query):
+  "who am i", "what is my name", "my profile", "my info",
+  "my account", "my details"
+
+IMPORTANT: The userId is available in academic_context — ALWAYS inject it in the request.
+
+### 13. When in doubt → use general_chat with steps=[].
 
 
 ### Multi-step example (result_query — grades then GPA):

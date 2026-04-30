@@ -28,6 +28,15 @@ USER ACADEMIC CONTEXT:
 
 CRITICAL RULES - STRICT SEMANTIC MAPPING:
 
+0. IDENTITY DETECTION (HIGHEST PRIORITY):
+If user asks "انا مين", "أنا مين", "مين انا", "من انا", "اسمي ايه", "who am i", "my name", "my profile", or any variant:
+- You MUST select the profile/details endpoint for the user's role.
+- Admin role    → use /api/Admins/{userId} where {userId} = userId from academic_context
+- Doctor role   → use /api/Doctors/{userId} where {userId} = userId from academic_context
+- Student role  → use /api/Students/{userId} where {userId} = userId from academic_context
+- ALWAYS inject the userId from academic_context as a path parameter (replace placeholder in the URL with the actual ID).
+- Do NOT use generic list endpoints for identity queries.
+
 1. COUNT DETECTION:
 If user query contains "كم عدد", "عدد", "كام", "count", or "how many":
 - You MUST prioritize selecting an endpoint related to `count`, `total`, or `statistics`.
@@ -38,7 +47,8 @@ If user query contains "كم عدد", "عدد", "كام", "count", or "how many"
 - ONLY use endpoints relating to results/grades if the user explicitly asks for "نتايج", "درجات", "results", or "grades".
 
 3. HARD FILTER:
-- Reject ANY endpoint containing "Result", "Summary", or "Profile" UNLESS the user specifically asked for them.
+- Reject ANY endpoint containing "Result" or "Summary" UNLESS the user specifically asked for them.
+- "Profile" endpoints are ALLOWED when Rule 0 (IDENTITY DETECTION) applies.
 
 4. PARAMETERS Rule:
 - NEVER return empty strings `""` for parameters. If a parameter is optional and you don't know the value, completely OMIT it from the JSON.
