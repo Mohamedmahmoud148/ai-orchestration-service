@@ -34,11 +34,25 @@ SCENARIO MAPPING RULES (apply in ORDER, stop at first match)
 RULE 0 — IDENTITY / PROFILE (HIGHEST PRIORITY):
 Keywords: "انا مين", "أنا مين", "مين انا", "من انا", "اسمي ايه", "اسمي إيه",
           "معلوماتي", "بياناتي", "بروفايلي", "who am i", "my name", "my profile"
-→ Select the profile/details endpoint for the user's role, using userId from context:
-  - admin   → GET /api/Admins/{{userId}}
-  - doctor/professor → GET /api/Doctors/{{code_or_userId}}
-  - student → GET /api/Students/{{code_or_userId}}
-→ Replace the path parameter with the actual userId from academic_context.
+
+⚠️ CRITICAL ID RULES FOR IDENTITY QUERIES:
+- admin role   → GET /api/Admins/{{ACTUAL_PROFILE_ID}}
+    Use "profileId" from academic_context (NOT "userId").
+    Example: if profileId = "01KMXFBTWXYQK3T3K1A9NAVQ2J"
+    → endpoint = "/api/Admins/01KMXFBTWXYQK3T3K1A9NAVQ2J"
+
+- doctor/professor role → GET /api/Doctors/{{ACTUAL_USER_ID}}
+    Use "userId" from academic_context.
+    Example: if userId = "01KQEQE95QGZHBEY2E6RAR2TP6"
+    → endpoint = "/api/Doctors/01KQEQE95QGZHBEY2E6RAR2TP6"
+
+- student role → GET /api/Students/{{ACTUAL_USER_ID}}
+    Use "userId" from academic_context.
+    Example: if userId = "01KP70519E5ZC0KK94RJY6WH67"
+    → endpoint = "/api/Students/01KP70519E5ZC0KK94RJY6WH67"
+
+⛔ NEVER return a literal placeholder like "{userId}" or "{profileId}" in the endpoint string.
+⛔ ALWAYS substitute the real ID value from academic_context into the URL.
 
 RULE 1 — DASHBOARD / STATISTICS:
 Keywords: "dashboard", "احصائيات", "إحصائيات", "نظرة عامة", "overview", "stats"
@@ -219,6 +233,37 @@ class DynamicApiModule:
                 status="failed",
                 response="أنا واجهت مشكلة في تحديد البيانات المطلوبة. لو سمحت وضح طلبك تاني."
             )
+
+        # ── Placeholder Sanitization Layer (Failsafe) ─────────────────────
+        # If the LLM returned a literal {placeholder} in the endpoint URL,
+        # substitute it automatically from academic_context.
+        if "{" in endpoint:
+            raw_ac = ctx.get("academic_context", {})
+            substitutions = {
+                "{userId}":    raw_ac.get("userId", ""),
+                "{profileId}": raw_ac.get("profileId", ""),
+                "{studentId}": raw_ac.get("studentId", raw_ac.get("userId", "")),
+                "{id}":        raw_ac.get("profileId") or raw_ac.get("userId", ""),
+                "{code}":      raw_ac.get("profileId") or raw_ac.get("userId", ""),
+            }
+            original_endpoint = endpoint
+            for placeholder, value in substitutions.items():
+                if value:
+                    endpoint = endpoint.replace(placeholder, value)
+            if "{" in endpoint:
+                logger.warning(
+                    "DynamicApiModule: Unresolved placeholders in endpoint after substitution: %s",
+                    endpoint
+                )
+                return AgentOutput(
+                    status="failed",
+                    response="مش قادر أحدد الـ ID المطلوب. ممكن تبعت الـ profileId أو userId في الـ context؟"
+                )
+            logger.info(
+                "DynamicApiModule: Placeholder substituted: %s → %s",
+                original_endpoint, endpoint
+            )
+
             
         if not endpoint:
             duration = round(time.time() - start_time, 4)

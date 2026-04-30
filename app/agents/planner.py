@@ -421,6 +421,7 @@ class PlannerAgent(BaseAgent):
             safe_keys = [
                 "userId", "studentId", "courseId", "subjectOfferingId",
                 "departmentId", "batchId", "collegeName", "departmentName",
+                "profileId",  # Admin/Doctor profile ID (different from userId)
             ]
             relevant = {k: v for k, v in academic_ctx.items() if k in safe_keys and v}
             if relevant:
