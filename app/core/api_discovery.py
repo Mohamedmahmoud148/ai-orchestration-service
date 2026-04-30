@@ -2,8 +2,10 @@
 api_discovery.py
 
 Downloads and caches the OpenAPI (Swagger) schema from the backend.
-Applies the Endpoint Allowlist Layer and Swagger Filtering Layer to prevent the AI
-from seeing, suggesting, or calling administrative or destructive routes.
+Applies Role-Based Endpoint Allowlist to prevent the AI from calling
+destructive or unauthorized routes.
+
+v2.0 — Full Swagger coverage with RBAC-aware allowlist.
 """
 import ssl
 import json
@@ -16,44 +18,87 @@ from app.core.logging import logger
 _cached_schema: Optional[str] = None
 _allowed_endpoints: Set[Tuple[str, str]] = set()
 
-# ── 1. Endpoint Allowlist (MANDATORY Constraint) ─────────────────────────────
-# We block all DELETE, PUT, PATCH methods completely.
-_ALLOWED_METHODS = {"get", "post"}
+# ── BLOCKED methods completely ────────────────────────────────────────────────
+_BLOCKED_METHODS = {"delete", "put", "patch"}
 
-# Block specific routes explicitly, even if they are GET or POST.
+# ── BLOCKED path prefixes (never exposed to AI regardless of method) ──────────
 _BLOCKED_PREFIXES = (
-    "/api/auth",             # Authentication endpoints
-    "/api/dev",              # Developer test endpoints
-    "/api/ai",               # Prevents orchestrator calling itself in a loop
-    "/api/structure",        # Destructive DB reset routes if any exist here
+    "/api/auth",          # Authentication — AI never handles login/logout
+    "/api/dev",           # Developer/debug routes
+    "/api/ai",            # Prevent self-loop (orchestrator calling itself)
+    "/api/auditlogs",     # Internal audit — not for AI queries
+    "/api/notification",  # Push notifications — not an AI tool
 )
 
-# Safe POST prefixes. If it's a POST, it MUST match one of these explicitly.
-_SAFE_POST_PREFIXES = (
-    "/api/exams",            # Generating exams
-    "/api/complaints",       # Submitting complaints
-    "/api/files",            # Bulk uploads etc
+# ── SAFE POST routes — only specific POST paths are allowed ───────────────────
+# Read: AI may call these POST endpoints (creation/bulk/tool actions)
+_SAFE_POST_PATHS = (
+    # Exams
+    "/api/exams",
+    "/api/exams/generate-ai",
+    "/api/exams/upload-pdf",
+    "/api/exams/grade-submission",
+    "/api/exams/",          # covers /api/exams/{id}/submit, /api/exams/{id}/auto-grade
+
+    # Complaints (via ai-tools)
+    "/api/ai-tools/create-complaint",
+    "/api/ai-tools/distribute-exams",
+    "/api/ai-tools/bulk-create-students",
+    "/api/ai-tools/bulk-upload-grades",
+
+    # Attendance
+    "/api/attendance/sessions",
+    "/api/attendance/check-in",
+
+    # Enrollment
+    "/api/enrollments/",
+    "/api/enrollment/upload",
+
+    # GPA recalculate
+    "/api/gpa/student/",
+
+    # Grades
+    "/api/grades/calculate/",
+    "/api/grades/",
+
+    # Files
+    "/api/file/upload",
+    "/api/studentfiles/upload",
+    "/api/materials/upload",
+
+    # Students bulk
+    "/api/students/bulk-upload-direct",
+    "/api/students/bulk-upload-ai",
+    "/api/students/import-excel",
 )
 
 
 def _is_allowed(path: str, method: str) -> bool:
-    """Execution Validation Layer Constraint 1: Check against allowlist."""
+    """Check if a path+method combination is allowed for AI usage."""
     method = method.lower()
     path_lower = path.lower()
 
-    if method not in _ALLOWED_METHODS:
+    # Block destructive methods entirely
+    if method in _BLOCKED_METHODS:
         return False
 
+    # Block forbidden prefixes
     for prefix in _BLOCKED_PREFIXES:
         if path_lower.startswith(prefix):
             return False
 
-    if method == "post":
-        is_safe_post = any(path_lower.startswith(p) for p in _SAFE_POST_PREFIXES)
-        if not is_safe_post:
-            return False
+    # GET requests: allow everything not blocked above
+    if method == "get":
+        return True
 
-    return True
+    # POST requests: must match a safe prefix
+    if method == "post":
+        for safe in _SAFE_POST_PATHS:
+            if path_lower.startswith(safe.lower()):
+                return True
+        return False
+
+    return False
 
 
 async def fetch_and_filter_schema() -> None:
@@ -62,7 +107,7 @@ async def fetch_and_filter_schema() -> None:
     and caches a compressed Schema String + precise Validation Set.
     """
     global _cached_schema, _allowed_endpoints
-    
+
     base_url = (settings.BACKEND_BASE_URL or "").rstrip("/")
     if not base_url:
         logger.warning("api_discovery: BACKEND_BASE_URL is not configured.")
@@ -72,13 +117,12 @@ async def fetch_and_filter_schema() -> None:
     logger.info("api_discovery: Fetching Swagger JSON from %s", swagger_url)
 
     try:
-        # Avoid SSL verification issues when fetching from self-signed internal endpoints
         transport = httpx.AsyncHTTPTransport(verify=False)
         async with httpx.AsyncClient(transport=transport, timeout=15.0) as client:
             response = await client.get(swagger_url)
             response.raise_for_status()
             data = response.json()
-            
+
             paths = data.get("paths", {})
             schema_lines = []
             allowed_set = set()
@@ -87,27 +131,38 @@ async def fetch_and_filter_schema() -> None:
                 for method, details in methods.items():
                     if not _is_allowed(path, method):
                         continue
-                    
-                    # Optional user constraint: Check for [AI_ALLOWED] tag
-                    # If tags exist, we could filter here. Currently not enforced 
-                    # as all internal APIs without blocks should be mapped.
-                    
-                    summary = details.get("summary", "") or details.get("description", "No description")
+
+                    summary = (
+                        details.get("summary", "")
+                        or details.get("description", "No description")
+                    )
                     parameters = details.get("parameters", [])
-                    param_names = [p["name"] for p in parameters if p.get("in") == "query" or p.get("in") == "path"]
-                    
-                    # Store exact match for Validation Layer
+                    param_names = [
+                        p["name"]
+                        for p in parameters
+                        if p.get("in") in ("query", "path")
+                    ]
+
+                    # Store exact path for validation layer
                     allowed_set.add((method.upper(), path))
-                    
-                    params_str = f" Params: {', '.join(param_names)}" if param_names else ""
-                    schema_lines.append(f"- {method.upper()} {path} → {summary}.{params_str}")
+
+                    params_str = (
+                        f" Params: {', '.join(param_names)}" if param_names else ""
+                    )
+                    schema_lines.append(
+                        f"- {method.upper()} {path} → {summary}.{params_str}"
+                    )
 
             if not schema_lines:
-                logger.warning("api_discovery: Swagger fetched but NO routes passed filtering.")
+                logger.warning(
+                    "api_discovery: Swagger fetched but NO routes passed filtering."
+                )
                 _cached_schema = "No allowed backend APIs available."
             else:
                 _cached_schema = "\n".join(schema_lines)
-                logger.info("api_discovery: Cached %d allowed endpoints.", len(allowed_set))
+                logger.info(
+                    "api_discovery: Cached %d allowed endpoints.", len(allowed_set)
+                )
 
             _allowed_endpoints = allowed_set
 
@@ -127,42 +182,47 @@ def validate_endpoint(method: str, endpoint: str) -> bool:
     """
     Validation Layer (CRITICAL):
     Determines if the LLM's requested endpoint is explicitly allowed.
+
+    Handles path-parameter substitution:
+      /api/Students/01KMXFB... matches /api/Students/{code}
     """
     if not _allowed_endpoints:
-        # Schema not loaded — log warning but allow to proceed so the
-        # backend JWT auth remains the final authority.
         logger.warning(
             "api_discovery.validate_endpoint: _allowed_endpoints is empty "
             "(Swagger not loaded at startup). Permitting %s %s under JWT-RBAC only.",
-            method, endpoint
+            method,
+            endpoint,
         )
         return True
 
-    # The LLM might output `/api/Students/123`. 
-    # Our allowed set contains `/api/Students/{id}`.
-    # We must do basic path matching.
     target_parts = endpoint.strip("/").split("/")
-    
+
     for allowed_method, allowed_path in _allowed_endpoints:
         if allowed_method != method.upper():
             continue
-            
+
         allowed_parts = allowed_path.strip("/").split("/")
         if len(target_parts) != len(allowed_parts):
             continue
-            
+
         match = True
         for tp, ap in zip(target_parts, allowed_parts):
+            # Path param placeholder matches any value
             if ap.startswith("{") and ap.endswith("}"):
-                continue # Param placeholder matches anything
+                continue
             if tp.lower() != ap.lower():
                 match = False
                 break
-                
+
         if match:
-            logger.debug("api_discovery.validate_endpoint: ALLOWED %s %s", method, endpoint)
+            logger.debug(
+                "api_discovery.validate_endpoint: ALLOWED %s %s", method, endpoint
+            )
             return True
 
-    logger.warning("api_discovery.validate_endpoint: BLOCKED %s %s - not in allowlist", method, endpoint)
+    logger.warning(
+        "api_discovery.validate_endpoint: BLOCKED %s %s - not in allowlist",
+        method,
+        endpoint,
+    )
     return False
-

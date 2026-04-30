@@ -16,57 +16,112 @@ from app.core.api_discovery import get_allowed_endpoints_schema, validate_endpoi
 from app.core.logging import logger
 
 _ROUTING_PROMPT = """\
-You are a STRICT API Router mapping a user's natural language request to a backend API endpoint.
+You are a STRICT API Router for a university management system.
+Map the user's natural language request to the SINGLE best backend API endpoint.
 
 AVAILABLE ENDPOINTS:
 {schema}
 
 USER REQUEST: "{message}"
 USER ROLE: {role}
-USER ACADEMIC CONTEXT:
+USER ACADEMIC CONTEXT (use these IDs to fill path/query params):
 {academic_context}
 
-CRITICAL RULES - STRICT SEMANTIC MAPPING:
+════════════════════════════════════════════════════
+SCENARIO MAPPING RULES (apply in ORDER, stop at first match)
+════════════════════════════════════════════════════
 
-0. IDENTITY DETECTION (HIGHEST PRIORITY):
-If user asks "انا مين", "أنا مين", "مين انا", "من انا", "اسمي ايه", "who am i", "my name", "my profile", or any variant:
-- You MUST select the profile/details endpoint for the user's role.
-- Admin role    → use /api/Admins/{userId} where {userId} = userId from academic_context
-- Doctor role   → use /api/Doctors/{userId} where {userId} = userId from academic_context
-- Student role  → use /api/Students/{userId} where {userId} = userId from academic_context
-- ALWAYS inject the userId from academic_context as a path parameter (replace placeholder in the URL with the actual ID).
-- Do NOT use generic list endpoints for identity queries.
+RULE 0 — IDENTITY / PROFILE (HIGHEST PRIORITY):
+Keywords: "انا مين", "أنا مين", "مين انا", "من انا", "اسمي ايه", "اسمي إيه",
+          "معلوماتي", "بياناتي", "بروفايلي", "who am i", "my name", "my profile"
+→ Select the profile/details endpoint for the user's role, using userId from context:
+  - admin   → GET /api/Admins/{{userId}}
+  - doctor/professor → GET /api/Doctors/{{code_or_userId}}
+  - student → GET /api/Students/{{code_or_userId}}
+→ Replace the path parameter with the actual userId from academic_context.
 
-1. COUNT DETECTION:
-If user query contains "كم عدد", "عدد", "كام", "count", or "how many":
-- You MUST prioritize selecting an endpoint related to `count`, `total`, or `statistics`.
-- Do NOT select endpoints containing `Results`, `Summary`, `Profile`, or `Details`.
-- If no explicit /count endpoint exists, use the GET endpoint that lists all those items (e.g., /api/Students) and the system will count them automatically. 
+RULE 1 — DASHBOARD / STATISTICS:
+Keywords: "dashboard", "احصائيات", "إحصائيات", "نظرة عامة", "overview", "stats"
+→ GET /api/Dashboard
 
-2. RESULTS DETECTION:
-- ONLY use endpoints relating to results/grades if the user explicitly asks for "نتايج", "درجات", "results", or "grades".
+RULE 2 — COLLEGES:
+Keywords: "كلية", "كليات", "الكليات", "colleges", "faculties"
+→ GET /api/Colleges
 
-3. HARD FILTER:
-- Reject ANY endpoint containing "Result" or "Summary" UNLESS the user specifically asked for them.
-- "Profile" endpoints are ALLOWED when Rule 0 (IDENTITY DETECTION) applies.
+RULE 3 — DEPARTMENTS:
+Keywords: "قسم", "أقسام", "اقسام", "departments"
+→ GET /api/Departments  (or /api/Departments/by-college/{{id}} if collegeId known)
 
-4. PARAMETERS Rule:
-- NEVER return empty strings `""` for parameters. If a parameter is optional and you don't know the value, completely OMIT it from the JSON.
-- If pagination is required, inject default values: `page=1`, `size=10`.
+RULE 4 — STUDENTS:
+Keywords: "طالب", "طلاب", "الطلاب", "students", "كام طالب", "عدد الطلاب"
+→ GET /api/Students  (list)
+→ GET /api/Students/{{code}} (individual, if userId/code known)
+→ GET /api/Students/by-batch/{{batchId}} (if batchId known)
 
-5. FAIL SAFE:
-- Accuracy is more important than answering. If no correct endpoint mathematically fits the user's request, DO NOT GUESS.
-- Return an empty endpoint string.
+RULE 5 — DOCTORS / FACULTY:
+Keywords: "دكتور", "دكاترة", "الدكاترة", "أستاذ", "doctor", "doctors", "faculty"
+→ GET /api/Doctors  (list)
+→ GET /api/Doctors/{{code}} (individual)
+→ GET /api/Doctors/{{code}}/subjects (their subjects)
 
-OUTPUT FORMAT:
-Return ONLY this JSON object:
+RULE 6 — SUBJECTS / COURSES:
+Keywords: "مادة", "مواد", "المواد", "subject", "subjects", "course", "courses"
+→ GET /api/Subjects/by-batch/{{batchId}}  (if batchId known)
+→ GET /api/Subjects/{{code}}  (individual)
+→ GET /api/SubjectOfferings/my-offerings  (student's offerings)
+
+RULE 7 — GRADES / RESULTS:
+Keywords: "درجة", "درجات", "نتيجة", "نتايج", "grades", "results", "marks"
+→ GET /api/Gpa/my-gpa  (student's own GPA)
+→ GET /api/Gpa/student/{{studentId}}  (specific student GPA)
+→ GET /api/Exams/{{id}}/results  (exam results, if examId known)
+
+RULE 8 — EXAMS:
+Keywords: "امتحان", "امتحانات", "اختبار", "exam", "exams", "quiz"
+→ GET /api/Exams/my-exams  (student's own exams)
+→ GET /api/Exams/by-offering/{{offeringId}}  (exams for a subject)
+→ GET /api/Exams/my-enrolled-exams  (enrolled exams)
+
+RULE 9 — ATTENDANCE:
+Keywords: "حضور", "غياب", "attendance", "absent", "present"
+→ GET /api/Attendance/student/{{studentId}}/report
+
+RULE 10 — COMPLAINTS:
+Keywords: "شكوى", "شكاوى", "complaint", "complaints"
+→ GET /api/ai-tools/get-complaints  (admin/doctor view)
+
+RULE 11 — MATERIALS:
+Keywords: "ملف", "ملفات", "مادة تعليمية", "material", "materials", "lecture"
+→ GET /api/Materials/by-offering/{{offeringId}}
+
+RULE 12 — BATCHES / GROUPS:
+Keywords: "دفعة", "دفعات", "batch", "batches", "group", "groups"
+→ GET /api/Batches
+→ GET /api/Groups
+
+RULE 13 — ACADEMIC YEARS / SEMESTERS:
+Keywords: "سنة دراسية", "فصل", "فصول", "academic year", "semester"
+→ GET /api/academic-years
+→ GET /api/Semesters/by-academic-year/{{academicYearId}}
+
+════════════════════════════════════════════════════
+PARAMETERS RULES:
+════════════════════════════════════════════════════
+- ALWAYS inject IDs from academic_context into path parameters.
+- NEVER return empty string "" for any parameter — omit it entirely if unknown.
+- For list endpoints, inject: page=1, size=20 as defaults.
+- For path params: replace {{placeholder}} directly in the URL string (not in "params").
+
+FAIL SAFE:
+- If NO rule matches perfectly, return "endpoint": "".
+- Never guess or hallucinate an endpoint.
+
+OUTPUT FORMAT (return ONLY this JSON, no markdown):
 {{
-    "endpoint": "<chosen_endpoint_path>",
+    "endpoint": "<chosen_endpoint_path_with_real_ids>",
     "method": "GET",
     "params": {{"<query_key>": "<value>"}}
 }}
-For path parameters (e.g. /api/Admins/{{id}}), replace {{id}} with the actual value directly in the endpoint string. Do NOT put it in "params".
-If no endpoint fits perfectly, return "endpoint": "".
 """
 
 _SUMMARY_PROMPT = """\
