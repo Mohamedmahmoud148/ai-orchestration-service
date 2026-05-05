@@ -51,7 +51,7 @@ Keywords: "انا مين", "أنا مين", "مين انا", "من انا", "ا�
     Example: if userId = "01KP70519E5ZC0KK94RJY6WH67"
     → endpoint = "/api/Students/01KP70519E5ZC0KK94RJY6WH67"
 
-⛔ NEVER return a literal placeholder like "{userId}" or "{profileId}" in the endpoint string.
+⛔ NEVER return a literal placeholder like "{{userId}}" or "{{profileId}}" in the endpoint string.
 ⛔ ALWAYS substitute the real ID value from academic_context into the URL.
 
 RULE 1 — DASHBOARD / STATISTICS:
