@@ -201,12 +201,11 @@ class DynamicApiModule:
         routing_messages = [
             {
                 "role": "system",
-                "content": _ROUTING_PROMPT.format(
-                    schema=schema_text,
-                    message=message,
-                    role=role,
-                    academic_context=academic_ctx
-                )
+                "content": _ROUTING_PROMPT
+                    .replace("{schema}", schema_text)
+                    .replace("{message}", message)
+                    .replace("{role}", role)
+                    .replace("{academic_context}", academic_ctx)
             }
         ]
         
@@ -345,14 +344,13 @@ class DynamicApiModule:
         summary_messages = [
             {
                 "role": "system",
-                "content": _SUMMARY_PROMPT.format(
-                    user_message=message,
-                    method=method,
-                    endpoint=endpoint,
-                    role=role,
-                    academic_context=academic_ctx,
-                    raw_response=json.dumps(raw_data, ensure_ascii=False)[:3000] # Cap size
-                )
+                "content": _SUMMARY_PROMPT
+                    .replace("{user_message}", message)
+                    .replace("{method}", method)
+                    .replace("{endpoint}", endpoint)
+                    .replace("{role}", role)
+                    .replace("{academic_context}", academic_ctx)
+                    .replace("{raw_response}", json.dumps(raw_data, ensure_ascii=False)[:3000])
             }
         ]
         
