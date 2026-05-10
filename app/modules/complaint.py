@@ -92,22 +92,27 @@ class ComplaintModule:
         academic_ctx: Dict[str, Any] = ctx.get("academic_context", {}) or {}
 
         # ── Resolve required fields ───────────────────────────────────────────
-        user_id            = agent_input.user_id or academic_ctx.get("userId") or academic_ctx.get("studentId")
         subject_offering_id = academic_ctx.get("subjectOfferingId") or academic_ctx.get("courseId")
+        doctor_id = academic_ctx.get("doctorId") or academic_ctx.get("professorId")
         complaint_message  = agent_input.message.strip()
         target_type        = _infer_target_type(complaint_message)
 
+        # Build targetId based on inferred type
+        target_id = ""
+        if target_type == "Doctor" and doctor_id:
+            target_id = doctor_id
+        elif target_type == "SubjectOffering" and subject_offering_id:
+            target_id = subject_offering_id
+        elif target_type == "Exam" and academic_ctx.get("examId"):
+            target_id = academic_ctx.get("examId")
+
         logger.info(
-            "ComplaintModule [submit]: userId=%s targetType=%s subjectOfferingId=%s",
-            user_id, target_type, subject_offering_id,
+            "ComplaintModule [submit]: targetType=%s targetId=%s",
+            target_type, target_id,
         )
 
         # ── Validation — fail fast with helpful message ───────────────────────
         missing: list[str] = []
-        if not user_id:
-            missing.append("userId")
-        if not subject_offering_id:
-            missing.append("subjectOfferingId")
         if not complaint_message:
             missing.append("message")
 
@@ -123,16 +128,16 @@ class ComplaintModule:
             )
 
         payload: Dict[str, Any] = {
-            "userId":            user_id,
+            "title":             f"{target_type} Complaint",
             "targetType":        target_type,
-            "subjectOfferingId": subject_offering_id,
+            "targetId":          target_id,
             "message":           complaint_message,
         }
 
         # ── Call backend ──────────────────────────────────────────────────────
         try:
             result = await self.backend_client.post(
-                route="/api/ai-tools/create-complaint",
+                route="/api/Complaints",
                 payload=payload,
                 auth_header=agent_input.auth_header,
             )
@@ -196,8 +201,9 @@ class ComplaintModule:
 
         # ── Fetch complaints from backend ─────────────────────────────────────
         try:
+            route = "/api/Complaints/all" if role.lower() in ["admin", "superadmin"] else "/api/Complaints/my-reports"
             complaints_data = await self.backend_client.fetch(
-                route="/api/ai-tools/get-complaints",
+                route=route,
                 auth_header=agent_input.auth_header,
             )
             logger.info(

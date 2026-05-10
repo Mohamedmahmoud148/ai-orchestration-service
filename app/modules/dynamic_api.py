@@ -102,7 +102,8 @@ Keywords: "حضور", "غياب", "attendance", "absent", "present"
 
 RULE 10 — COMPLAINTS:
 Keywords: "شكوى", "شكاوى", "complaint", "complaints"
-→ GET /api/ai-tools/get-complaints  (admin/doctor view)
+→ GET /api/Complaints/all  (admin view)
+→ GET /api/Complaints/my-reports (doctor view)
 
 RULE 11 — MATERIALS:
 Keywords: "ملف", "ملفات", "مادة تعليمية", "material", "materials", "lecture"

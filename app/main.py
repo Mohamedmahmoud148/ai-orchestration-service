@@ -19,7 +19,7 @@ from app.agents.executor import PlanExecutor
 from app.agents.model_router import ModelRouter
 from app.agents.planner import PlannerAgent
 
-from app.api.routes import chat, health
+from app.api.routes import chat, health, complaint_intelligence
 from app.core.config import settings
 from app.core.logging import logger, setup_logging
 from app.services.backend_client import tool_execution_client
@@ -154,6 +154,7 @@ app.add_middleware(
 
 app.include_router(health.router)
 app.include_router(chat.router, prefix="/api")
+app.include_router(complaint_intelligence.router, prefix="/api")
 
 
 @app.get("/")
