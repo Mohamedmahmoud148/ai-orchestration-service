@@ -36,6 +36,7 @@ Permission matrix
   academic_advice         ✅       ✅      ✅
   material_explanation    ✅       ✅      ✅
   generate_exam           ❌       ✅      ✅
+  backend_api_query       ✅       ✅      ✅
 """
 from __future__ import annotations
 
@@ -59,6 +60,7 @@ _STUDENT_ALLOWED: FrozenSet[str] = frozenset({
     "cv_analysis",
     "academic_advice",
     "material_explanation",
+    "backend_api_query",  # Students can query their own data (JWT enforces data-level RBAC)
 })
 
 _DOCTOR_ALLOWED: FrozenSet[str] = frozenset({
@@ -71,6 +73,7 @@ _DOCTOR_ALLOWED: FrozenSet[str] = frozenset({
     "academic_advice",
     "file_extraction",
     "cv_analysis",
+    "backend_api_query",  # Doctors can query their profile/subjects/students (JWT enforces data-level RBAC)
 })
 
 # admin → _ALL (checked dynamically — no explicit list needed)
@@ -95,6 +98,7 @@ _INTENT_LABELS: dict[str, str] = {
     "academic_advice":      "Academic Advice",
     "material_explanation": "Material Explanation",
     "generate_exam":        "Exam Generation",
+    "backend_api_query":    "Data Query",
 }
 
 
