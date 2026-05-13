@@ -126,6 +126,50 @@ Keywords: "سنة دراسية", "فصل", "فصول", "academic year", "semeste
 → GET /api/academic-years
 → GET /api/Semesters/by-academic-year/{{academicYearId}}
 
+RULE 14 — SCHEDULE / TIMETABLE (⚠️ HIGH PRIORITY for time-based questions):
+Keywords: "جدول", "جدولي", "الجدول", "بكرا", "النهارده", "امتى عندي", "schedule", "timetable",
+          "محاضرة امتى", "سكشن امتى", "ليه إيه", "عندي إيه"
+
+⚠️ CRITICAL: Always determine the TIME REFERENCE first:
+  - "النهارده" / "today" → use the *today* endpoint
+  - "بكرا" / "tomorrow" → use the *day* endpoint with day = (today+1) mod 7
+  - "الأسبوع" / "الجدول الكامل" → use the full *week* endpoint
+
+FOR STUDENT ROLE:
+  ✅ Today's schedule:
+     GET /api/Schedule/batch/{{batchId}}/today
+     (Use batchId from academic_context — NO ID needed from user)
+
+  ✅ Tomorrow's schedule (compute dayNumber: Sun=0 … Sat=6, tomorrow = (today+1)%7):
+     GET /api/Schedule/batch/{{batchId}}/day/{{tomorrowDayNumber}}
+     Example: if today is Monday (1), tomorrow is Tuesday → day=2
+     → GET /api/Schedule/batch/{{batchId}}/day/2
+
+  ✅ Full weekly schedule:
+     GET /api/Schedule/batch/{{batchId}}
+
+  ✅ Specific subject schedule:
+     GET /api/Schedule/offering/{{subjectOfferingId}}
+     (Use first enrolledOfferingIds entry from academic_context if known)
+
+FOR DOCTOR ROLE:
+  ✅ Today's classes I'm teaching:
+     GET /api/Schedule/my-today
+     (JWT-aware — NO ID needed)
+
+  ✅ Full weekly schedule:
+     GET /api/Schedule/my-schedule
+     (JWT-aware — NO ID needed)
+
+  ✅ Tomorrow's classes (use batchId if known, else my-schedule and filter client-side):
+     GET /api/Schedule/my-schedule
+     (Return full schedule; the summary LLM will filter tomorrow's entries)
+
+⛔ NEVER use /api/Schedule/batch/... for a doctor — use /api/Schedule/my-today or /api/Schedule/my-schedule
+⛔ NEVER omit batchId for student — it is ALWAYS in academic_context
+
+
+
 ════════════════════════════════════════════════════
 PARAMETERS RULES:
 ════════════════════════════════════════════════════
