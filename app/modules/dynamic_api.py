@@ -41,15 +41,22 @@ Keywords: "انا مين", "أنا مين", "مين انا", "من انا", "ا�
     Example: if profileId = "01KMXFBTWXYQK3T3K1A9NAVQ2J"
     → endpoint = "/api/Admins/01KMXFBTWXYQK3T3K1A9NAVQ2J"
 
-- doctor/professor role → GET /api/Doctors/{{ACTUAL_USER_ID}}
-    Use "userId" from academic_context.
-    Example: if userId = "01KQEQE95QGZHBEY2E6RAR2TP6"
-    → endpoint = "/api/Doctors/01KQEQE95QGZHBEY2E6RAR2TP6"
+- doctor/professor role →
+    ✅ PREFERRED: GET /api/SubjectOfferings/my-offerings
+    (JWT-aware endpoint — uses the Bearer token to identify the doctor. NO ID needed in the URL.)
+    OR if the user asks specifically about their profile/details:
+    GET /api/Doctors/{{userCode}}
+    Use "userCode" or "doctorCode" from academic_context if available.
+    ⛔ NEVER use "userId" as a path param for /api/Doctors — that endpoint expects a short code.
 
-- student role → GET /api/Students/{{ACTUAL_USER_ID}}
-    Use "userId" from academic_context.
-    Example: if userId = "01KP70519E5ZC0KK94RJY6WH67"
-    → endpoint = "/api/Students/01KP70519E5ZC0KK94RJY6WH67"
+- student role →
+    ✅ PREFERRED (for GPA/profile): GET /api/Gpa/my-gpa
+    ✅ PREFERRED (for subjects): GET /api/SubjectOfferings/my-offerings
+    (Both are JWT-aware — NO ID needed in URL.)
+    OR if the user asks specifically about their profile:
+    GET /api/Students/{{userCode}}
+    Use "userCode" or "studentCode" from academic_context if available.
+    ⛔ NEVER use "userId" as a path param for /api/Students — that expects a university code.
 
 ⛔ NEVER return a literal placeholder like "{{userId}}" or "{{profileId}}" in the endpoint string.
 ⛔ ALWAYS substitute the real ID value from academic_context into the URL.
@@ -234,17 +241,30 @@ class DynamicApiModule:
                 response="أنا واجهت مشكلة في تحديد البيانات المطلوبة. لو سمحت وضح طلبك تاني."
             )
 
-        # ── Placeholder Sanitization Layer (Failsafe) ─────────────────────
+        # ── Placeholder Sanitization Layer (Failsafe) ────────────────────
         # If the LLM returned a literal {placeholder} in the endpoint URL,
         # substitute it automatically from academic_context.
         if "{" in endpoint:
             raw_ac = ctx.get("academic_context", {})
+            # Resolve the best available "code" for doctor/student endpoints:
+            # frontend should send userCode / doctorCode / studentCode in academic_context
+            user_code = (
+                raw_ac.get("userCode")
+                or raw_ac.get("doctorCode")
+                or raw_ac.get("studentCode")
+                or raw_ac.get("universityId")
+                or raw_ac.get("staffId")
+                or ""
+            )
             substitutions = {
-                "{userId}":    raw_ac.get("userId", ""),
+                "{userId}":     raw_ac.get("userId", ""),
                 "{profileId}": raw_ac.get("profileId", ""),
                 "{studentId}": raw_ac.get("studentId", raw_ac.get("userId", "")),
+                "{doctorId}":  raw_ac.get("doctorId", raw_ac.get("profileId", "")),
                 "{id}":        raw_ac.get("profileId") or raw_ac.get("userId", ""),
-                "{code}":      raw_ac.get("profileId") or raw_ac.get("userId", ""),
+                # code-based substitutions (short string like DOC-AI-001 / STU20260001)
+                "{code}":      user_code or raw_ac.get("profileId") or raw_ac.get("userId", ""),
+                "{userCode}":  user_code,
             }
             original_endpoint = endpoint
             for placeholder, value in substitutions.items():
@@ -327,6 +347,27 @@ class DynamicApiModule:
                 status="failed",
                 response=f"مش قادر أوصل للبيانات دلوقتي، حاول تاني (Backend Error on {method} {endpoint})",
                 data={"exec_route": endpoint, "error": str(exc)}
+            )
+
+        # ── Auth error guard ────────────────────────────────────────────
+        # backend_client returns {"_error": "unauthorized"} on 401/403.
+        # Happens when doctor/student tries to access an admin-only endpoint.
+        if isinstance(raw_data, dict) and raw_data.get("_error") == "unauthorized":
+            duration = round(time.time() - start_time, 4)
+            logger.warning(
+                "[AI] Intent: %s\n[AI] Endpoint: %s\n[AI] Status: Auth Denied (401/403)\n[AI] Duration: %s",
+                intent, endpoint, duration
+            )
+            return AgentOutput(
+                status="failed",
+                response=(
+                    "⚠️ مفيش صلاحية للوصول لهذه البيانات بنظام التصريح الحالي.\n"
+                    "جرب تسأل عن بياناتك الشخصية مثل:\n"
+                    "• 'موادي الترم دة' للمواد الدراسية\n"
+                    "• 'الجي بيتاعي' للدرجات\n"
+                    "• 'جدولي' للجدول الدراسي\n"
+                    "\n(This data is restricted to administrators.)"
+                )
             )
 
         if not raw_data:

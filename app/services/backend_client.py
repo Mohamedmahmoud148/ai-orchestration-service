@@ -182,10 +182,17 @@ class ToolExecutionClient:
 
         except httpx.HTTPStatusError as exc:
             body = exc.response.text[:300]
+            status_code = exc.response.status_code
             logger.error(
                 "BackendClient [POST] HTTP %s from %s: %s",
-                exc.response.status_code, url, body,
+                status_code, url, body,
             )
+            if status_code in (401, 403):
+                logger.warning(
+                    "BackendClient [POST] Auth error (%s) on %s — returning soft error dict",
+                    status_code, url,
+                )
+                return {"_error": "unauthorized", "status_code": status_code}
             raise HTTPException(
                 status_code=502,
                 detail=_BACKEND_UNAVAILABLE_MSG,
@@ -261,10 +268,20 @@ class ToolExecutionClient:
 
         except httpx.HTTPStatusError as exc:
             body = exc.response.text[:300]
+            status_code = exc.response.status_code
             logger.error(
                 "BackendClient [GET] HTTP %s from %s: %s",
-                exc.response.status_code, url, body,
+                status_code, url, body,
             )
+            # ── Soft auth errors: return structured dict instead of crashing ──
+            # This lets the calling module show a friendly message rather than
+            # a generic 502 backend error, which was confusing for doctor/student.
+            if status_code in (401, 403):
+                logger.warning(
+                    "BackendClient [GET] Auth error (%s) on %s — returning soft error dict",
+                    status_code, url,
+                )
+                return {"_error": "unauthorized", "status_code": status_code}
             raise HTTPException(
                 status_code=502,
                 detail=_BACKEND_UNAVAILABLE_MSG,

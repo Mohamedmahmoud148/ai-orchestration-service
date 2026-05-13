@@ -318,7 +318,22 @@ class MaterialExplanationModule:
                 ),
             )
 
-        # ── 3. Extract usable text (including fileUrl fallback) ───────────────
+        # ── 3. Handle soft auth error ─────────────────────────────────────────
+        if isinstance(materials_data, dict) and materials_data.get("_error") == "unauthorized":
+            logger.warning(
+                "MaterialExplanationModule: 401/403 from backend for offering=%s", offering_id
+            )
+            return AgentOutput(
+                status="failed",
+                response=(
+                    "⚠️ مفيش صلاحية للوصول لمواد المادة دي. "
+                    "تأكد إنك مسجل في المادة دي.\n\n"
+                    "Unable to access materials for this subject. "
+                    "Ensure you are enrolled in this offering."
+                ),
+            )
+
+        # ── 4. Extract usable text (including fileUrl fallback) ───────────────
         material_text = await _collect_material_text(
             materials_data, agent_input.auth_header
         )
