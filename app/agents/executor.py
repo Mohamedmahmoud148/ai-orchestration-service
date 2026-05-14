@@ -314,10 +314,11 @@ class PlanExecutor:
         """
         ctx    = input_context.context or {}
         role   = ctx.get("role", "student")
-        # Resolve intent: explicit module_name takes priority, else read from plan
-        intent = module_name if module_name in _MODULE_CLASS_MAP else (
-            getattr(plan, "intent", None) or "general_chat"
-        )
+        # RBAC always uses the semantic plan intent, never the internal module name.
+        # module_name is an implementation detail (e.g. "dynamic_api_module") and is
+        # NOT registered in rbac.py — using it as the permission key silently blocks
+        # all students from backend_api_query even though it is permitted for them.
+        intent = getattr(plan, "intent", None) or "general_chat"
 
         # 0. RBAC gate ─────────────────────────────────────────────────────────
         from app.core.rbac import is_allowed, get_denial_message, log_blocked_attempt

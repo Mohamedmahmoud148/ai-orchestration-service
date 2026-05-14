@@ -134,9 +134,16 @@ def _detect_backend_query(message: str) -> bool:
         "اسمي", "اسم", "انا مين", "أنا مين",
         "من انا", "من أنا", "مين انا", "مين أنا",
         "معلوماتي", "بياناتي", "بروفايلي", "حسابي",
-        "profile", "who am i", "my name", "my info",
         # University/system data
         "بيانات", "جامعه", "جامعة", "السيستم",
+        # ── English data / identity queries ────────────────────────────────
+        "how many", "list of", "show me", "what are",
+        "my courses", "my subjects", "my schedule", "my grades",
+        "my gpa", "my results", "my profile", "my info",
+        "who am i", "my name", "my account", "my details",
+        "profile", "courses i have", "subjects i have",
+        "how much", "total", "count of", "number of",
+        "students list", "doctors list", "departments",
     }
     for kw in _ARABIC_DATA_KEYWORDS:
         if kw in msg:
@@ -504,31 +511,46 @@ class PlannerAgent(BaseAgent):
         self, history_turns: list[dict], user_content: str
     ) -> dict | None:
         """
-        Send the planning request to OpenAI via structured messages[].
+        Send the planning request via structured messages[] that include history.
 
         Message order:
           [system]  _SYSTEM_PROMPT
-          [prior turns from history…]
+          [prior turns from history…]   ← gives the planner conversation context
           [user]    role + message + academic_context note
 
-        Falls back to gpt-3.5-turbo if gpt-4o-mini returns nothing.
+        Using generate_with_messages + json_object response_format instead of
+        generate_structured_json so that history_turns are forwarded to the model
+        (generate_structured_json is a single-turn helper with no history support).
         """
+        messages = [
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            *history_turns,
+            {"role": "user", "content": user_content},
+        ]
         try:
-            logger.debug("PlannerAgent: requesting JSON from openai/gpt-4o-mini")
-            parsed = await self.model_router.generate_structured_json(
-                prompt=user_content,
-                system_instruction=_SYSTEM_PROMPT,
+            logger.debug(
+                "PlannerAgent: requesting JSON from openai/gpt-4o-mini "
+                "(history_turns=%d)", len(history_turns),
+            )
+            raw = await self.model_router.generate_with_messages(
+                messages=messages,
                 model_id="openai/gpt-4o-mini",
+                response_format={"type": "json_object"},
             )
 
-            if not parsed:
+            if not raw:
                 logger.warning(
                     "PlannerAgent: openai/gpt-4o-mini returned empty — fallback chain will handle it"
                 )
+                return None
 
+            parsed = json.loads(raw) if isinstance(raw, str) else raw
             logger.debug("PlannerAgent: raw plan = %s", parsed)
             return parsed
 
+        except json.JSONDecodeError as exc:
+            logger.error("PlannerAgent: JSON parse failed — %s", exc)
+            return None
         except Exception as exc:
             logger.error("PlannerAgent: model call failed — %s", exc, exc_info=True)
             return None

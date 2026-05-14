@@ -118,16 +118,46 @@ def is_allowed(intent: str, role: str) -> bool:
 
 def get_denial_message(intent: str, role: str) -> str:
     """
-    Return the standardised denial message for a blocked intent.
+    Return a bilingual, user-friendly denial message.
 
-    Per security spec: never reveals internal role logic or system structure.
-    Format: "You are not authorized to perform this action. Please contact your administrator."
+    Never reveals internal role logic, intent names, or system structure.
+    Students and doctors receive actionable guidance, not technical jargon.
     """
-    label      = _INTENT_LABELS.get(intent, intent.replace("_", " ").title())
-    role_label = role.capitalize()
+    if role == "student":
+        if intent == "complaint_summary":
+            return (
+                "عرض ملخصات الشكاوى متاح للدكاترة والإدارة فقط.\n"
+                "Complaint summaries are available to doctors and admins only."
+            )
+        if intent == "generate_exam":
+            return (
+                "إنشاء الامتحانات متاح للدكاترة فقط.\n"
+                "Exam generation is available to doctors only."
+            )
+        if intent == "file_processing":
+            return (
+                "معالجة الملفات المجمّعة متاحة للإدارة فقط.\n"
+                "Bulk file processing is available to admins only."
+            )
+    if role == "doctor":
+        if intent == "complaint_submit":
+            return (
+                "تقديم الشكاوى متاح للطلاب فقط. إذا كان لديك مشكلة يُرجى التواصل مع الإدارة.\n"
+                "Complaint submission is available to students only. "
+                "Please contact the administration if you have an issue."
+            )
+        if intent == "file_processing":
+            return (
+                "معالجة الملفات المجمّعة متاحة للإدارة فقط.\n"
+                "Bulk file processing is available to admins only."
+            )
+
+    # Generic fallback — no technical details exposed
     return (
-        f"You are not authorized to perform '{label}' with your current role ({role_label}). "
-        "Please contact your administrator if you believe this is a mistake."
+        "عذراً، ليس لديك صلاحية للقيام بهذا الإجراء. "
+        "تواصل مع الإدارة إذا كنت تعتقد أن هذا خطأ.\n"
+        "Sorry, you don't have permission to perform this action. "
+        "Please contact the administration if you believe this is a mistake."
     )
 
 

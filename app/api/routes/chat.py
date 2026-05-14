@@ -19,7 +19,7 @@ from fastapi.security import HTTPBearer
 from app.agents.agent import Agent
 from app.agents.execution_context import ExecutionContext
 from app.agents.pipeline import _PipelineStageError
-from app.core.logging import logger
+from app.core.logging import logger, get_correlation_id, set_request_user_id
 from app.models.chat import ChatRequest, ChatResponse
 
 # ─────────────────────────────────────────────────────────────
@@ -58,7 +58,28 @@ async def chat_endpoint(
         )
         raise HTTPException(status_code=401, detail="Authorization header missing.")
 
-    logger.info("Chat request received. user_id=%s role=%s", request.user_id, request.role)
+    # Propagate user_id into the logging context for this request
+    set_request_user_id(request.user_id or "-")
+
+    # ── Rate limiting ─────────────────────────────────────────
+    rate_limiter = getattr(fastapi_request.app.state, "rate_limiter", None)
+    if rate_limiter is not None:
+        allowed = await rate_limiter.is_allowed(request.user_id or "")
+        if not allowed:
+            logger.warning(
+                "Rate limit exceeded. user_id=%s correlation=%s",
+                request.user_id,
+                get_correlation_id(),
+            )
+            raise HTTPException(
+                status_code=429,
+                detail="Too many requests. Please wait a moment before trying again.",
+            )
+
+    logger.info(
+        "Chat request received. user_id=%s role=%s correlation=%s",
+        request.user_id, request.role, get_correlation_id(),
+    )
 
     # ── Build context ─────────────────────────────────────────
     context = ExecutionContext(

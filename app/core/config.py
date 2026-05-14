@@ -22,6 +22,12 @@ class Settings(BaseSettings):
     # Redis Config
     REDIS_URL: str = ""
 
+    # Rate limiting — requests per minute per user_id (0 = disabled)
+    RATE_LIMIT_RPM: int = 30
+
+    # Request timeout — seconds to wait for Agent.run() before 504
+    REQUEST_TIMEOUT_SECONDS: int = 60
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

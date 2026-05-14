@@ -22,7 +22,10 @@ from app.agents.planner import PlannerAgent
 from app.api.routes import chat, health, complaint_intelligence
 from app.core.config import settings
 from app.core.logging import logger, setup_logging
+from app.core.middleware import CorrelationIDMiddleware, RequestTimingMiddleware
+from app.core.rate_limiter import RateLimiter
 from app.services.backend_client import tool_execution_client
+from app.services.memory_store import MemoryStore
 from app.services.model_service import local_model_service
 from app.services.tool_registry import tool_registry
 
@@ -85,9 +88,14 @@ async def lifespan(app: FastAPI):
         local_model_service=local_model_service,
     )
 
+    memory_store = MemoryStore()
+    app.state.memory_store = memory_store
+    app.state.rate_limiter = RateLimiter()
+
     planner = PlannerAgent(
         model_router=model_router,
-        ranker=None
+        memory=memory_store,
+        ranker=None,
     )
 
     executor = PlanExecutor(
@@ -144,6 +152,8 @@ def _build_cors_origins() -> list[str]:
     return origins
 
 
+# Middleware is applied in reverse order (last added = outermost).
+# Desired order: Correlation → Timing → CORS → route handler.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_build_cors_origins(),
@@ -151,6 +161,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(RequestTimingMiddleware)
+app.add_middleware(CorrelationIDMiddleware)
 
 app.include_router(health.router)
 app.include_router(chat.router, prefix="/api")
