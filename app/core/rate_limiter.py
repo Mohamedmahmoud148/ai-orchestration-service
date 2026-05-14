@@ -100,7 +100,7 @@ class RateLimiter:
         if url and url.startswith(("redis://", "rediss://", "unix://")):
             pool = redis.ConnectionPool.from_url(url, decode_responses=True)
             self._redis = redis.Redis(connection_pool=pool)
-            self._script: redis.client.Script | None = None   # loaded lazily
+            self._script = None   # Lua script SHA, registered lazily
             self._use_redis = True
             logger.info("RateLimiter: Redis backend configured (%s)", url)
         else:
