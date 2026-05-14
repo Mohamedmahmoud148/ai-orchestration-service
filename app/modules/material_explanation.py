@@ -144,26 +144,35 @@ async def _collect_material_text(
     """
     Collect usable text from the backend material response.
 
-    Backend may return:
-      - A list of material objects: [{content, title, fileUrl, ...}, ...]
-      - A single dict with content/fileUrl
-      - Raw bytes (PDF)
+    Backend returns a paginated envelope:
+      { "items": [{id, fileName, contentType, fileSize, uploadedAt, fileUrl}, ...],
+        "totalCount": N, "pageNumber": 1, "pageSize": 10 }
 
-    Attempts in order:
-      1. content / text / description field (fastest)
-      2. fileUrl fetch (fallback — only if content is empty)
+    For each item:
+      1. Try content / text / description field (fastest — usually empty for file-only uploads)
+      2. Try fileUrl → download → extract text from PDF / read plain text
+
+    Raw bytes and bare-list shapes are kept for backward compatibility.
     """
     if not materials_data:
         return ""
 
     texts: List[str] = []
 
+    # ── Unwrap paginated envelope ─────────────────────────────────────────
+    # The .NET backend returns { "items": [...], "totalCount": N }.
+    # Unwrap so the rest of the function always operates on a plain list.
+    if isinstance(materials_data, dict) and "items" in materials_data:
+        materials_data = materials_data["items"] or []
+
     # ── List of material objects ──────────────────────────────────────────
     if isinstance(materials_data, list):
         for item in materials_data[:5]:  # cap to avoid token overflow
             if not isinstance(item, dict):
                 continue
-            title = item.get("title") or item.get("name") or ""
+            title = item.get("fileName") or item.get("title") or item.get("name") or ""
+
+            # 1. Inline text field (usually absent for pure file uploads)
             text = (
                 item.get("content")
                 or item.get("text")
@@ -174,9 +183,10 @@ async def _collect_material_text(
                 texts.append(f"[{title}]\n{text}" if title else text)
                 continue
 
-            # Fallback: fetch fileUrl if content field is empty
+            # 2. Download via fileUrl (public CDN URL built by backend)
             file_url = (
                 item.get("fileUrl")
+                or item.get("signedUrl")
                 or item.get("url")
                 or item.get("filePath")
                 or ""
@@ -184,28 +194,33 @@ async def _collect_material_text(
             if file_url:
                 fetched = await _fetch_file_url_text(file_url, auth_header)
                 if fetched:
-                    texts.append(f"[{title}]\n{fetched}" if title else fetched)
+                    label = f"[{title}]\n{fetched}" if title else fetched
+                    texts.append(label)
+                    logger.info(
+                        "MaterialExplanationModule: extracted %d chars from '%s'",
+                        len(fetched), title,
+                    )
 
-    # ── Single dict ────────────────────────────────────────────────────────
+    # ── Single dict (non-paginated legacy shape) ──────────────────────────
     elif isinstance(materials_data, dict):
         if "_raw_bytes" in materials_data:
             pdf_text = _extract_pdf_text(materials_data["_raw_bytes"])
             if pdf_text:
                 texts.append(pdf_text)
         else:
-            text = (
-                materials_data.get("content")
-                or materials_data.get("text")
-                or ""
-            )
+            text = materials_data.get("content") or materials_data.get("text") or ""
             if text:
                 texts.append(str(text))
-            elif materials_data.get("fileUrl"):
-                fetched = await _fetch_file_url_text(
-                    materials_data["fileUrl"], auth_header
+            else:
+                file_url = (
+                    materials_data.get("fileUrl")
+                    or materials_data.get("signedUrl")
+                    or ""
                 )
-                if fetched:
-                    texts.append(fetched)
+                if file_url:
+                    fetched = await _fetch_file_url_text(file_url, auth_header)
+                    if fetched:
+                        texts.append(fetched)
 
     # ── Raw bytes (PDF returned directly) ─────────────────────────────────
     elif isinstance(materials_data, bytes):

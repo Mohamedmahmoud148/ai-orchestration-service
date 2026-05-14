@@ -13,7 +13,6 @@ Flow:
 from __future__ import annotations
 
 import io
-from typing import Any, Optional
 
 from app.agents.schemas import AgentInput, AgentOutput
 from app.core.logging import logger
@@ -74,16 +73,47 @@ class SummarizationModule:
                 auth_header=agent_input.auth_header,
             )
 
-            if "error" in result:
+            if isinstance(result, dict) and "error" in result:
                 logger.warning("SummarizationModule: backend error — %s", result["error"])
-            elif "_raw_bytes" in result:
+            elif isinstance(result, dict) and "_raw_bytes" in result:
                 material_text = _extract_text_from_bytes(
                     result["_raw_bytes"], result.get("content_type", "")
                 )
-            elif "content" in result:
-                material_text = str(result["content"])
-            elif "text" in result:
-                material_text = str(result["text"])
+            else:
+                # Unwrap paginated envelope: { "items": [...], "totalCount": N }
+                items = result.get("items", []) if isinstance(result, dict) else (result if isinstance(result, list) else [])
+
+                collected: list[str] = []
+                for item in items[:5]:
+                    if not isinstance(item, dict):
+                        continue
+                    # 1. Inline text field
+                    text = item.get("content") or item.get("text") or item.get("description") or ""
+                    if text:
+                        collected.append(str(text))
+                        continue
+                    # 2. Download via fileUrl (public CDN URL built by .NET backend)
+                    file_url = item.get("fileUrl") or item.get("signedUrl") or item.get("url") or ""
+                    if file_url:
+                        try:
+                            import httpx
+                            async with httpx.AsyncClient() as client:
+                                resp = await client.get(file_url, timeout=20.0)
+                                resp.raise_for_status()
+                            fetched = _extract_text_from_bytes(
+                                resp.content, resp.headers.get("content-type", "")
+                            )
+                            if fetched:
+                                title = item.get("fileName") or ""
+                                collected.append(f"[{title}]\n{fetched}" if title else fetched)
+                                logger.info(
+                                    "SummarizationModule: extracted %d chars from '%s'",
+                                    len(fetched), title,
+                                )
+                        except Exception as exc:
+                            logger.warning("SummarizationModule: fileUrl fetch failed — %s", exc)
+
+                material_text = "\n\n".join(collected)[:5_000]
 
         # Fall back to the user's message when no material was fetched
         if not material_text:
