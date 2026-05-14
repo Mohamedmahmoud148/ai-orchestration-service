@@ -111,7 +111,7 @@ class RateLimiter:
                 "(not suitable for multi-worker deployments)."
             )
 
-    async def _load_script(self) -> redis.client.Script:
+    async def _load_script(self):
         """Register the Lua script once and cache the SHA."""
         if self._script is None:
             self._script = self._redis.register_script(_SLIDING_WINDOW_LUA)
