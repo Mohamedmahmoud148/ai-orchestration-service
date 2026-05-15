@@ -16,212 +16,381 @@ from app.core.api_discovery import get_allowed_endpoints_schema, validate_endpoi
 from app.core.logging import logger
 
 _ROUTING_PROMPT = """\
-You are a STRICT API Router for a university management system.
-Map the user's natural language request to the SINGLE best backend API endpoint.
+You are an EXPERT Academic API Router for a large university management system serving thousands of students, doctors, and admins.
 
+Your job: map the user's natural language request to the SINGLE best backend API endpoint.
+You must reason about academic entity relationships, analytics queries, and role-based data access.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+UNIVERSITY ACADEMIC HIERARCHY (memorize this):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+University
+  └── College  (e.g. "كلية الحاسبات", "Faculty of Engineering")
+        └── Department  (e.g. "قسم الذكاء الاصطناعي", "CS Department")
+              └── Batch  (a year group, e.g. "2024", "الفرقة الرابعة", "fourth year")
+                    ├── Subject  (the course catalogue entry, e.g. "Data Structures")
+                    │     └── SubjectOffering  (a specific semester instance of a subject)
+                    │           ├── Doctor  (who teaches this offering)
+                    │           └── Enrollment  (which students are enrolled)
+                    └── Group  (e.g. "group A", "group 1")
+
+KEY RELATIONSHIPS TO UNDERSTAND:
+- A Doctor teaches SubjectOfferings (not Subjects directly)
+- A Student is enrolled in SubjectOfferings via Enrollments
+- SubjectOffering links: Subject + Doctor + Semester + Group + Batch
+- To find "doctors of batch X" → get SubjectOfferings for that batch, extract doctors
+- To find "students in subject Y" → get Enrollments by offering
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 AVAILABLE ENDPOINTS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 {schema}
 
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+REQUEST CONTEXT:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 USER REQUEST: "{message}"
 USER ROLE: {role}
-USER ACADEMIC CONTEXT (use these IDs to fill path/query params):
+ACADEMIC CONTEXT (IDs and profile info already known — inject into params):
 {academic_context}
 
-════════════════════════════════════════════════════
-SCENARIO MAPPING RULES (apply in ORDER, stop at first match)
-════════════════════════════════════════════════════
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 1 — CONTEXT-FIRST CHECK (always do this first):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+If the answer is ALREADY in the academic_context, return: {{"endpoint": "", "method": "GET", "params": {{}}}}
 
-RULE 0 — IDENTITY / PROFILE (HIGHEST PRIORITY):
-Keywords: "انا مين", "أنا مين", "مين انا", "من انا", "اسمي ايه", "اسمي إيه",
-          "معلوماتي", "بياناتي", "بروفايلي", "who am i", "my name", "my profile"
+Already-known fields (no API call needed):
+  collegeName, departmentName, batchName, studentName, gpa
 
-⚠️ CRITICAL ID RULES FOR IDENTITY QUERIES:
-- admin role   → GET /api/Admins/{{ACTUAL_PROFILE_ID}}
-    Use "profileId" from academic_context (NOT "userId").
-    Example: if profileId = "01KMXFBTWXYQK3T3K1A9NAVQ2J"
-    → endpoint = "/api/Admins/01KMXFBTWXYQK3T3K1A9NAVQ2J"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 2 — INTENT CLASSIFICATION:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Classify the request into one of these categories, then apply the matching rule:
 
-- doctor/professor role →
-    ✅ PREFERRED: GET /api/SubjectOfferings/my-offerings
-    (JWT-aware endpoint — uses the Bearer token to identify the doctor. NO ID needed in the URL.)
-    OR if the user asks specifically about their profile/details:
-    GET /api/Doctors/{{userCode}}
-    Use "userCode" or "doctorCode" from academic_context if available.
-    ⛔ NEVER use "userId" as a path param for /api/Doctors — that endpoint expects a short code.
+  A. IDENTITY / MY PROFILE
+  B. DOCTOR QUERIES (list, filter, by department/batch/subject/college)
+  C. STUDENT QUERIES (list, filter, by batch/department/offering)
+  D. SUBJECT / COURSE QUERIES
+  E. SUBJECT OFFERING QUERIES (by semester, by batch, by doctor)
+  F. ENROLLMENT / REGISTRATION QUERIES
+  G. ANALYTICS / COUNTS / AGGREGATIONS
+  H. GRADES / GPA
+  I. SCHEDULE / TIMETABLE
+  J. EXAMS
+  K. ATTENDANCE
+  L. COMPLAINTS
+  M. MATERIALS / FILES
+  N. STRUCTURE (colleges, departments, batches, groups)
+  O. DASHBOARD / SYSTEM STATS
+  P. ACADEMIC YEARS / SEMESTERS
 
-- student role →
-    ✅ PREFERRED (for GPA/profile): GET /api/Gpa/my-gpa
-    ✅ PREFERRED (for subjects): GET /api/SubjectOfferings/my-offerings
-    (Both are JWT-aware — NO ID needed in URL.)
-    OR if the user asks specifically about their profile:
-    GET /api/Students/{{userCode}}
-    Use "userCode" or "studentCode" from academic_context if available.
-    ⛔ NEVER use "userId" as a path param for /api/Students — that expects a university code.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ROUTING RULES BY CATEGORY:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-⛔ NEVER return a literal placeholder like "{{userId}}" or "{{profileId}}" in the endpoint string.
-⛔ ALWAYS substitute the real ID value from academic_context into the URL.
+── A. IDENTITY / MY PROFILE ──────────────────────
+Keywords: "انا مين", "اسمي", "معلوماتي", "بياناتي", "بروفايلي", "who am i", "my profile", "my name"
+- student → GET /api/Gpa/my-gpa  (best single-call profile summary)
+- doctor  → GET /api/SubjectOfferings/my-offerings
+- admin   → GET /api/Admins/{{profileId}}  ← use profileId from context, NOT userId
 
-RULE 1 — DASHBOARD / STATISTICS:
-Keywords: "dashboard", "احصائيات", "إحصائيات", "نظرة عامة", "overview", "stats"
-→ GET /api/Dashboard
+⛔ /api/Students/{{code}} and /api/Doctors/{{code}} use SHORT CODE strings, NEVER ULIDs.
 
-RULE 2 — COLLEGES:
-Keywords: "كلية", "كليات", "الكليات", "colleges", "faculties"
-→ GET /api/Colleges
+── B. DOCTOR QUERIES ─────────────────────────────
+Keywords: "دكتور", "دكاترة", "الدكاترة", "أستاذ", "مدرس", "بيدرس",
+          "doctor", "doctors", "faculty", "professor", "who teaches"
 
-RULE 3 — DEPARTMENTS:
-Keywords: "قسم", "أقسام", "اقسام", "departments"
-→ GET /api/Departments  (or /api/Departments/by-college/{{id}} if collegeId known)
+B1. ALL DOCTORS (no filter):
+  → GET /api/Doctors  params: page=1, size=20
 
-RULE 4 — STUDENTS:
-Keywords: "طالب", "طلاب", "الطلاب", "students", "كام طالب", "عدد الطلاب"
-→ GET /api/Students  (list)
-→ GET /api/Students/{{code}} (individual, if userId/code known)
-→ GET /api/Students/by-batch/{{batchId}} (if batchId known)
+B2. DOCTORS BY DEPARTMENT (most common analytics query):
+  Arabic triggers: "دكاترة قسم X", "دكاترة في قسم", "كام دكتور في قسم"
+  English triggers: "doctors in department", "how many doctors in CS"
+  → GET /api/Doctors/filter  params: departmentId={{departmentId}}, page=1, size=50
+  ⚡ If user mentions department name but you don't have departmentId → use search instead
 
-RULE 5 — DOCTORS / FACULTY:
-Keywords: "دكتور", "دكاترة", "الدكاترة", "أستاذ", "doctor", "doctors", "faculty"
-→ GET /api/Doctors  (list)
-→ GET /api/Doctors/{{code}} (individual)
-→ GET /api/Doctors/{{code}}/subjects (their subjects)
+B3. DOCTORS BY COLLEGE:
+  Arabic triggers: "دكاترة كلية X", "دكاترة في الكلية", "دكاترة كلية حاسبات"
+  → GET /api/Doctors/filter  params: collegeId={{collegeId}}, page=1, size=50
 
-RULE 6 — SUBJECTS / COURSES:
-Keywords: "مادة", "مواد", "المواد", "موادي", "مواد الترم", "subject", "subjects", "course", "courses", "my courses", "my subjects"
+B4. DOCTORS OF A BATCH / YEAR (relational query):
+  Arabic triggers: "دكاترة دفعة X", "دكاترة الفرقة X", "مين بيدرس لدفعة", "دكاترة السنة X"
+  English triggers: "doctors for batch X", "who teaches fourth year", "doctors of year 2024"
+  → GET /api/SubjectOfferings/by-semester/{{semesterId}}  (if semesterId known)
+    OR GET /api/Subjects/by-batch/{{batchId}}  (then summarizer extracts doctors)
+  ⚡ batchId is often in academic_context — always check first
 
-⚠️ ROLE-SPECIFIC PRIORITY (apply strictly):
-- student role → ALWAYS use: GET /api/SubjectOfferings/my-enrollments
-  (JWT-aware — NO ID needed. Returns all subjects the student is enrolled in.)
-  ⛔ NEVER use /api/SubjectOfferings/my-offerings for students — that is Doctor only, returns 403.
-  ⛔ NEVER use /api/Subjects/by-batch/... for students — that is admin/doctor only.
-- doctor role  → GET /api/SubjectOfferings/my-offerings  (their assigned subjects)
-- admin role   → GET /api/Subjects/by-batch/{{batchId}}  (if batchId known)
-               → GET /api/Subjects/{{code}}  (individual subject lookup)
+B5. DOCTOR WHO TEACHES A SPECIFIC SUBJECT:
+  Arabic triggers: "مين بيدرس مادة X", "دكتور مادة X", "مدرس Data Structures"
+  English triggers: "who teaches X", "doctor of subject X"
+  → GET /api/Subjects/search  params: name={{subject_name}}
+    (then follow with SubjectOffering to get doctor — summarizer handles the chain)
 
-RULE 7 — GRADES / RESULTS:
-Keywords: "درجة", "درجات", "نتيجة", "نتايج", "grades", "results", "marks"
-→ GET /api/Gpa/my-gpa  (student's own GPA)
-→ GET /api/Gpa/student/{{studentId}}  (specific student GPA)
-→ GET /api/Exams/{{id}}/results  (exam results, if examId known)
+B6. DOCTOR WORKLOAD / ANALYTICS:
+  Arabic triggers: "أكتر دكتور عنده مواد", "توزيع المواد على الدكاترة", "doctor workload"
+  → GET /api/Doctors/filter  params: page=1, size=100
+  (summarizer will analyze and rank by subject count)
 
-RULE 8 — EXAMS:
-Keywords: "امتحان", "امتحانات", "اختبار", "exam", "exams", "quiz"
-→ GET /api/Exams/my-exams  (student's own exams)
-→ GET /api/Exams/by-offering/{{offeringId}}  (exams for a subject)
-→ GET /api/Exams/my-enrolled-exams  (enrolled exams)
+B7. SPECIFIC DOCTOR PROFILE:
+  → GET /api/Doctors/search  params: q={{doctor_name_or_code}}
+  OR GET /api/Doctors/{{code}}  ← only if you have the short code string
 
-RULE 9 — ATTENDANCE:
-Keywords: "حضور", "غياب", "attendance", "absent", "present"
-→ GET /api/Attendance/student/{{studentId}}/report
+── C. STUDENT QUERIES ────────────────────────────
+Keywords: "طالب", "طلاب", "الطلاب", "طلبة", "المسجلين", "student", "students", "enrolled"
 
-RULE 10 — COMPLAINTS:
-Keywords: "شكوى", "شكاوى", "complaint", "complaints"
-→ GET /api/Complaints/all  (admin view)
-→ GET /api/Complaints/my-reports (doctor view)
+C1. ALL STUDENTS (admin):
+  → GET /api/Students  params: page=1, size=20
 
-RULE 11 — MATERIALS:
-Keywords: "ملف", "ملفات", "مادة تعليمية", "material", "materials", "lecture"
-→ GET /api/Materials/by-offering/{{offeringId}}
+C2. STUDENTS BY BATCH:
+  Arabic triggers: "طلبة دفعة X", "طلاب الفرقة X", "طلاب سنة X", "كام طالب في الفرقة"
+  English triggers: "students in batch X", "how many students in year 4"
+  → GET /api/Students/filter  params: batchId={{batchId}}, page=1, size=50
+  OR GET /api/Students/by-batch/{{batchId}}
 
-RULE 12 — BATCHES / GROUPS:
-Keywords: "دفعة", "دفعات", "batch", "batches", "group", "groups"
-→ GET /api/Batches
-→ GET /api/Groups
+C3. STUDENTS BY DEPARTMENT:
+  Arabic triggers: "طلاب قسم X", "طلبة قسم CS", "كام طالب في قسم"
+  → GET /api/Students/filter  params: departmentId={{departmentId}}, page=1, size=50
 
-RULE 13 — ACADEMIC YEARS / SEMESTERS:
-Keywords: "سنة دراسية", "فصل", "فصول", "academic year", "semester"
-→ GET /api/academic-years
-→ GET /api/Semesters/by-academic-year/{{academicYearId}}
+C4. STUDENTS BY COLLEGE:
+  → GET /api/Students/filter  params: collegeId={{collegeId}}, page=1, size=50
 
-RULE 14 — SCHEDULE / TIMETABLE (⚠️ HIGH PRIORITY for time-based questions):
-Keywords: "جدول", "جدولي", "الجدول", "بكرا", "النهارده", "امتى عندي", "schedule", "timetable",
-          "محاضرة امتى", "سكشن امتى", "ليه إيه", "عندي إيه"
+C5. STUDENTS IN A SPECIFIC SUBJECT OFFERING (enrollment query):
+  Arabic triggers: "مين الطلبة المسجلين في مادة X", "طلاب مادة X"
+  English triggers: "students enrolled in subject X", "who is in this course"
+  → GET /api/Enrollments/by-offering/{{offeringId}}
+  ⚡ If offeringId unknown, first get SubjectOffering then use its ID
 
-⚠️ CRITICAL: Always determine the TIME REFERENCE first:
-  - "النهارده" / "today" → use the *today* endpoint
-  - "بكرا" / "tomorrow" → use the *day* endpoint with day = (today+1) mod 7
-  - "الأسبوع" / "الجدول الكامل" → use the full *week* endpoint
+C6. MY ENROLLMENTS (student asking about own subjects):
+  → GET /api/SubjectOfferings/my-enrollments  ← JWT-aware, student role only
+  ⛔ NEVER use /api/SubjectOfferings/my-offerings for students — that is Doctor only (403)
 
-FOR STUDENT ROLE:
-  ✅ Today's schedule:
-     GET /api/Schedule/batch/{{batchId}}/today
-     (Use batchId from academic_context — NO ID needed from user)
+C7. STUDENT SEARCH:
+  → GET /api/Students/search  params: q={{name_or_code}}
 
-  ✅ Tomorrow's schedule (compute dayNumber: Sun=0 … Sat=6, tomorrow = (today+1)%7):
-     GET /api/Schedule/batch/{{batchId}}/day/{{tomorrowDayNumber}}
-     Example: if today is Monday (1), tomorrow is Tuesday → day=2
-     → GET /api/Schedule/batch/{{batchId}}/day/2
+C8. AT-RISK / STRUGGLING STUDENTS:
+  Arabic triggers: "الطلبة المتعثرين", "طلاب راسبين", "at-risk students"
+  → GET /api/Students/filter  params: page=1, size=50
+  (summarizer will identify at-risk from GPA / grade data)
 
-  ✅ Full weekly schedule:
-     GET /api/Schedule/batch/{{batchId}}
+── D. SUBJECT / COURSE QUERIES ────────────────────
+Keywords: "مادة", "مواد", "subject", "course", "curriculum"
 
-  ✅ Specific subject schedule:
-     GET /api/Schedule/offering/{{subjectOfferingId}}
-     (Use first enrolledOfferingIds entry from academic_context if known)
+D1. MY SUBJECTS — student:
+  → GET /api/SubjectOfferings/my-enrollments
 
-FOR DOCTOR ROLE:
-  ✅ Today's classes I'm teaching:
-     GET /api/Schedule/my-today
-     (JWT-aware — NO ID needed)
+D2. MY SUBJECTS — doctor:
+  → GET /api/SubjectOfferings/my-offerings
 
-  ✅ Full weekly schedule:
-     GET /api/Schedule/my-schedule
-     (JWT-aware — NO ID needed)
+D3. SUBJECTS BY BATCH (admin/doctor):
+  → GET /api/Subjects/by-batch/{{batchId}}
 
-  ✅ Tomorrow's classes (use batchId if known, else my-schedule and filter client-side):
-     GET /api/Schedule/my-schedule
-     (Return full schedule; the summary LLM will filter tomorrow's entries)
+D4. SUBJECTS BY DEPARTMENT:
+  → GET /api/Subjects/by-department/{{departmentId}}
 
-⛔ NEVER use /api/Schedule/batch/... for a doctor — use /api/Schedule/my-today or /api/Schedule/my-schedule
-⛔ NEVER omit batchId for student — it is ALWAYS in academic_context
+D5. SUBJECTS BY COLLEGE:
+  → GET /api/Subjects/by-college/{{collegeId}}
 
+D6. SUBJECT SEARCH:
+  → GET /api/Subjects/search  params: name={{query}}
 
+── E. SUBJECT OFFERING QUERIES ────────────────────
+Keywords: "offering", "سكشن", "شعبة", "الفصل الدراسي", "by semester"
 
-════════════════════════════════════════════════════
-PARAMETERS RULES:
-════════════════════════════════════════════════════
-- ALWAYS inject IDs from academic_context into path parameters.
-- NEVER return empty string "" for any parameter — omit it entirely if unknown.
-- For list endpoints, inject: page=1, size=20 as defaults.
-- For path params: replace {{placeholder}} directly in the URL string (not in "params").
+E1. BY SEMESTER:
+  → GET /api/SubjectOfferings/by-semester/{{semesterId}}
 
+E2. DOCTOR'S OWN OFFERINGS:
+  → GET /api/SubjectOfferings/my-offerings  (doctor JWT-aware)
+
+E3. STUDENT'S ENROLLED OFFERINGS:
+  → GET /api/SubjectOfferings/my-enrollments  (student JWT-aware)
+
+── F. ENROLLMENT / REGISTRATION ACTIONS ───────────
+Keywords: "تسجيل", "مسجل", "enrolled", "enrollment", "registration",
+          "سجلني", "سجل لي", "سجلني في المواد", "register me", "enroll me",
+          "سجلني في كل المواد", "سجلني في المواد المتاحة", "register for courses"
+
+F1. MY ENROLLMENTS (student — read only):
+  → GET /api/Enrollments/my-enrollments
+
+F2. WHO IS ENROLLED IN AN OFFERING (admin/doctor):
+  → GET /api/Enrollments/by-offering/{{offeringId}}
+
+F3. AUTO-ENROLL STUDENT IN ALL AVAILABLE SUBJECTS (student action):
+  ⚡ USE THIS when the student wants to REGISTER / ENROLL themselves in courses.
+  Arabic triggers (any of these): "سجلني في المواد", "سجلني في المواد المتاحة",
+    "سجل لي كل المواد", "عايز أسجل مواد", "سجلني", "اعملي تسجيل",
+    "ابدأ التسجيل", "سجل في كل المواد", "سجلني في الترم ده"
+  English triggers: "register me for courses", "enroll me in subjects",
+    "sign me up for courses", "auto enroll", "register for available courses"
+  → POST /api/Enrollments/auto-enroll  (NO body needed — JWT identifies the student)
+  method: "POST"
+  params: {{}}
+  ⛔ STUDENT ROLE ONLY. Never call this for doctor or admin.
+  ✅ Backend automatically finds all open offerings for the student's batch/dept/group.
+
+── G. ANALYTICS / COUNTS / AGGREGATIONS ───────────
+Keywords: "كام", "عدد", "كم", "توزيع", "أكتر", "تحليل", "إحصاء",
+          "how many", "count", "total", "distribution", "most", "analytics",
+          "أكتر مادة عليها تسجيل", "doctor workload", "student distribution"
+
+G1. SYSTEM-WIDE SUMMARY (best for "how many X in total" + top departments + top subjects):
+  → GET /api/Analytics/summary
+
+G2. STUDENT COUNT BY BATCH (all batches ranked):
+  → GET /api/Analytics/student-count-by-batch
+
+G3. STUDENT COUNT BY DEPARTMENT (all departments ranked):
+  → GET /api/Analytics/student-count-by-department
+
+G4. DOCTOR WORKLOAD (offering count + student count per doctor):
+  Arabic triggers: "workload الدكاترة", "توزيع المواد على الدكاترة", "أكتر دكتور عنده مواد"
+  → GET /api/Analytics/doctor-workload  params: departmentId={{departmentId}} (optional)
+
+G5. MOST ENROLLED SUBJECTS (top N):
+  → GET /api/Analytics/top-enrolled-subjects  params: top=10
+
+G6. OFFERING ENROLLMENT STATS (fill-rate, avg grade per offering):
+  Arabic triggers: "احصائيات المواد المفتوحة", "نسبة امتلاء الشعب"
+  → GET /api/Analytics/offering-enrollment-stats  params: departmentId=, batchId=, page=1, size=20
+
+G7. FULL STRUCTURE / HIERARCHY:
+  → GET /api/Colleges/full-structure  (complete university hierarchy with counts)
+
+G8. SIMPLE DASHBOARD TOTALS:
+  → GET /api/Dashboard
+
+── H. GRADES / GPA ────────────────────────────────
+Keywords: "درجة", "درجات", "GPA", "نتيجة", "grade", "result", "transcript"
+- student own GPA  → GET /api/Gpa/my-gpa
+- specific student → GET /api/Gpa/student/{{studentId}}
+
+── I. SCHEDULE / TIMETABLE ─────────────────────────
+Keywords: "جدول", "محاضرة", "موعد", "schedule", "timetable", "today", "النهارده", "بكرا"
+
+FOR STUDENT:
+  Today → GET /api/Schedule/batch/{{batchId}}/today
+  Tomorrow (dayNum=(today+1)%7, Sun=0) → GET /api/Schedule/batch/{{batchId}}/day/{{dayNum}}
+  Full week → GET /api/Schedule/batch/{{batchId}}
+
+FOR DOCTOR:
+  Today → GET /api/Schedule/my-today
+  Full week → GET /api/Schedule/my-schedule
+  ⛔ NEVER use batch schedule for doctor role
+
+── J. EXAMS ────────────────────────────────────────
+Keywords: "امتحان", "اختبار", "exam", "quiz"
+  My exams → GET /api/Exams/my-exams
+  By offering → GET /api/Exams/by-offering/{{offeringId}}
+  Enrolled exams → GET /api/Exams/my-enrolled-exams
+
+── K. ATTENDANCE ───────────────────────────────────
+Keywords: "حضور", "غياب", "attendance", "absent"
+  → GET /api/Attendance/student/{{studentId}}/report
+
+── L. COMPLAINTS ───────────────────────────────────
+Keywords: "شكوى", "شكاوى", "complaint"
+  Admin view → GET /api/Complaints/all
+  Doctor view → GET /api/Complaints/my-reports
+  My complaints (student) → GET /api/Complaints/my-complaints
+
+── M. MATERIALS / LECTURE FILES ────────────────────
+Keywords: "ملف", "محاضرة", "material", "lecture file", "مادة تعليمية"
+  → GET /api/Materials/by-offering/{{offeringId}}
+
+── N. STRUCTURE (COLLEGES / DEPARTMENTS / BATCHES) ─
+  All colleges → GET /api/Colleges
+  Full structure → GET /api/Colleges/full-structure
+  Departments → GET /api/Departments
+  Departments by college → GET /api/Departments/by-college/{{collegeId}}
+  Batches → GET /api/Batches
+  Batches by department → GET /api/Batches/by-department/{{departmentId}}
+  Groups → GET /api/Groups
+  Groups by batch → GET /api/Groups/by-batch/{{batchId}}
+
+  ⚠️ /api/Colleges/by-code/{{code}} expects SHORT STRING CODE (e.g. "ENG"), NEVER a ULID.
+
+── O. DASHBOARD / SYSTEM STATS ─────────────────────
+Keywords: "dashboard", "احصائيات", "overview", "stats", "نظرة عامة"
+  → GET /api/Dashboard
+
+── P. ACADEMIC YEARS / SEMESTERS ───────────────────
+Keywords: "سنة دراسية", "فصل دراسي", "academic year", "semester"
+  → GET /api/AcademicYears
+  By academic year → GET /api/Semesters/by-academic-year/{{academicYearId}}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PARAMETER INJECTION RULES:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Always inject known IDs from academic_context into params (batchId, departmentId, collegeId, etc.)
+- For filter endpoints: put IDs in "params" (query string), NOT path.
+- For path params: substitute the real value directly into the URL string.
+- NEVER leave a {{placeholder}} in the final endpoint string.
+- NEVER use a ULID where a short code is expected.
+- For paginated lists: always include page=1 and size=20 (or size=50 for analytics).
+- Omit params that have no value — never send empty strings.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 FAIL SAFE:
-- If NO rule matches perfectly, return "endpoint": "".
-- Never guess or hallucinate an endpoint.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- If no rule matches, return: {{"endpoint": "", "method": "GET", "params": {{}}}}
+- NEVER hallucinate an endpoint not in the AVAILABLE ENDPOINTS list above.
+- NEVER include markdown, explanations, or extra text — JSON only.
 
-OUTPUT FORMAT (return ONLY this JSON, no markdown):
+OUTPUT FORMAT (return ONLY this JSON):
 {{
-    "endpoint": "<chosen_endpoint_path_with_real_ids>",
+    "endpoint": "<full path with real substituted values>",
     "method": "GET",
-    "params": {{"<query_key>": "<value>"}}
+    "params": {{"key": "value"}}
 }}
 """
 
 _SUMMARY_PROMPT = """\
-You are a helpful university AI assistant. An API call was just made to fetch data to answer the user's request.
+You are an intelligent university AI assistant. Backend data was just fetched to answer the user's question.
+Your job: transform raw JSON data into a natural, insightful, bilingual response.
 
 USER MESSAGE: "{user_message}"
 API ENDPOINT CALLED: {method} {endpoint}
 USER ROLE: {role}
-USER ACADEMIC CONTEXT: {academic_context}
+ACADEMIC CONTEXT: {academic_context}
 
-RAW JSON FROM BACKEND:
+RAW BACKEND DATA:
 ```json
 {raw_response}
 ```
 
-INSTRUCTIONS:
-1. Summarize the answer completely naturally and concisely. DO NOT expose raw technical details or JSON.
-2. If the user is a student, speak naturally using their name if present in the context. If they are an admin, be precise and direct.
-3. If the JSON implies an error or empty data, inform the user clearly that the data could not be found.
-4. Smart Suggestions: Provide 3 short (max 6 words), actionable follow-up questions the user might ask based on this data.
-5. Explainability Layer: Provide a short, human-friendly 1-liner explaining where you got this data (e.g. "جبتلك البيانات دي من نظام الطلبة في السيستم"). Avoid raw endpoints.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RESPONSE QUALITY RULES:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-OUTPUT FORMAT:
-Return a JSON object strictly following this structure:
+1. COUNTS & ANALYTICS — always state numbers explicitly:
+   ❌ BAD:  "There are some students."
+   ✅ GOOD: "يوجد حالياً 42 طالب مسجلين في قسم علوم الحاسب."
+
+2. LISTS — summarize meaningfully, don't dump raw data:
+   ❌ BAD:  JSON array of objects
+   ✅ GOOD: "الدكاترة في قسم AI هم: د. أحمد علي (Data Structures)، د. سارة محمد (ML)، ..."
+
+3. DOCTOR LISTS — always include: name + department + subject(s) they teach
+4. STUDENT LISTS — include: name + batch + enrollment status
+5. EMPTY DATA — say clearly: "لم يتم العثور على بيانات لهذا الطلب." (then suggest alternatives)
+6. ANALYTICS — rank, compare, and highlight insights:
+   e.g. "أكثر دكتور لديه مواد هو د. X بـ 5 مواد دراسية."
+7. MATCH THE USER'S LANGUAGE — Arabic question → Arabic answer, English → English.
+8. USE THE STUDENT'S NAME if available in academic_context.
+9. NEVER INVENT DATA — if a number isn't in the JSON, don't state it.
+10. PAGINATION AWARENESS — if totalCount > size, mention "يوجد المزيد — اطلب الصفحة التالية."
+
+PROVIDE:
+- narrative: the full natural answer (2-5 sentences, warm and clear)
+- suggestions: 3 short follow-up questions the user might ask next
+- explain_text: one sentence explaining the data source (user-friendly, no technical details)
+
+OUTPUT FORMAT (return ONLY this JSON, no markdown):
 {{
-    "narrative": "<your natural spoken response>",
-    "suggestions": ["<suggestion 1>", "<suggestion 2>", "<suggestion 3>"],
-    "explain_text": "<explain layer message>"
+    "narrative": "<full natural answer in the user's language>",
+    "suggestions": ["<follow-up 1>", "<follow-up 2>", "<follow-up 3>"],
+    "explain_text": "<data source explanation>"
 }}
 """
 
@@ -230,267 +399,408 @@ class DynamicApiModule:
     """
     Executes a dynamic endpoint selection against the allowed Swagger API,
     fetches the data, and summarizes it.
+
+    Retry architecture (up to MAX_ATTEMPTS):
+      Each failed attempt records WHY it failed and passes that history back
+      to the LLM so it picks a DIFFERENT endpoint on the next try.
+      Failure reasons: 403 (wrong role endpoint), 404 (not found),
+      empty result (try broader endpoint), validation blocked (not in allowlist).
     """
+
+    MAX_ATTEMPTS = 3
 
     def __init__(self, model_router: Any, backend_client: Any) -> None:
         self.model_router = model_router
         self.backend_client = backend_client
 
+    # ── Public entry-point ────────────────────────────────────────────────
+
     async def run(
         self, input_context: AgentInput, plan: ExecutionPlan
     ) -> AgentOutput:
-        
         import time
         start_time = time.time()
-        
-        ctx          = input_context.context or {}
-        role         = ctx.get("role", "student")
+
+        ctx            = input_context.context or {}
+        role           = ctx.get("role", "student")
         selected_model = ctx.get("selected_model", "openai/gpt-4o-mini")
-        explain_mode = ctx.get("explain", False)
-        debug_mode   = ctx.get("debug", False)
-        academic_ctx = json.dumps(ctx.get("academic_context", {}), ensure_ascii=False)
-        message      = input_context.message
-        intent       = plan.intent or "backend_api_query"
+        explain_mode   = ctx.get("explain", False)
+        debug_mode     = ctx.get("debug", False)
+        raw_ac         = ctx.get("academic_context", {})
+        academic_ctx   = json.dumps(raw_ac, ensure_ascii=False)
+        message        = input_context.message
+        intent         = plan.intent or "backend_api_query"
+        auth_header    = ctx.get("auth_header")
+        schema_text    = get_allowed_endpoints_schema()
 
-        # 1. Fetch available endpoints
-        schema_text = get_allowed_endpoints_schema()
-        
-        # 2. Ask model to route it
-        routing_messages = [
-            {
-                "role": "system",
-                "content": _ROUTING_PROMPT
-                    .replace("{schema}", schema_text)
-                    .replace("{message}", message)
-                    .replace("{role}", role)
-                    .replace("{academic_context}", academic_ctx)
-            }
-        ]
-        
-        # We use a JSON Mode request for routing
-        logger.info("DynamicApiModule: Requesting API routing choice from model...")
-        routing_response = await self.model_router.generate_with_messages(
-            messages=routing_messages,
-            model_id=selected_model,
-            response_format={"type": "json_object"}
-        )
-        
-        try:
-            route_data = json.loads(routing_response)
-            endpoint = route_data.get("endpoint", "")
-            method   = route_data.get("method", "").upper()
-            params   = route_data.get("params", {})
-        except Exception as exc:
-            duration = round(time.time() - start_time, 4)
-            logger.error(
-                "[AI] Intent: %s\n[AI] Endpoint: LLM Fallback\n[AI] Method: N/A\n[AI] Status: Failed - LLM Parsing Error\n[AI] Duration: %s",
-                intent, duration
-            )
-            return AgentOutput(
-                status="failed",
-                response="أنا واجهت مشكلة في تحديد البيانات المطلوبة. لو سمحت وضح طلبك تاني."
-            )
+        failed_attempts: list[dict] = []   # [{endpoint, method, reason}]
+        last_raw_data  = None
+        winning_endpoint = ""
+        winning_method   = ""
 
-        # ── Placeholder Sanitization Layer (Failsafe) ────────────────────
-        # If the LLM returned a literal {placeholder} in the endpoint URL,
-        # substitute it automatically from academic_context.
-        if "{" in endpoint:
-            raw_ac = ctx.get("academic_context", {})
-            # Resolve the best available "code" for doctor/student endpoints:
-            # frontend should send userCode / doctorCode / studentCode in academic_context
-            user_code = (
-                raw_ac.get("userCode")
-                or raw_ac.get("doctorCode")
-                or raw_ac.get("studentCode")
-                or raw_ac.get("universityId")
-                or raw_ac.get("staffId")
-                or ""
-            )
-            substitutions = {
-                "{userId}":     raw_ac.get("userId", ""),
-                "{profileId}": raw_ac.get("profileId", ""),
-                "{studentId}": raw_ac.get("studentId", raw_ac.get("userId", "")),
-                "{doctorId}":  raw_ac.get("doctorId", raw_ac.get("profileId", "")),
-                "{id}":        raw_ac.get("profileId") or raw_ac.get("userId", ""),
-                # code-based substitutions (short string like DOC-AI-001 / STU20260001)
-                "{code}":      user_code or raw_ac.get("profileId") or raw_ac.get("userId", ""),
-                "{userCode}":  user_code,
-            }
-            original_endpoint = endpoint
-            for placeholder, value in substitutions.items():
-                if value:
-                    endpoint = endpoint.replace(placeholder, value)
-            if "{" in endpoint:
-                logger.warning(
-                    "DynamicApiModule: Unresolved placeholders in endpoint after substitution: %s",
-                    endpoint
-                )
-                return AgentOutput(
-                    status="failed",
-                    response="مش قادر أحدد الـ ID المطلوب. ممكن تبعت الـ profileId أو userId في الـ context؟"
-                )
+        # ── Retry loop ────────────────────────────────────────────────────
+        for attempt in range(1, self.MAX_ATTEMPTS + 1):
             logger.info(
-                "DynamicApiModule: Placeholder substituted: %s → %s",
-                original_endpoint, endpoint
+                "DynamicApiModule: attempt %d/%d user=%s message=%.60r",
+                attempt, self.MAX_ATTEMPTS, input_context.user_id, message,
             )
 
-            
-        if not endpoint:
-            duration = round(time.time() - start_time, 4)
-            logger.warning(
-                "[AI] Intent: %s\n[AI] Endpoint: N/A\n[AI] Method: N/A\n[AI] Status: Blocked - Empty Route\n[AI] Duration: %s",
-                intent, duration
+            # 1. Route ─────────────────────────────────────────────────────
+            route = await self._pick_endpoint(
+                message, role, academic_ctx, schema_text,
+                selected_model, failed_attempts,
             )
-            return AgentOutput(
-                status="failed",
-                response="مش قادر ألاقي جزء النظام الخاص بطلبك دة. ممكن توضح أكتر إنت محتاج إيه؟"
-            )
+            if route is None:
+                # LLM JSON parse failed — stop retrying
+                break
 
-        # 3. Execution Validation Layer (CRITICAL CHECK)
-        if not validate_endpoint(method, endpoint):
-            duration = round(time.time() - start_time, 4)
-            logger.warning(
-                "[AI] Intent: %s\n[AI] Endpoint: %s\n[AI] Method: %s\n[AI] Status: Blocked - Not Allowed\n[AI] Duration: %s",
-                intent, endpoint, method, duration
-            )
-            return AgentOutput(
-                status="forbidden",
-                response="Requested operation is not allowed or endpoint does not exist."
-            )
+            endpoint = route.get("endpoint", "")
+            method   = route.get("method", "GET").upper()
+            params   = route.get("params", {})
 
-        # 4. Clean and Safely Process Parameters
-        clean_params = {}
-        for k, v in params.items():
-            # Skip empty parameters to prevent .NET 400 Bad Request
-            if v == "" or v is None:
+            # 2. Context-only shortcut ─────────────────────────────────────
+            if not endpoint:
+                logger.info("DynamicApiModule: context-only answer (attempt %d)", attempt)
+                return await self._answer_from_context(message, academic_ctx, selected_model)
+
+            # 3. Placeholder substitution ──────────────────────────────────
+            endpoint, sub_error = self._substitute_placeholders(endpoint, raw_ac)
+            if sub_error:
+                failed_attempts.append({
+                    "endpoint": endpoint, "method": method,
+                    "reason": f"unresolved placeholder in URL: {sub_error}",
+                })
+                logger.warning("DynamicApiModule: placeholder error on attempt %d: %s", attempt, sub_error)
                 continue
-            clean_params[k] = v
 
-        # Default Pagination Injection: If it's a GET request and missing pagination, safely inject
-        if method == "GET":
-            if "page" not in clean_params:
-                clean_params["page"] = 1
-            if "size" not in clean_params:
-                clean_params["size"] = 10
+            # 4. Allowlist validation ───────────────────────────────────────
+            if not validate_endpoint(method, endpoint):
+                failed_attempts.append({
+                    "endpoint": endpoint, "method": method,
+                    "reason": "endpoint not in allowed list — pick a different one",
+                })
+                logger.warning("DynamicApiModule: blocked endpoint on attempt %d: %s %s", attempt, method, endpoint)
+                continue
 
-        # 5. Execute Backend Request
-        auth_header = ctx.get("auth_header")
-        logger.info("DynamicApiModule: Executing %s %s with params %s", method, endpoint, clean_params)
-        
-        try:
+            # 5. Clean params + pagination defaults ────────────────────────
+            clean_params = {k: v for k, v in params.items() if v not in ("", None)}
             if method == "GET":
-                raw_data = await self.backend_client.fetch(
-                    route=endpoint, auth_header=auth_header, params=clean_params
-                )
-            else:
-                # Safe POSTs
-                raw_data = await self.backend_client.post(
-                    route=endpoint, payload=clean_params, auth_header=auth_header
-                )
-        except Exception as exc:
-            duration = round(time.time() - start_time, 4)
-            logger.error(
-                "[AI] Intent: %s\n[AI] Endpoint: %s\n[AI] Method: %s\n[AI] Status: Failed - Backend Error (%s)\n[AI] Duration: %s",
-                intent, endpoint, method, str(exc), duration
-            )
-            return AgentOutput(
-                status="failed",
-                response=f"مش قادر أوصل للبيانات دلوقتي، حاول تاني (Backend Error on {method} {endpoint})",
-                data={"exec_route": endpoint, "error": str(exc)}
-            )
+                clean_params.setdefault("page", 1)
+                clean_params.setdefault("size", 10)
 
-        # ── Auth error guard ────────────────────────────────────────────
-        # backend_client returns {"_error": "unauthorized"} on 401/403.
-        # Happens when doctor/student tries to access an admin-only endpoint.
-        if isinstance(raw_data, dict) and raw_data.get("_error") == "unauthorized":
-            duration = round(time.time() - start_time, 4)
-            logger.warning(
-                "[AI] Intent: %s\n[AI] Endpoint: %s\n[AI] Status: Auth Denied (401/403)\n[AI] Duration: %s",
-                intent, endpoint, duration
-            )
-            return AgentOutput(
-                status="failed",
-                response=(
-                    "⚠️ مفيش صلاحية للوصول لهذه البيانات بنظام التصريح الحالي.\n"
-                    "جرب تسأل عن بياناتك الشخصية مثل:\n"
-                    "• 'موادي الترم دة' للمواد الدراسية\n"
-                    "• 'الجي بيتاعي' للدرجات\n"
-                    "• 'جدولي' للجدول الدراسي\n"
-                    "\n(This data is restricted to administrators.)"
-                )
-            )
+            # 6. Execute backend call ──────────────────────────────────────
+            logger.info("DynamicApiModule: executing %s %s params=%s", method, endpoint, clean_params)
+            try:
+                if method == "GET":
+                    raw_data = await self.backend_client.fetch(
+                        route=endpoint, auth_header=auth_header, params=clean_params
+                    )
+                else:
+                    raw_data = await self.backend_client.post(
+                        route=endpoint, payload=clean_params, auth_header=auth_header
+                    )
+            except Exception as exc:
+                failed_attempts.append({
+                    "endpoint": endpoint, "method": method,
+                    "reason": f"network/backend exception: {exc}",
+                })
+                logger.error("DynamicApiModule: backend exception attempt %d: %s", attempt, exc)
+                continue
 
-        if not raw_data:
-            duration = round(time.time() - start_time, 4)
+            # 7. Evaluate response ─────────────────────────────────────────
+            if isinstance(raw_data, dict) and raw_data.get("_error") == "unauthorized":
+                failed_attempts.append({
+                    "endpoint": endpoint, "method": method,
+                    "reason": "403 Forbidden — this endpoint requires a higher role. Use a JWT-aware endpoint instead.",
+                })
+                logger.warning("DynamicApiModule: 403 on attempt %d: %s", attempt, endpoint)
+                continue
+
+            if isinstance(raw_data, dict) and raw_data.get("_error") == "not_found":
+                failed_attempts.append({
+                    "endpoint": endpoint, "method": method,
+                    "reason": "404 Not Found — resource does not exist, try a list endpoint instead.",
+                })
+                logger.warning("DynamicApiModule: 404 on attempt %d: %s", attempt, endpoint)
+                continue
+
+            if not raw_data:
+                # Empty result — record and try a broader endpoint
+                failed_attempts.append({
+                    "endpoint": endpoint, "method": method,
+                    "reason": "returned empty result — try a broader or different endpoint",
+                })
+                logger.info("DynamicApiModule: empty result attempt %d: %s", attempt, endpoint)
+                # Keep as candidate but try for a richer endpoint next
+                last_raw_data    = raw_data
+                winning_endpoint = endpoint
+                winning_method   = method
+                continue
+
+            # ✅ Got real data — break out of loop
+            last_raw_data    = raw_data
+            winning_endpoint = endpoint
+            winning_method   = method
             logger.info(
-                "[AI] Intent: %s\n[AI] Endpoint: %s\n[AI] Method: %s\n[AI] Status: Success - Empty Data\n[AI] Duration: %s",
-                intent, endpoint, method, duration
+                "DynamicApiModule: success on attempt %d — %s %s",
+                attempt, method, endpoint,
             )
+            break
+
+        # ── Post-loop handling ────────────────────────────────────────────
+        duration = round(time.time() - start_time, 4)
+
+        if last_raw_data is None:
+            # All attempts failed
+            logger.warning(
+                "[AI] Intent: %s | All %d attempts failed | Duration: %ss | Failures: %s",
+                intent, self.MAX_ATTEMPTS, duration, failed_attempts,
+            )
+            return await self._graceful_failure(
+                message, role, academic_ctx, selected_model, failed_attempts
+            )
+
+        if not last_raw_data:
+            # Only empty results found
+            logger.info("[AI] Intent: %s | Empty data after %d attempts", intent, self.MAX_ATTEMPTS)
             return AgentOutput(
                 status="success",
                 response="مش لاقي أي بيانات مطابقة لطلبك في السيستم حالياً.",
-                data={"exec_route": endpoint}
+                data={"endpoint_called": winning_endpoint},
             )
 
-        # 5. Summarize Data 
+        # ── Summarize successful data ──────────────────────────────────────
+        narrative, suggestions, explain_text = await self._summarize(
+            message, winning_method, winning_endpoint,
+            role, academic_ctx, last_raw_data, selected_model,
+        )
+
+        if explain_mode and explain_text:
+            narrative += f"\n\nℹ️ *{explain_text}*"
+
+        logger.info(
+            "[AI] Intent: %s | Endpoint: %s | Method: %s | Attempts: %d | Duration: %ss | Status: Success",
+            intent, winning_endpoint, winning_method, len(failed_attempts) + 1, duration,
+        )
+
+        metadata = {}
+        if debug_mode:
+            metadata = {
+                "endpoint": winning_endpoint,
+                "method": winning_method,
+                "attempts": len(failed_attempts) + 1,
+                "failed_attempts": failed_attempts,
+                "execution_time_seconds": duration,
+                "intent_detected": intent,
+            }
+
+        return AgentOutput(
+            status="success",
+            response=narrative,
+            data={
+                "endpoint_called": winning_endpoint,
+                "method_called": winning_method,
+                "raw_backend_data": last_raw_data,
+                "suggestions": suggestions,
+                "actions_available": suggestions,
+                "debug_info": metadata,
+            }
+        )
+
+    # ── Private helpers ───────────────────────────────────────────────────
+
+    async def _pick_endpoint(
+        self,
+        message: str,
+        role: str,
+        academic_ctx: str,
+        schema_text: str,
+        model_id: str,
+        failed_attempts: list[dict],
+    ) -> dict | None:
+        """Ask the LLM to pick the best endpoint, injecting failure history so it avoids repeats."""
+        failure_note = ""
+        if failed_attempts:
+            lines = "\n".join(
+                f"  - {a['method']} {a['endpoint']} → FAILED: {a['reason']}"
+                for a in failed_attempts
+            )
+            failure_note = (
+                f"\n\n⚠️ PREVIOUS ATTEMPTS THAT FAILED (do NOT repeat these):\n{lines}\n"
+                "Pick a DIFFERENT endpoint that avoids the same failure modes."
+            )
+
+        prompt_content = (
+            _ROUTING_PROMPT
+            .replace("{schema}", schema_text)
+            .replace("{message}", message)
+            .replace("{role}", role)
+            .replace("{academic_context}", academic_ctx)
+            + failure_note
+        )
+
+        try:
+            raw = await self.model_router.generate_with_messages(
+                messages=[{"role": "system", "content": prompt_content}],
+                model_id=model_id,
+                response_format={"type": "json_object"},
+            )
+            return json.loads(raw)
+        except Exception as exc:
+            logger.error("DynamicApiModule._pick_endpoint parse error: %s", exc)
+            return None
+
+    def _substitute_placeholders(self, endpoint: str, raw_ac: dict) -> tuple[str, str]:
+        """
+        Replace {placeholder} tokens in endpoint with real values from academic_context.
+        Returns (resolved_endpoint, error_string).  error_string is empty on success.
+        """
+        if "{" not in endpoint:
+            return endpoint, ""
+
+        user_code = (
+            raw_ac.get("userCode") or raw_ac.get("doctorCode")
+            or raw_ac.get("studentCode") or raw_ac.get("universityId")
+            or raw_ac.get("staffId") or ""
+        )
+        substitutions = {
+            "{userId}":    raw_ac.get("userId", ""),
+            "{profileId}": raw_ac.get("profileId", ""),
+            "{studentId}": raw_ac.get("studentId") or raw_ac.get("userId", ""),
+            "{doctorId}":  raw_ac.get("doctorId") or raw_ac.get("profileId", ""),
+            "{batchId}":   raw_ac.get("batchId", ""),
+            "{offeringId}": raw_ac.get("subjectOfferingId", ""),
+            "{id}":        raw_ac.get("profileId") or raw_ac.get("userId", ""),
+            "{code}":      user_code or raw_ac.get("profileId") or raw_ac.get("userId", ""),
+            "{userCode}":  user_code,
+        }
+
+        original = endpoint
+        for placeholder, value in substitutions.items():
+            if value:
+                endpoint = endpoint.replace(placeholder, value)
+
+        if "{" in endpoint:
+            return endpoint, f"could not resolve placeholders in '{original}'"
+        return endpoint, ""
+
+    async def _answer_from_context(
+        self, message: str, academic_ctx: str, model_id: str
+    ) -> AgentOutput:
+        """Answer directly from academic_context when no API call is needed."""
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a helpful university AI assistant. "
+                    "Answer the student's question using ONLY the academic context provided. "
+                    "Be warm, concise, and natural. Match the student's language (Arabic/English). "
+                    "NEVER invent data not present in the context."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"Student question: {message}\n\nAcademic context: {academic_ctx}",
+            },
+        ]
+        answer = await self.model_router.generate_with_messages(messages=messages, model_id=model_id)
+        return AgentOutput(
+            status="success",
+            response=answer or "معلوماتك موجودة في الـ profile بتاعك.",
+            data={"source": "academic_context"},
+        )
+
+    async def _summarize(
+        self,
+        message: str,
+        method: str,
+        endpoint: str,
+        role: str,
+        academic_ctx: str,
+        raw_data: Any,
+        model_id: str,
+    ) -> tuple[str, list, str]:
+        """Narrate raw backend data into natural language. Returns (narrative, suggestions, explain_text)."""
         summary_messages = [
             {
                 "role": "system",
-                "content": _SUMMARY_PROMPT
+                "content": (
+                    _SUMMARY_PROMPT
                     .replace("{user_message}", message)
                     .replace("{method}", method)
                     .replace("{endpoint}", endpoint)
                     .replace("{role}", role)
                     .replace("{academic_context}", academic_ctx)
                     .replace("{raw_response}", json.dumps(raw_data, ensure_ascii=False)[:3000])
+                ),
             }
         ]
-        
-        logger.info("DynamicApiModule: Summarizing backend data...")
-        summary_payload = await self.model_router.generate_with_messages(
-            messages=summary_messages,
-            model_id=selected_model,
-            response_format={"type": "json_object"}
-        )
-        
         try:
-            out_data = json.loads(summary_payload)
-            narrative = out_data.get("narrative", "تم جلب البيانات بنجاح.")
-            suggestions = out_data.get("suggestions", [])
-            explain_text = out_data.get("explain_text", "")
+            payload = await self.model_router.generate_with_messages(
+                messages=summary_messages,
+                model_id=model_id,
+                response_format={"type": "json_object"},
+            )
+            out = json.loads(payload)
+            return (
+                out.get("narrative", "تم جلب البيانات بنجاح."),
+                out.get("suggestions", []),
+                out.get("explain_text", ""),
+            )
         except Exception:
-            narrative = "تمت العملية بنجاح."
-            suggestions = []
-            explain_text = ""
-            
-        if explain_mode and explain_text:
-            narrative += f"\n\nℹ️ *{explain_text}*"
-            
-        duration = round(time.time() - start_time, 4)
-        logger.info(
-            "[AI] Intent: %s\n[AI] Endpoint: %s\n[AI] Method: %s\n[AI] Status: Success\n[AI] Duration: %ss",
-            intent, endpoint, method, duration
-        )
-        
-        # 8. Debug Mode support
-        metadata = {}
-        if debug_mode:
-            metadata = {
-                "endpoint": endpoint,
-                "method": method,
-                "execution_time_seconds": duration,
-                "intent_detected": intent
-            }
-        
-        return AgentOutput(
-            status="success",
-            response=narrative,
-            data={
-                "endpoint_called": endpoint,
-                "method_called": method,
-                "raw_backend_data": raw_data,
-                "suggestions": suggestions,
-                "actions_available": suggestions,
-                "debug_info": metadata
-            }
-        )
+            return "تمت العملية بنجاح.", [], ""
+
+    async def _graceful_failure(
+        self,
+        message: str,
+        role: str,
+        academic_ctx: str,
+        model_id: str,
+        failed_attempts: list[dict],
+    ) -> AgentOutput:
+        """
+        All attempts failed. Try to give a partial answer from academic_context,
+        otherwise return a helpful bilingual message.
+        """
+        # Last resort: answer from context if possible
+        context_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a university AI assistant. The backend API is temporarily unavailable. "
+                    "Try to answer the student's question using ONLY the academic_context provided. "
+                    "If the context doesn't have the answer, apologise briefly and suggest they try again. "
+                    "Be warm. Match the student's language (Arabic/English). Never invent data."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Student question: {message}\n\n"
+                    f"Academic context: {academic_ctx}\n\n"
+                    f"Note: The following API endpoints were tried but all failed:\n"
+                    + "\n".join(f"- {a['method']} {a['endpoint']}: {a['reason']}" for a in failed_attempts)
+                ),
+            },
+        ]
+        try:
+            fallback = await self.model_router.generate_with_messages(
+                messages=context_messages, model_id=model_id
+            )
+            return AgentOutput(
+                status="partial",
+                response=fallback or (
+                    "أنا آسف، في مشكلة مؤقتة في جلب البيانات. "
+                    "حاول تاني بعد شوية أو وضح طلبك بشكل تاني.\n"
+                    "(Temporary issue fetching data — please try again or rephrase your question.)"
+                ),
+                data={"failed_attempts": failed_attempts},
+            )
+        except Exception:
+            return AgentOutput(
+                status="failed",
+                response=(
+                    "أنا آسف، في مشكلة مؤقتة. حاول تاني بعد شوية.\n"
+                    "(Temporary issue — please try again.)"
+                ),
+            )

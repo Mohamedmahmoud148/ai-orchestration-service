@@ -119,33 +119,56 @@ def _detect_generate_exam(message: str) -> bool:
     return False
 
 def _detect_backend_query(message: str) -> bool:
-    """Detect if the user is asking a data query like counts, lists, or system stats."""
+    """Detect if the user is asking a data query like counts, lists, analytics, or system stats."""
     msg = message.strip().lower()
-    
-    _ARABIC_DATA_KEYWORDS = {
-        # Data/count queries
-        "كم عدد", "كام بدرس", "عدد الدكاترة", "نسبة", "احصائيات",
-        "مين هم", "قائمة", "عدد الطلاب", "اللي بيدرس",
-        # Entity names
+
+    _BACKEND_KEYWORDS = {
+        # ── Arabic: count / analytics ─────────────────────────────────────
+        "كم عدد", "كام بدرس", "كام طالب", "كام دكتور", "كام مادة",
+        "عدد الدكاترة", "عدد الطلاب", "عدد المواد", "عدد الاقسام",
+        "نسبة", "احصائيات", "إحصائيات", "احصاء", "إحصاء",
+        "تحليل", "تقرير", "ملخص الشكاوى", "ملخص النتائج",
+        "مين هم", "قائمة", "اللي بيدرس", "اللي مسجل",
+        "اعلى", "أعلى", "اقل", "أقل", "افضل", "أفضل",
+        # ── Arabic: filter / relationship queries ─────────────────────────
+        "دكاترة في", "طلاب في", "مواد في", "عرض في",
+        "في قسم", "في كلية", "في الفرقة", "في الدفعة",
+        "بيدرس في", "مسجل في", "تابع ل",
+        # ── Arabic: entity names ──────────────────────────────────────────
         "كليات", "الكليات", "دكاترة", "الدكاترة",
         "قسم", "اقسام", "الأقسام", "الاقسام",
         "طلاب", "الطلاب", "مواد", "المواد",
-        # Identity / profile queries
+        "فرقة", "دفعة", "الفرقة", "الدفعة",
+        "عروض", "العروض", "التسجيلات",
+        # ── Arabic: identity / profile ────────────────────────────────────
         "اسمي", "اسم", "انا مين", "أنا مين",
         "من انا", "من أنا", "مين انا", "مين أنا",
         "معلوماتي", "بياناتي", "بروفايلي", "حسابي",
-        # University/system data
+        "كليتي", "قسمي", "دفعتي", "فرقتي",
+        # ── Arabic: system data ───────────────────────────────────────────
         "بيانات", "جامعه", "جامعة", "السيستم",
-        # ── English data / identity queries ────────────────────────────────
-        "how many", "list of", "show me", "what are",
+        # ── English: count / analytics ────────────────────────────────────
+        "how many", "count of", "number of", "total students",
+        "total doctors", "total courses", "how much",
+        "statistics", "analytics", "distribution", "breakdown",
+        "top students", "at risk", "failing students",
+        "most enrolled", "most popular", "average gpa",
+        # ── English: filter / relationship queries ────────────────────────
+        "doctors in", "students in", "courses in", "offerings in",
+        "in department", "in college", "in batch", "in year",
+        "who teaches", "enrolled in", "assigned to",
+        "list doctors", "list students", "list courses",
+        # ── English: list / show ──────────────────────────────────────────
+        "list of", "show me", "what are", "give me",
+        "students list", "doctors list", "departments",
+        # ── English: my data ──────────────────────────────────────────────
         "my courses", "my subjects", "my schedule", "my grades",
         "my gpa", "my results", "my profile", "my info",
+        "my college", "my department", "my batch",
         "who am i", "my name", "my account", "my details",
         "profile", "courses i have", "subjects i have",
-        "how much", "total", "count of", "number of",
-        "students list", "doctors list", "departments",
     }
-    for kw in _ARABIC_DATA_KEYWORDS:
+    for kw in _BACKEND_KEYWORDS:
         if kw in msg:
             return True
     return False

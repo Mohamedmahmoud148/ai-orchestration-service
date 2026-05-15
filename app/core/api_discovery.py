@@ -52,6 +52,7 @@ _SAFE_POST_PATHS = (
 
     # Enrollment
     "/api/enrollments/",
+    "/api/enrollments/auto-enroll",
     "/api/enrollment/upload",
 
     # GPA recalculate
@@ -124,7 +125,8 @@ async def fetch_and_filter_schema() -> None:
             data = response.json()
 
             paths = data.get("paths", {})
-            schema_lines = []
+            priority_lines: list[str] = []
+            other_lines: list[str] = []
             allowed_set = set()
 
             for path, methods in paths.items():
@@ -147,11 +149,19 @@ async def fetch_and_filter_schema() -> None:
                     allowed_set.add((method.upper(), path))
 
                     params_str = (
-                        f" Params: {', '.join(param_names)}" if param_names else ""
+                        f" [{', '.join(param_names)}]" if param_names else ""
                     )
-                    schema_lines.append(
-                        f"- {method.upper()} {path} → {summary}.{params_str}"
-                    )
+                    line = f"- {method.upper()} {path} → {summary}.{params_str}"
+
+                    # Boost analytics-relevant endpoints to top of schema output
+                    path_lower = path.lower()
+                    is_priority = any(seg in path_lower for seg in _PRIORITY_SEGMENTS)
+                    if is_priority:
+                        priority_lines.append(line)
+                    else:
+                        other_lines.append(line)
+
+            schema_lines = priority_lines + other_lines
 
             if not schema_lines:
                 logger.warning(
@@ -161,7 +171,8 @@ async def fetch_and_filter_schema() -> None:
             else:
                 _cached_schema = "\n".join(schema_lines)
                 logger.info(
-                    "api_discovery: Cached %d allowed endpoints.", len(allowed_set)
+                    "api_discovery: Cached %d allowed endpoints (%d priority, %d other).",
+                    len(allowed_set), len(priority_lines), len(other_lines),
                 )
 
             _allowed_endpoints = allowed_set
@@ -169,6 +180,14 @@ async def fetch_and_filter_schema() -> None:
     except Exception as exc:
         logger.error("api_discovery: Failed to fetch Swagger schema: %s", exc)
         _cached_schema = "Backend API schema currently unavailable."
+
+
+# ── Analytics-priority path segments (boosted to top of schema output) ────────
+_PRIORITY_SEGMENTS = (
+    "students", "doctors", "departments", "offerings", "enrollments",
+    "analytics", "stats", "colleges", "batches", "subjects", "complaints",
+    "grades", "gpa", "schedule", "materials",
+)
 
 
 def get_allowed_endpoints_schema() -> str:
