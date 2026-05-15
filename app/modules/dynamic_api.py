@@ -86,10 +86,15 @@ Keywords: "دكتور", "دكاترة", "الدكاترة", "أستاذ", "docto
 → GET /api/Doctors/{{code}}/subjects (their subjects)
 
 RULE 6 — SUBJECTS / COURSES:
-Keywords: "مادة", "مواد", "المواد", "subject", "subjects", "course", "courses"
-→ GET /api/Subjects/by-batch/{{batchId}}  (if batchId known)
-→ GET /api/Subjects/{{code}}  (individual)
-→ GET /api/SubjectOfferings/my-offerings  (student's offerings)
+Keywords: "مادة", "مواد", "المواد", "موادي", "مواد الترم", "subject", "subjects", "course", "courses", "my courses", "my subjects"
+
+⚠️ ROLE-SPECIFIC PRIORITY (apply strictly):
+- student role → ALWAYS use: GET /api/SubjectOfferings/my-offerings
+  (JWT-aware — NO ID needed. Works for "مواد الترم ده", "موادي", "my courses", etc.)
+  ⛔ NEVER use /api/Subjects/by-batch/... for students — that is admin/doctor only.
+- doctor role  → GET /api/SubjectOfferings/my-offerings  (their assigned subjects)
+- admin role   → GET /api/Subjects/by-batch/{{batchId}}  (if batchId known)
+               → GET /api/Subjects/{{code}}  (individual subject lookup)
 
 RULE 7 — GRADES / RESULTS:
 Keywords: "درجة", "درجات", "نتيجة", "نتايج", "grades", "results", "marks"
