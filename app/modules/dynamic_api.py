@@ -9,7 +9,7 @@ An intelligent, dynamically routed module that:
 5. Summarizes the raw JSON data into natural response text.
 """
 import json
-from typing import Any, Dict, Optional, Type
+from typing import Any
 
 from app.agents.schemas import AgentInput, AgentOutput, ExecutionPlan
 from app.core.api_discovery import get_allowed_endpoints_schema, validate_endpoint
@@ -89,8 +89,9 @@ RULE 6 — SUBJECTS / COURSES:
 Keywords: "مادة", "مواد", "المواد", "موادي", "مواد الترم", "subject", "subjects", "course", "courses", "my courses", "my subjects"
 
 ⚠️ ROLE-SPECIFIC PRIORITY (apply strictly):
-- student role → ALWAYS use: GET /api/SubjectOfferings/my-offerings
-  (JWT-aware — NO ID needed. Works for "مواد الترم ده", "موادي", "my courses", etc.)
+- student role → ALWAYS use: GET /api/SubjectOfferings/my-enrollments
+  (JWT-aware — NO ID needed. Returns all subjects the student is enrolled in.)
+  ⛔ NEVER use /api/SubjectOfferings/my-offerings for students — that is Doctor only, returns 403.
   ⛔ NEVER use /api/Subjects/by-batch/... for students — that is admin/doctor only.
 - doctor role  → GET /api/SubjectOfferings/my-offerings  (their assigned subjects)
 - admin role   → GET /api/Subjects/by-batch/{{batchId}}  (if batchId known)
