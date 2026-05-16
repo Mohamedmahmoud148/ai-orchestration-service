@@ -123,6 +123,24 @@ def _detect_backend_query(message: str) -> bool:
     msg = message.strip().lower()
 
     _BACKEND_KEYWORDS = {
+        # ── Arabic: regulation / roadmap queries ─────────────────────────
+        "لائحة", "لوائح", "خطة دراسية", "خارطة طريق",
+        "مواد الترم", "مواد الفصل", "مواد السنة",
+        "المواد اللي هسجلها", "المواد المقترحة", "ايه المواد",
+        "كام ساعة خلصت", "ساعات معتمدة", "الساعات الباقية",
+        "رسبت في", "مواد راسب", "مواد باقية", "مواد خلصتها",
+        "تقدمي الأكاديمي", "وضعي الأكاديمي", "هل انا في المسار",
+        "الترم الجاي", "المواد القادمة", "ايه اللي باقيلي",
+        "roadmap", "academic plan", "study plan", "academic progress",
+        "credit hours", "remaining subjects", "passed subjects",
+        "failed subjects", "next semester subjects", "what subjects",
+        # ── Arabic: enrollment ACTIONS (register/enroll me) ──────────────
+        "سجلني", "سجل لي", "سجل لى", "اسجلني", "عايز أسجل",
+        "عايز اسجل", "ابدأ التسجيل", "ابدا التسجيل",
+        "سجلني في المواد", "سجل في كل المواد", "سجلني في الترم",
+        "تسجيل المواد", "تسجيل في المواد", "اعملي تسجيل",
+        "register me", "enroll me", "sign me up", "auto enroll",
+        "register for courses", "enroll in courses",
         # ── Arabic: count / analytics ─────────────────────────────────────
         "كم عدد", "كام بدرس", "كام طالب", "كام دكتور", "كام مادة",
         "عدد الدكاترة", "عدد الطلاب", "عدد المواد", "عدد الاقسام",

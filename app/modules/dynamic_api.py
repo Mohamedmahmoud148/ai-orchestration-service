@@ -319,6 +319,41 @@ Keywords: "سنة دراسية", "فصل دراسي", "academic year", "semester
   → GET /api/AcademicYears
   By academic year → GET /api/Semesters/by-academic-year/{{academicYearId}}
 
+── Q. REGULATION / ACADEMIC ROADMAP (HIGHEST PRIORITY FOR STUDENTS) ─
+Keywords: "لائحة", "لوائح", "خطة دراسية", "خارطة طريق", "regulation",
+          "roadmap", "academic plan", "study plan",
+          "مواد الترم", "مواد الفصل", "مواد السنة",
+          "المواد اللي هسجلها", "المواد المقترحة", "ايه المواد",
+          "كام ساعة خلصت", "ساعات معتمدة", "الساعات الباقية",
+          "رسبت في", "مواد راسب", "مواد باقية", "مواد خلصتها",
+          "هل انا في المسار", "تقدمي الأكاديمي", "وضعي الأكاديمي",
+          "الترم الجاي", "المواد القادمة", "ايه اللي باقيلي",
+          "credit hours", "remaining subjects", "passed subjects",
+          "academic progress", "what subjects", "next semester subjects",
+          "failed subjects", "must retake"
+
+Q1. STUDENT'S FULL ACADEMIC ROADMAP (use for almost ALL regulation questions):
+  ⚡ THIS IS THE PRIMARY ENDPOINT FOR ANY STUDENT QUESTION ABOUT:
+    - their subjects by semester
+    - their academic progress
+    - credit hours completed/remaining
+    - recommended next semester
+    - failed/passed subjects
+    - their regulation/لائحة details
+  → GET /api/Regulations/my-roadmap
+  method: "GET", params: {{}}
+  ✅ JWT-aware — no params needed. Returns full personalized roadmap.
+  ⛔ Student role ONLY.
+
+Q2. SPECIFIC STUDENT'S REGULATION (Admin/Doctor viewing a student):
+  → GET /api/Regulations/student/{{studentId}}
+
+Q3. REGULATIONS BY DEPARTMENT (Admin):
+  → GET /api/Regulations/by-department/{{departmentId}}
+
+Q4. ALL REGULATIONS (Admin):
+  → GET /api/Regulations
+
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 PARAMETER INJECTION RULES:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -362,6 +397,43 @@ RAW BACKEND DATA:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 RESPONSE QUALITY RULES:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+0a. ACADEMIC ROADMAP RESULTS (/api/Regulations/my-roadmap) — HIGHEST PRIORITY:
+   This endpoint returns the student's FULL personalized academic plan.
+   You MUST extract exactly what the user asked about and answer precisely:
+
+   - "ايه مواد الترم الثاني؟"
+     → Find semesters[semesterNumber==2].subjects, list them with status
+     → "مواد الترم الثاني في لائحتك هي: Data Structures (3 ساعات)، Algorithms (3 ساعات)، ..."
+
+   - "كام ساعة خلصت؟" / "credit hours completed"
+     → completedCreditHours and totalCreditHours
+     → "أنهيت حتى الآن X ساعة معتمدة من أصل Y ساعة — تبقّى Z ساعة."
+
+   - "المواد اللي رسبت فيها؟"
+     → mustRetake list OR subjects with status=="failed" across all semesters
+     → List them clearly with gradeLetter if available
+
+   - "المواد المقترحة الترم الجاي؟"
+     → recommendedNext list
+     → "المواد المقترحة للترم القادم: ..."
+
+   - "هل أنا في المسار الصح؟" / "وضعي الأكاديمي"
+     → Compare passedSubjects/totalSubjects, GPA, mustRetake count
+     → Give an honest, encouraging assessment
+
+   - General regulation question → give overview: regulation title, semesters, progress
+   ❌ NEVER dump the full JSON — always focus on what the user actually asked.
+
+0b. ACTION RESULTS (POST responses) — HIGHEST PRIORITY RULE:
+   If the endpoint is a POST (e.g. /enrollments/auto-enroll), the data is an ACTION RESULT not a data query.
+   Interpret the fields and confirm what was done:
+   ✅ auto-enroll result example:
+     {{"enrolled": 5, "alreadyHad": 2, "enrolledSubjects": ["Data Structures", "Algorithms", ...]}}
+     → "تم تسجيلك بنجاح في 5 مواد جديدة: Data Structures، Algorithms، ...
+        كنت مسجلاً مسبقاً في 2 مادة.
+        إجمالي المواد المتاحة لدفعتك: 7."
+   ❌ NEVER say "no data found" for a POST result — it's a confirmation, not a list.
 
 1. COUNTS & ANALYTICS — always state numbers explicitly:
    ❌ BAD:  "There are some students."
