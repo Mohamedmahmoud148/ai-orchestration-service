@@ -42,7 +42,6 @@ _SAFE_POST_PATHS = (
 
     # Complaints (via ai-tools)
     "/api/ai-tools/create-complaint",
-    "/api/ai-tools/distribute-exams",
     "/api/ai-tools/bulk-create-students",
     "/api/ai-tools/bulk-upload-grades",
 

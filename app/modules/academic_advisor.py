@@ -221,9 +221,8 @@ class AcademicAdvisorModule:
                 )
                 try:
                     enriched = await self.backend_client.fetch(
-                        route="/api/ai-tools/student-academic-summary",
+                        route=f"/api/ai-tools/student-overview/{user_id}",
                         auth_header=agent_input.auth_header,
-                        params={"userId": user_id},
                     )
                     if enriched and "error" in enriched:
                         logger.warning(

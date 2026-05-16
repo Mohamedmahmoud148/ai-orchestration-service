@@ -7,8 +7,8 @@ Flow:
   1. Resolve subjectOfferingId (from plan, context, or pre-execution steps).
      GET /api/ai-tools/resolve-offering?subject={subjectName}
   2. Fetch course material from backend   GET /api/Materials/by-offering/{id}
-  3. Generate questions via Flan-T5  (model_service.generate_questions).
-  4. Persist the exam via BackendClient  POST /api/Exams
+  3. Generate structured MCQ questions via Claude (generate_structured_json).
+  4. Persist the exam via BackendClient  POST /api/Exams/generate-ai
   5. Return generated questions as structured text and JSON.
 
 Safety contract
@@ -21,27 +21,26 @@ Safety contract
 from __future__ import annotations
 
 import io
-import re
-from typing import Any, Dict, Optional
+import json
+from typing import Any, Dict, List, Optional
 
 from app.agents.schemas import AgentInput, AgentOutput
 from app.core.logging import logger
 
-# Patterns that identify placeholder / fake question text that must be rejected.
-_PLACEHOLDER_PATTERNS = re.compile(
-    r"""
-    ^                               # start of line
-    (question\s+\d+                 # "Question 1", "question 2 about ..."
-    |additional\s+question          # "Additional question 3."
-    |q\s*\d+\s*[.:\-]              # "Q1:", "Q 2 -"
-    )
-    """,
-    re.IGNORECASE | re.VERBOSE,
-)
-
 _BACKEND_UNAVAILABLE_MSG = (
     "The backend service is currently unavailable. Please try again later."
 )
+
+_QUESTION_SYSTEM_PROMPT = """You are an expert university exam writer.
+Generate exam questions strictly as a JSON array. Each element must have:
+  - "questionText": string — the question (at least 20 characters)
+  - "questionType": integer — 0 for MCQ, 1 for TrueFalse, 2 for Essay
+  - "options": array of exactly 4 strings for MCQ, null for TrueFalse/Essay
+  - "correctAnswer": string — for MCQ: one of the option strings; for TrueFalse: "True" or "False"; for Essay: a model answer
+  - "mark": integer between 5 and 20
+
+Return ONLY the JSON array with no extra text, markdown, or explanation.
+"""
 
 
 def _pdf_to_text(data: bytes) -> str:
@@ -55,7 +54,7 @@ def _pdf_to_text(data: bytes) -> str:
 
 class ExamGenerationModule:
     """
-    Generates exam questions from course material using Flan-T5.
+    Generates structured MCQ exam questions via Claude.
     Persists the exam to the .NET backend when a valid offering is resolved.
     """
 
@@ -66,11 +65,15 @@ class ExamGenerationModule:
     async def run(self, agent_input: AgentInput, plan=None) -> AgentOutput:
         logger.info("ExamGenerationModule: starting.")
 
-        params    = getattr(plan, "exam_params", None) if plan else None
-        context   = agent_input.context or {}
-        num_q     = getattr(params, "numberOfQuestions", 5) if params else 5
-        exam_type = getattr(params, "examType", "midterm") if params else "midterm"
-        subject   = getattr(params, "subjectName", "the subject") if params else "the subject"
+        params      = getattr(plan, "exam_params", None) if plan else None
+        context     = agent_input.context or {}
+        num_q       = getattr(params, "numberOfQuestions", 10) if params else context.get("questionCount", 10)
+        exam_type   = getattr(params, "examType", "midterm") if params else context.get("examType", "midterm")
+        difficulty  = getattr(params, "difficulty", "Medium") if params else context.get("difficulty", "Medium")
+        subject     = getattr(params, "subjectName", "the subject") if params else "the subject"
+        is_random   = context.get("isRandomized", False)
+        per_student = context.get("questionsPerStudent", 0)
+        topics      = context.get("topics", [])
 
         # ── 1. Resolve subjectOfferingId ──────────────────────────────────────
         offering_id = (
@@ -93,7 +96,6 @@ class ExamGenerationModule:
                             params={"subject": subject_name},
                         )
 
-                        # ── Disambiguation: backend returned multiple matches ──────────
                         if isinstance(res, list) and len(res) > 1:
                             logger.info(
                                 "ExamGenerationModule: resolve-offering returned %d results "
@@ -115,15 +117,16 @@ class ExamGenerationModule:
                                 },
                             )
 
-                        # ── Single result or dict ────────────────────────────────────
                         if isinstance(res, list) and len(res) == 1:
                             offering_id = res[0].get("subjectOfferingId") or res[0].get("id")
+                            subject = res[0].get("subjectName", subject)
                         else:
                             offering_id = (
                                 res.get("subjectOfferingId")
                                 if res and "error" not in res
                                 else None
                             )
+                            subject = res.get("subjectName", subject) if res else subject
                         logger.info(
                             "ExamGenerationModule: resolved subjectOfferingId=%s",
                             offering_id,
@@ -136,7 +139,6 @@ class ExamGenerationModule:
                         offering_id = None
                     break
 
-        # CRITICAL: Never continue without a valid offering ID.
         if not offering_id:
             logger.error(
                 "ExamGenerationModule: offering_id is None — cannot generate exam "
@@ -173,7 +175,6 @@ class ExamGenerationModule:
                         result.get("content") or result.get("text") or ""
                     )
         except Exception as material_exc:
-            # Material fetch is non-fatal — fall back to the user message.
             logger.warning(
                 "ExamGenerationModule: material fetch failed (non-fatal) — %s",
                 material_exc,
@@ -184,83 +185,78 @@ class ExamGenerationModule:
                 agent_input.message or f"General {exam_type} exam for {subject}."
             )
 
-        # ── 3. Generate questions via ModelRouter ─────────────────────────────
-        selected_model = context.get("selected_model")
-        target_model = selected_model
-        if not selected_model or not selected_model.startswith("hf/"):
-            target_model = "hf/google/flan-t5-base"
-            logger.info(
-                "ExamGenerationModule: overriding pipeline model '%s' "
-                "with task-optimized 'hf/google/flan-t5-base'.",
-                selected_model or "default",
-            )
+        # ── 3. Generate structured questions via Claude ───────────────────────
+        topics_hint = f" Focus on these topics: {', '.join(topics)}." if topics else ""
+        user_prompt = (
+            f"Generate {num_q} {difficulty}-difficulty {exam_type} exam questions "
+            f"for the subject '{subject}'.{topics_hint}\n\n"
+            f"Course material excerpt:\n{material_text[:4000]}"
+        )
 
         logger.info(
-            "ExamGenerationModule: generating %d questions for '%s' using %s.",
-            num_q, subject, target_model,
-        )
-        raw_questions = await self.model_router.generate_questions(
-            material_text, num_questions=num_q, model_id=target_model
+            "ExamGenerationModule: requesting %d questions for '%s' (difficulty=%s).",
+            num_q, subject, difficulty,
         )
 
-        # ── Parse raw model output — raises ValueError on any invalid output ──
+        questions_list: List[Dict[str, Any]] = []
         try:
-            questions_list = self._parse_questions(raw_questions, num_q, subject)
-        except ValueError as parse_exc:
+            raw = await self.model_router.generate_structured_json(
+                prompt=user_prompt,
+                system_instruction=_QUESTION_SYSTEM_PROMPT,
+            )
+            if isinstance(raw, list):
+                questions_list = raw
+            elif isinstance(raw, str):
+                questions_list = json.loads(raw)
+            else:
+                raise ValueError(f"Unexpected model output type: {type(raw)}")
+        except Exception as gen_exc:
             logger.error(
-                "ExamGenerationModule: question parsing failed — %s", parse_exc
+                "ExamGenerationModule: Claude generation failed — %s", gen_exc
             )
             return AgentOutput(
                 status="error",
                 response=(
-                    "The AI model could not generate valid exam questions from "
-                    "the provided material. Please try again with more detailed "
-                    "course content."
+                    "The AI could not generate valid exam questions. "
+                    "Please try again with more detailed course content."
                 ),
-                data={"module": "ExamGenerationModule", "error": str(parse_exc)},
+                data={"module": "ExamGenerationModule", "error": str(gen_exc)},
             )
 
-        # ── 4. Pre-persist validation ─────────────────────────────────────────
+        # ── 4. Validate ───────────────────────────────────────────────────────
         try:
             self._validate_questions(questions_list)
         except ValueError as val_exc:
             logger.error(
-                "ExamGenerationModule: pre-persist validation failed — %s", val_exc
+                "ExamGenerationModule: validation failed — %s", val_exc
             )
             return AgentOutput(
                 status="error",
-                response=(
-                    "The generated exam is invalid or empty and cannot be saved. "
-                    "Please try again."
-                ),
+                response="The generated exam is invalid and cannot be saved. Please try again.",
                 data={"module": "ExamGenerationModule", "error": str(val_exc)},
             )
 
-        # ── 5. Persist to backend ─────────────────────────────────────────────
+        # ── 5. Persist to backend via generate-ai endpoint ───────────────────
         exam_payload: Dict[str, Any] = {
             "subjectOfferingId": offering_id,
-            "examData": {
-                "title": f"{exam_type.capitalize()} Exam — {subject}",
-                "questions": questions_list,
-            },
-            "handleStudentRandomization": False,
+            "difficulty": difficulty,
+            "questionCount": len(questions_list),
+            "examType": exam_type.capitalize(),
+            "topics": topics,
+            "isRandomized": is_random,
+            "questionsPerStudent": per_student,
         }
         logger.info(
-            "ExamGenerationModule [POST] endpoint=/api/Exams "
-            "offeringId=%s questions_count=%d",
-            offering_id,
-            len(questions_list),
+            "ExamGenerationModule [POST] endpoint=/api/Exams/generate-ai "
+            "offeringId=%s questions_count=%d isRandomized=%s",
+            offering_id, len(questions_list), is_random,
         )
         backend_result: Dict[str, Any] = {}
         try:
             backend_result = await self.backend_client.post(
-                route="/api/Exams",
+                route="/api/Exams/generate-ai",
                 payload=exam_payload,
                 auth_header=agent_input.auth_header,
-            )
-            logger.info(
-                "ExamGenerationModule [POST] /api/Exams response=%s",
-                backend_result,
             )
             if backend_result and "error" in backend_result:
                 logger.warning(
@@ -283,7 +279,8 @@ class ExamGenerationModule:
                 "module": "ExamGenerationModule",
                 "questions": questions_list,
                 "backend_result": backend_result,
-                "model_used": target_model,
+                "isRandomized": is_random,
+                "questionsPerStudent": per_student,
             },
         )
 
@@ -292,92 +289,39 @@ class ExamGenerationModule:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _parse_questions(raw: str, num_q: int, subject: str) -> list:
-        """Parse raw model output into a validated list of question dicts.
-
-        Raises
-        ------
-        ValueError
-            - If ``raw`` is None, empty, or whitespace-only.
-            - If no non-empty lines can be extracted after stripping.
-            - If every extracted line looks like a placeholder.
-            Fake / placeholder questions are NEVER returned.
-        """
-        if not raw or not raw.strip():
-            raise ValueError(
-                "Model returned an empty response. "
-                "Cannot generate exam questions without valid model output."
-            )
-
-        lines = [line.strip() for line in raw.split("\n") if line.strip()]
-        if not lines:
-            raise ValueError(
-                "No question lines could be extracted from model output. "
-                "The response contained only blank lines."
-            )
-
-        # Filter out lines that are too short to be real questions (< 10 chars)
-        valid_lines = [l for l in lines if len(l) >= 10]
-        if not valid_lines:
-            raise ValueError(
-                f"All extracted lines are too short to be valid questions "
-                f"(minimum 10 characters). Got: {lines[:3]}"
-            )
-
-        # Reject if every line matches a known placeholder pattern
-        placeholder_count = sum(
-            1 for l in valid_lines if _PLACEHOLDER_PATTERNS.match(l)
-        )
-        if placeholder_count == len(valid_lines):
-            raise ValueError(
-                "Model output consists entirely of placeholder text. "
-                "Cannot persist fake questions to the backend."
-            )
-
-        result = []
-        for line in valid_lines[:num_q]:
-            result.append({"question": line, "answer": "", "marks": 5})
-
-        return result
-
-    @staticmethod
     def _validate_questions(questions: list) -> None:
-        """Strict pre-persist gate — raises ValueError on any violation.
-
-        Checks
-        ------
-        - List must not be empty.
-        - Every item must have a non-empty ``question`` field.
-        - No item may match the placeholder pattern.
-
-        Raises
-        ------
-        ValueError
-            If any validation rule is violated.
-        """
         if not questions:
-            raise ValueError(
-                "Generated exam is invalid: questions list is empty."
-            )
+            raise ValueError("Generated exam is invalid: questions list is empty.")
 
         for i, q in enumerate(questions):
-            text = q.get("question", "").strip()
-            if not text:
+            text = (q.get("questionText") or q.get("question") or "").strip()
+            if not text or len(text) < 10:
                 raise ValueError(
-                    f"Question at index {i} has an empty 'question' field."
+                    f"Question at index {i} is missing or too short: {text!r}"
                 )
-            if len(text) < 10:
+            q_type = q.get("questionType", 0)
+            if q_type == 0:  # MCQ
+                opts = q.get("options")
+                if not opts or len(opts) < 2:
+                    raise ValueError(
+                        f"MCQ question at index {i} must have at least 2 options."
+                    )
+            if not q.get("correctAnswer"):
                 raise ValueError(
-                    f"Question at index {i} is too short to be valid: {text!r}"
-                )
-            if _PLACEHOLDER_PATTERNS.match(text):
-                raise ValueError(
-                    f"Question at index {i} looks like a placeholder: {text!r}"
+                    f"Question at index {i} is missing 'correctAnswer'."
                 )
 
     @staticmethod
     def _format_questions(questions: list, subject: str, exam_type: str) -> str:
         lines = [f"**{exam_type.capitalize()} Exam — {subject}**", ""]
         for i, q in enumerate(questions, 1):
-            lines.append(f"{i}. {q['question']}  [{q['marks']} marks]")
+            text = q.get("questionText") or q.get("question", "")
+            mark = q.get("mark", 5)
+            q_type = q.get("questionType", 0)
+            lines.append(f"{i}. {text}  [{mark} marks]")
+            if q_type == 0:
+                opts = q.get("options") or []
+                for j, opt in enumerate(opts):
+                    lines.append(f"   {'ABCD'[j]}. {opt}")
+            lines.append("")
         return "\n".join(lines)
