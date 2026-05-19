@@ -454,9 +454,15 @@ RESPONSE QUALITY RULES:
 10. PAGINATION AWARENESS — if totalCount > size, mention "يوجد المزيد — اطلب الصفحة التالية."
 
 PROVIDE:
-- narrative: the full natural answer (2-5 sentences, warm and clear)
-- suggestions: 3 short follow-up questions the user might ask next
-- explain_text: one sentence explaining the data source (user-friendly, no technical details)
+- narrative: رد كامل وعميق وطبيعي — مش مجرد ترجمة للبيانات.
+  * للبيانات الكثيرة: استخدم جداول أو نقاط منظمة.
+  * للأرقام والإحصائيات: اشرحها في سياق (مثلاً: "ده نسبة قبول 73% — فوق المتوسط").
+  * للطلاب: استخدم اسمهم بشكل طبيعي لو متاح.
+  * لا تقل "تم جلب البيانات" — الرد لازم يكون محتوى حقيقي.
+  * اختم بجملة تالية أو سؤال يحفز المستخدم على الاستمرار.
+  * الطول المثالي: 3-8 أسطر حسب كمية البيانات.
+- suggestions: 3 أسئلة متابعة قصيرة ومنطقية يمكن أن يسألها المستخدم بعد كده
+- explain_text: جملة واحدة تشرح مصدر البيانات (بدون تفاصيل تقنية)
 
 OUTPUT FORMAT (return ONLY this JSON, no markdown):
 {{
@@ -479,7 +485,7 @@ class DynamicApiModule:
       empty result (try broader endpoint), validation blocked (not in allowlist).
     """
 
-    MAX_ATTEMPTS = 3
+    MAX_ATTEMPTS = 5
 
     def __init__(self, model_router: Any, backend_client: Any) -> None:
         self.model_router = model_router
@@ -834,24 +840,24 @@ class DynamicApiModule:
         All attempts failed. Try to give a partial answer from academic_context,
         otherwise return a helpful bilingual message.
         """
-        # Last resort: answer from context if possible
+        # Last resort: try to answer from context or general knowledge
         context_messages = [
             {
                 "role": "system",
                 "content": (
-                    "You are a university AI assistant. The backend API is temporarily unavailable. "
-                    "Try to answer the student's question using ONLY the academic_context provided. "
-                    "If the context doesn't have the answer, apologise briefly and suggest they try again. "
-                    "Be warm. Match the student's language (Arabic/English). Never invent data."
+                    "أنت مساعد جامعي ذكي. الـ API مش متاح مؤقتًا.\n"
+                    "المطلوب:\n"
+                    "1. لو في academic_context يحتوي على إجابة للسؤال → استخدمه وأجب مباشرة.\n"
+                    "2. لو مفيش context كافٍ → حاول تجاوب من معرفتك العامة بالأنظمة الجامعية.\n"
+                    "3. لو السؤال محتاج بيانات حقيقية من السيستم فقط → اعتذر بجملة واحدة وقول للمستخدم يعيد المحاولة بعد ثانية.\n"
+                    "لا تعتذر أكثر من جملة واحدة. لا تكشف أسباب تقنية. تكلم بلغة المستخدم."
                 ),
             },
             {
                 "role": "user",
                 "content": (
-                    f"Student question: {message}\n\n"
-                    f"Academic context: {academic_ctx}\n\n"
-                    f"Note: The following API endpoints were tried but all failed:\n"
-                    + "\n".join(f"- {a['method']} {a['endpoint']}: {a['reason']}" for a in failed_attempts)
+                    f"سؤال المستخدم: {message}\n\n"
+                    f"السياق الأكاديمي المتاح: {academic_ctx}"
                 ),
             },
         ]
@@ -861,18 +867,11 @@ class DynamicApiModule:
             )
             return AgentOutput(
                 status="partial",
-                response=fallback or (
-                    "أنا آسف، في مشكلة مؤقتة في جلب البيانات. "
-                    "حاول تاني بعد شوية أو وضح طلبك بشكل تاني.\n"
-                    "(Temporary issue fetching data — please try again or rephrase your question.)"
-                ),
+                response=fallback or "في مشكلة مؤقتة — حاول تاني بعد ثواني.",
                 data={"failed_attempts": failed_attempts},
             )
         except Exception:
             return AgentOutput(
                 status="failed",
-                response=(
-                    "أنا آسف، في مشكلة مؤقتة. حاول تاني بعد شوية.\n"
-                    "(Temporary issue — please try again.)"
-                ),
+                response="في مشكلة مؤقتة — حاول تاني بعد ثواني.",
             )
