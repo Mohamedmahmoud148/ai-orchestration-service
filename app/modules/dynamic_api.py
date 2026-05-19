@@ -366,6 +366,35 @@ PARAMETER INJECTION RULES:
 - Omit params that have no value — never send empty strings.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+R. WRITE ACTIONS (POST — execute something in the system):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+⚡ These are ACTION requests — user wants the system to DO something, not just fetch data.
+Always use method: "POST" for these.
+
+R1. STUDENT AUTO-ENROLL (student enrolling in their batch subjects):
+  Arabic triggers: "سجلني", "سجل لي المواد", "اسجلني", "عايز أسجل", "اعملي تسجيل", "تسجيل المواد"
+  English triggers: "enroll me", "register me", "sign me up for courses", "auto enroll"
+  → POST /api/enrollments/auto-enroll
+  params: {{"studentId": "{{studentId}}", "batchId": "{{batchId}}"}}
+  ✅ JWT-aware — inject studentId and batchId from academic_context.
+
+R2. CREATE EXAM (doctor generating AI exam):
+  Arabic triggers: "اعمل امتحان", "انشئ امتحان", "حضّر امتحان"
+  → POST /api/exams/generate-ai
+  params: {{"subjectOfferingId": "{{offeringId}}", ...}}
+
+R3. SUBMIT COMPLAINT (student submitting a complaint):
+  Arabic triggers: "اشتكي", "عايز أشتكي", "قدم شكوى"
+  → POST /api/ai-tools/create-complaint
+  params: inject from context
+
+R4. ADMIN: ADD/CREATE ENTITIES:
+  "أضف طالب" / "add student"  → POST /api/students
+  "أضف دكتور" / "add doctor"  → POST /api/doctors
+  ⚠️ Always confirm required fields are in the message before executing.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 FAIL SAFE:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 - If no rule matches, return: {{"endpoint": "", "method": "GET", "params": {{}}}}
@@ -375,7 +404,7 @@ FAIL SAFE:
 OUTPUT FORMAT (return ONLY this JSON):
 {{
     "endpoint": "<full path with real substituted values>",
-    "method": "GET",
+    "method": "GET or POST",
     "params": {{"key": "value"}}
 }}
 """
