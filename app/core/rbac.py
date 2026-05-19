@@ -60,7 +60,8 @@ _STUDENT_ALLOWED: FrozenSet[str] = frozenset({
     "cv_analysis",
     "academic_advice",
     "material_explanation",
-    "backend_api_query",  # Students can query their own data (JWT enforces data-level RBAC)
+    "backend_api_query",
+    "action_execute",     # Students can enroll, submit — JWT enforces data-level RBAC
 })
 
 _DOCTOR_ALLOWED: FrozenSet[str] = frozenset({
@@ -73,7 +74,8 @@ _DOCTOR_ALLOWED: FrozenSet[str] = frozenset({
     "academic_advice",
     "file_extraction",
     "cv_analysis",
-    "backend_api_query",  # Doctors can query their profile/subjects/students (JWT enforces data-level RBAC)
+    "backend_api_query",
+    "action_execute",     # Doctors can create exams, grade submissions
 })
 
 # admin → _ALL (checked dynamically — no explicit list needed)
@@ -99,6 +101,7 @@ _INTENT_LABELS: dict[str, str] = {
     "material_explanation": "Material Explanation",
     "generate_exam":        "Exam Generation",
     "backend_api_query":    "Data Query",
+    "action_execute":       "System Action",
 }
 
 

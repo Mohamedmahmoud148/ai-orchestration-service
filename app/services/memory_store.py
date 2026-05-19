@@ -169,6 +169,60 @@ class MemoryStore:
             return data.get("summary")
         return data  # str or None
 
+    async def get_context(self, user_id: str | None) -> str:
+        """
+        Synthesize a plain-text context string for the Planner.
+        Combines summary + last conversation memory + preferences.
+        Returns empty string (never raises) so the Planner degrades gracefully.
+        """
+        if not user_id:
+            return ""
+        try:
+            parts: list[str] = []
+
+            summary = await self.get_summary(user_id)
+            if summary:
+                parts.append(f"Conversation summary: {summary}")
+
+            memory = await self.get_conversation(user_id)
+            if memory:
+                if memory.get("last_intent"):
+                    parts.append(f"Last intent: {memory['last_intent']}")
+                if memory.get("last_entities"):
+                    parts.append(f"Last entities: {memory['last_entities']}")
+                if memory.get("last_result"):
+                    parts.append(f"Last result summary: {str(memory['last_result'])[:300]}")
+
+            prefs = await self.get_preferences(user_id)
+            if prefs:
+                if prefs.get("language"):
+                    parts.append(f"User language preference: {prefs['language']}")
+                if prefs.get("interests"):
+                    parts.append(f"User interests: {', '.join(prefs['interests'][:5])}")
+
+            return "\n".join(parts)
+        except Exception as exc:
+            logger.warning("MemoryStore.get_context failed for user_id=%s: %s", user_id, exc)
+            return ""
+
+    async def save_context(self, user_id: str, intent: str, entities: Any, result_summary: str = "") -> None:
+        """Save the latest intent + entities after a successful agent run."""
+        if not user_id:
+            return
+        await self.save_conversation(user_id, {
+            "last_intent": intent,
+            "last_entities": entities,
+            "last_result": result_summary,
+        })
+
+    async def update_context(self, user_id: str, updates: Dict[str, Any]) -> None:
+        """Merge updates into existing conversation memory."""
+        if not user_id:
+            return
+        existing = await self.get_conversation(user_id) or {}
+        merged = {**existing, **updates}
+        await self.save_conversation(user_id, merged)
+
     async def save_summary(self, user_id: str, summary: str) -> None:
         """
         Persist a compressed conversation summary with a 24-hour TTL.
