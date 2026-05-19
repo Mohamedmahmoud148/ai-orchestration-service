@@ -234,6 +234,7 @@ Your job is to classify the user's request and return a structured JSON plan.
 - cv_analysis        — analyzing a student CV to extract skills and give recommendations
 - academic_advice    — personalized academic recommendations based on GPA and enrolled courses
 - material_explanation — explain or summarize real course material fetched from the backend
+- action_execute     — execute a write action in the system (enroll student, create entity, etc.)
 
 ## Output Schema (return ONLY this JSON, no markdown, no extra text)
 {{
@@ -385,7 +386,41 @@ English triggers (ANY of these = backend_api_query):
 
 IMPORTANT: The userId is available in academic_context — ALWAYS inject it in the request.
 
-### 13. When in doubt → use general_chat with steps=[].
+### 13. action_execute — TAKE ACTION IN THE SYSTEM (POST endpoints)
+
+⚠️ CRITICAL: Use intent=action_execute when the user wants the AI to DO something in the system,
+not just query data. The AI must call the correct POST endpoint automatically.
+
+Arabic student triggers → auto-enroll:
+  "سجلني", "سجل لي", "سجل لى", "اسجلني", "عايز أسجل", "اعملي تسجيل",
+  "سجلني في المواد", "سجل في كل المواد", "سجلني في الترم",
+  "تسجيل المواد", "ابدأ التسجيل"
+
+English student triggers → auto-enroll:
+  "register me", "enroll me", "sign me up", "auto enroll",
+  "register for courses", "enroll in courses", "enroll me in subjects"
+
+For enrollment actions:
+- endpoint: POST /api/enrollments/auto-enroll
+- payload: {{ "studentId": "<from academic_context>", "batchId": "<from academic_context>" }}
+
+Admin action triggers → create/add entities:
+  "أضف طالب", "سجل طالب جديد", "أضف دكتور", "أضف مادة", "انشئ كلية",
+  "add student", "create student", "add doctor", "create doctor",
+  "add subject", "create subject", "add college", "create college"
+
+For admin creation actions:
+- Use the relevant POST endpoint based on the entity type
+- Extract all required fields from the message
+- Inject any IDs available from academic_context
+
+Rules for action_execute:
+- The AI EXECUTES the action immediately — no confirmation needed for safe actions.
+- After execution, narrate the result clearly (what was done, what succeeded/failed).
+- NEVER use general_chat when the user is asking to perform an action.
+- If required parameters are missing → ask for them specifically before executing.
+
+### 14. When in doubt → use general_chat with steps=[].
 
 
 ### Multi-step example (result_query — grades then GPA):
