@@ -83,7 +83,7 @@ class ExamGenerationModule:
         if not offering_id and plan and hasattr(plan, "pre_execution_steps"):
             for step in plan.pre_execution_steps:
                 if step.tool == "ResolveSubjectOffering":
-                    subject_name = step.input_payload.get("subjectName", "").strip()
+                    subject_name = (step.input_payload.get("subjectName") or "").strip()
                     logger.info(
                         "ExamGenerationModule [GET] endpoint=/api/ai-tools/resolve-offering "
                         "query_params={'subject': '%s'}",
