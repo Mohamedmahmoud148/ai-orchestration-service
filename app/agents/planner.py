@@ -296,6 +296,8 @@ Rules for generate_exam:
     variationMode ("same_for_all"|"different_per_student"),
     subjectOfferingId (string|null)
 - If subjectOfferingId is unknown, add ResolveSubjectOffering to pre_execution_steps.
+  pre_execution_steps format (use "tool" NOT "tool_name"):
+  {{"tool": "ResolveSubjectOffering", "reason": "Need subjectOfferingId to create exam", "input_payload": {{"departmentId": "<from context>", "subjectName": "<from user>"}}}}
 - NEVER leave intent=general_chat when the user's action is exam creation.
 
 ### 4. Context-aware auto-fill (MANDATORY)
