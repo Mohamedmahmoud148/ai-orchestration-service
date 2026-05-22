@@ -194,9 +194,9 @@ D6. SUBJECT SEARCH:
   → GET /api/Subjects/search  params: name={{query}}
 
 ── E. SUBJECT OFFERING QUERIES ────────────────────
-Keywords: "offering", "سكشن", "شعبة", "الفصل الدراسي", "by semester"
+Keywords: "offering", "سكشن", "شعبة", "مواد متاحة", "course offerings", "by semester"
 
-E1. BY SEMESTER:
+E1. BY SEMESTER (if semesterId known):
   → GET /api/SubjectOfferings/by-semester/{{semesterId}}
 
 E2. DOCTOR'S OWN OFFERINGS:
@@ -204,6 +204,16 @@ E2. DOCTOR'S OWN OFFERINGS:
 
 E3. STUDENT'S ENROLLED OFFERINGS:
   → GET /api/SubjectOfferings/my-enrollments  (student JWT-aware)
+
+E4. ALL OFFERINGS — when user asks "explore course offerings" or "what courses are available"
+    and you do NOT have a departmentId or semesterId:
+  → GET /api/SubjectOfferings/by-semester/{{semesterId}} if semesterId in context
+  → GET /api/SubjectOfferings/my-offerings if role=doctor
+  → GET /api/Subjects  params: page=1, size=20  ← fallback: list subjects instead
+
+⚠️ NEVER use /api/SubjectOfferings/by-department/{{departmentId}} unless departmentId
+   is explicitly available in academic_context or the user provided it.
+   If departmentId is missing → use GET /api/Subjects or GET /api/SubjectOfferings/my-offerings instead.
 
 ── F. ENROLLMENT / REGISTRATION ACTIONS ───────────
 Keywords: "تسجيل", "مسجل", "enrolled", "enrollment", "registration",
