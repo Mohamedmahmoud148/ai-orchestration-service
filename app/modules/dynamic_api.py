@@ -205,15 +205,14 @@ E2. DOCTOR'S OWN OFFERINGS:
 E3. STUDENT'S ENROLLED OFFERINGS:
   → GET /api/SubjectOfferings/my-enrollments  (student JWT-aware)
 
-E4. ALL OFFERINGS — when user asks "explore course offerings" or "what courses are available"
-    and you do NOT have a departmentId or semesterId:
-  → GET /api/SubjectOfferings/by-semester/{{semesterId}} if semesterId in context
-  → GET /api/SubjectOfferings/my-offerings if role=doctor
-  → GET /api/Subjects  params: page=1, size=20  ← fallback: list subjects instead
+E4. ALL OFFERINGS — when user asks "explore course offerings" or "what courses are available":
+  - role=doctor  → GET /api/SubjectOfferings/my-offerings
+  - role=admin   → GET /api/Subjects  params: page=1, size=20  (admins cannot use my-offerings)
+  - role=student → GET /api/SubjectOfferings/my-enrollments
 
 ⚠️ NEVER use /api/SubjectOfferings/by-department/{{departmentId}} unless departmentId
-   is explicitly available in academic_context or the user provided it.
-   If departmentId is missing → use GET /api/Subjects or GET /api/SubjectOfferings/my-offerings instead.
+   is explicitly in academic_context. If missing → use GET /api/Subjects  params: page=1, size=20.
+⚠️ /api/SubjectOfferings/my-offerings is DOCTOR ONLY (403 for admin/student).
 
 ── F. ENROLLMENT / REGISTRATION ACTIONS ───────────
 Keywords: "تسجيل", "مسجل", "enrolled", "enrollment", "registration",

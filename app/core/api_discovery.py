@@ -204,6 +204,12 @@ def validate_endpoint(method: str, endpoint: str) -> bool:
     Handles path-parameter substitution:
       /api/Students/01KMXFB... matches /api/Students/{code}
     """
+    # Fast-path: if _is_allowed passes for GET, trust it
+    # (Swagger set may be incomplete due to pagination/filtering)
+    if method.lower() == "get" and _is_allowed(endpoint, "get"):
+        logger.debug("api_discovery.validate_endpoint: ALLOWED %s %s", method, endpoint)
+        return True
+
     if not _allowed_endpoints:
         logger.warning(
             "api_discovery.validate_endpoint: _allowed_endpoints is empty "
