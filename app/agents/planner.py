@@ -333,6 +333,13 @@ Rules for generate_exam:
   OR mentions uploading/processing a file for bulk operations.
 - Do NOT use this for single-file text extraction (use file_extraction).
 
+### 7b. Checking/reading course material content → ALWAYS use material_explanation
+- When user wants to "check", "read", "verify", "show content of" a course file/material:
+  Use intent=material_explanation (NOT file_extraction).
+- Triggers: "تحقق من محتوى الملف", "اقرأ الملف", "show file content",
+  "check the material", "read the file", "ما محتوى الملف", "اعرض محتوى المادة"
+- The material_explanation module handles file fetching internally using subjectOfferingId.
+
 ### 8. cv_analysis
 - Use intent=cv_analysis when the user wants their CV reviewed, analyzed,
   or feedback on skills, experience, or job readiness.
@@ -372,6 +379,14 @@ Rules for generate_exam:
 - Use intent=backend_api_query for ANY question requesting data from the university system.
 - Triggers include asking about: users, names, colleges, departments, subjects, students, doctors, counts, lists.
 - Examples: "ما هي الكليات", "من هم الدكاترة", "انا اسمي ايه", "كم عدد الطلاب", "what are the colleges"
+
+- Doctor-specific triggers → ALWAYS backend_api_query:
+  "علمت كام امتحان", "عندي كام امتحان", "امتحاناتي", "شوفلي امتحاناتي",
+  "درجات الطلاب", "نتايج الطلاب", "نتيجة المادة", "درجات المادة",
+  "كام طالب في المادة", "الطلاب اللي رسبوا", "من أعلى درجة",
+  "my exams", "how many exams", "student grades", "exam results",
+  "students who failed", "grade summary"
+  → For these, use GET /api/Exams/my-exams or GET /api/Exams/{id}/results
 
 ### 12. Identity & Profile Queries → ALWAYS backend_api_query
 ⚠️ CRITICAL: Questions about the user's own identity, name, or profile data MUST use backend_api_query.

@@ -80,36 +80,93 @@ class FileExtractionModule:
         file_bytes: Optional[bytes] = context.get("file_bytes")
         file_name: str              = context.get("file_name", "file.pdf")
         file_reference: Optional[str] = context.get("file_reference")
+        file_url: Optional[str]     = (
+            context.get("file_url")
+            or context.get("fileUrl")
+            or context.get("signedUrl")
+            or context.get("url")
+        )
 
-        # -- 1. Get raw bytes --------------------------------------------------
+        # -- 1. Get raw bytes — try all sources --------------------------------
+
+        # Source A: direct file_reference → backend API
         if not file_bytes and file_reference:
             result = await self.backend_client.fetch(
                 route=f"/api/Files/{file_reference}",
                 auth_header=agent_input.auth_header,
             )
-            if "error" in result:
-                return AgentOutput(
-                    status="failed",
-                    response=f"FileExtractionModule: could not fetch file — {result['error']}",
+            if "error" not in result:
+                file_bytes   = result.get("_raw_bytes")
+                file_name    = result.get("fileName", file_name)
+                content_type = result.get("content_type", "")
+                if not file_name.endswith((".pdf", ".docx", ".txt")):
+                    if "pdf" in content_type:
+                        file_name += ".pdf"
+                    elif "word" in content_type or "docx" in content_type:
+                        file_name += ".docx"
+                    else:
+                        file_name += ".txt"
+
+        # Source B: direct URL (from material response or previous AI turn)
+        if not file_bytes and file_url and file_url.startswith("http"):
+            try:
+                import httpx
+                headers = {}
+                if agent_input.auth_header:
+                    headers["Authorization"] = agent_input.auth_header
+                async with httpx.AsyncClient() as client:
+                    resp = await client.get(file_url, headers=headers, timeout=30.0)
+                    resp.raise_for_status()
+                file_bytes = resp.content
+                # derive filename from URL if not set
+                url_path = file_url.split("?")[0]
+                if "/" in url_path:
+                    file_name = url_path.split("/")[-1] or file_name
+                logger.info("FileExtractionModule: fetched %d bytes from URL", len(file_bytes))
+            except Exception as exc:
+                logger.warning("FileExtractionModule: URL fetch failed — %s", exc)
+
+        # Source C: try fetching materials from the backend using subjectOfferingId
+        if not file_bytes:
+            offering_id = (
+                context.get("subjectOfferingId")
+                or context.get("academic_context", {}).get("subjectOfferingId")
+            )
+            if offering_id:
+                result = await self.backend_client.fetch(
+                    route=f"/api/Materials/by-offering/{offering_id}",
+                    auth_header=agent_input.auth_header,
                 )
-            file_bytes   = result.get("_raw_bytes")
-            file_name    = result.get("fileName", file_name)
-            content_type = result.get("content_type", "")
-            # Detect type from content-type header if no extension
-            if not file_name.endswith((".pdf", ".docx", ".txt")):
-                if "pdf" in content_type:
-                    file_name += ".pdf"
-                elif "word" in content_type or "docx" in content_type:
-                    file_name += ".docx"
-                else:
-                    file_name += ".txt"
+                items = result.get("items") or (result if isinstance(result, list) else [])
+                if items:
+                    first = items[0] if isinstance(items, list) else {}
+                    mat_url = (
+                        first.get("fileUrl") or first.get("signedUrl")
+                        or first.get("url") or first.get("filePath") or ""
+                    )
+                    file_name = first.get("fileName") or first.get("title") or file_name
+                    if mat_url and mat_url.startswith("http"):
+                        try:
+                            import httpx
+                            headers = {}
+                            if agent_input.auth_header:
+                                headers["Authorization"] = agent_input.auth_header
+                            async with httpx.AsyncClient() as client:
+                                resp = await client.get(mat_url, headers=headers, timeout=30.0)
+                                resp.raise_for_status()
+                            file_bytes = resp.content
+                            logger.info("FileExtractionModule: fetched material from offering — %d bytes", len(file_bytes))
+                        except Exception as exc:
+                            logger.warning("FileExtractionModule: material URL fetch failed — %s", exc)
 
         if not file_bytes:
             return AgentOutput(
                 status="failed",
                 response=(
+                    "لم أتمكن من الوصول إلى محتوى الملف. "
+                    "تأكد من رفع المواد الدراسية أولاً عبر الدكتور، ثم حاول مجدداً.\n\n"
                     "FileExtractionModule: no file provided. "
-                    "Supply file_bytes+file_name or file_reference in context."
+                    "Supply file_bytes+file_name or file_reference or file_url in context."
                 ),
             )
 
