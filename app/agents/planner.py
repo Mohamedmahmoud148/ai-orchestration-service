@@ -386,7 +386,7 @@ Rules for generate_exam:
   "كام طالب في المادة", "الطلاب اللي رسبوا", "من أعلى درجة",
   "my exams", "how many exams", "student grades", "exam results",
   "students who failed", "grade summary"
-  → For these, use GET /api/Exams/my-exams or GET /api/Exams/{id}/results
+  → For these, use GET /api/Exams/my-exams or GET /api/Exams/{{id}}/results
 
 ### 12. Identity & Profile Queries → ALWAYS backend_api_query
 ⚠️ CRITICAL: Questions about the user's own identity, name, or profile data MUST use backend_api_query.
