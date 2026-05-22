@@ -108,12 +108,10 @@ def _extract_pdf_text(data: bytes) -> str:
         return ""
 
 
-async def _fetch_file_url_text(file_url: str, auth_header: Optional[str]) -> str:
+async def _fetch_file_url_text(file_url: str, auth_header: Optional[str], filename: str = "") -> str:
     """
-    Optionally fetch a fileUrl returned in the materials response.
-
-    If the URL points to a PDF, extract its text.  If it's plain text,
-    return as-is.  Returns empty string on any failure (non-fatal).
+    Fetch file from URL and extract text.
+    Supports PDF, Excel (xlsx/xls), DOCX, CSV, and plain text.
     """
     if not file_url or not file_url.startswith("http"):
         return ""
@@ -122,13 +120,28 @@ async def _fetch_file_url_text(file_url: str, auth_header: Optional[str]) -> str
         if auth_header:
             headers["Authorization"] = auth_header
         async with httpx.AsyncClient() as client:
-            resp = await client.get(file_url, headers=headers, timeout=20.0)
+            resp = await client.get(file_url, headers=headers, timeout=30.0, follow_redirects=True)
             resp.raise_for_status()
+
+        # Determine file type from URL or content-type
+        url_path = file_url.split("?")[0].lower()
+        fname = filename.lower() or url_path.split("/")[-1]
         content_type = resp.headers.get("content-type", "")
-        if "pdf" in content_type or file_url.lower().endswith(".pdf"):
+
+        # Import extraction functions from file_extraction module
+        from app.modules.file_extraction import extract_text_from_bytes
+
+        if any(fname.endswith(ext) for ext in (".pdf", ".docx", ".xlsx", ".xls", ".csv", ".txt")):
+            return extract_text_from_bytes(resp.content, fname)[:6_000]
+
+        if "pdf" in content_type:
             return _extract_pdf_text(resp.content)
-        if "text" in content_type or "json" in content_type:
+        if "spreadsheet" in content_type or "excel" in content_type:
+            from app.modules.file_extraction import _extract_excel
+            return _extract_excel(resp.content, fname)[:6_000]
+        if "text" in content_type:
             return resp.text[:5_000]
+
         return ""
     except Exception as exc:
         logger.warning(
@@ -192,7 +205,7 @@ async def _collect_material_text(
                 or ""
             )
             if file_url:
-                fetched = await _fetch_file_url_text(file_url, auth_header)
+                fetched = await _fetch_file_url_text(file_url, auth_header, title)
                 if fetched:
                     label = f"[{title}]\n{fetched}" if title else fetched
                     texts.append(label)
