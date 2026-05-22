@@ -122,7 +122,10 @@ def setup_logging() -> None:
         root.addHandler(handler)
 
     # Suppress noisy third-party loggers
-    for noisy in ("httpx", "httpcore", "uvicorn.access", "openai._base_client"):
+    for noisy in ("httpx", "httpcore", "uvicorn.access", "openai._base_client",
+                  "pdfminer", "pdfminer.psparser", "pdfminer.pdfinterp",
+                  "pdfminer.cmapdb", "pdfminer.pdfdocument", "pdfminer.pdfpage",
+                  "pypdf", "pypdf._reader"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
     logging.getLogger("uvicorn.error").setLevel(logging.INFO)
