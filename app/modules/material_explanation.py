@@ -282,30 +282,70 @@ class MaterialExplanationModule:
                     if offering_id:
                         break
 
+        # ── 1b. No subjectOfferingId — try smarter fallbacks ─────────────────
         if not offering_id:
-            logger.warning(
-                "MaterialExplanationModule: subjectOfferingId not found in context"
+            logger.warning("MaterialExplanationModule: subjectOfferingId not found — trying fallbacks")
+
+            # Fallback A: file_url in academic_context (restored from memory or passed directly)
+            direct_url = (
+                academic_ctx.get("file_url") or academic_ctx.get("fileUrl")
+                or ctx.get("file_url") or ctx.get("fileUrl")
             )
+            if direct_url:
+                logger.info("MaterialExplanationModule: using direct file_url from context")
+                material_text = await _fetch_file_url_text(direct_url, agent_input.auth_header)
+                if material_text:
+                    return await self._explain(material_text, agent_input, model_id, role, ctx)
+
+            # Fallback B: extract file URL from recent conversation history
+            history = ctx.get("history", []) or []
+            import re
+            for turn in reversed(history[-6:]):
+                content = turn.get("content", "")
+                urls = re.findall(
+                    r'https?://[^\s\)\]"\']+\.(?:pdf|xlsx|xls|docx|csv)',
+                    content, re.IGNORECASE
+                )
+                if urls:
+                    logger.info("MaterialExplanationModule: found file URL in history: %s", urls[0][:60])
+                    material_text = await _fetch_file_url_text(urls[0], agent_input.auth_header)
+                    if material_text:
+                        return await self._explain(material_text, agent_input, model_id, role, ctx)
+
+            # Fallback C: fetch regulations and use their fileUrl
+            logger.info("MaterialExplanationModule: trying regulations endpoint")
+            try:
+                regs_data = await self.backend_client.fetch(
+                    route="/api/Regulations",
+                    auth_header=agent_input.auth_header,
+                    params={"page": 1, "size": 10},
+                )
+                regs_list = regs_data if isinstance(regs_data, list) else regs_data.get("data") or []
+                for reg in regs_list[:3]:
+                    reg_url = reg.get("fileUrl") or reg.get("filePath") or ""
+                    if reg_url:
+                        logger.info("MaterialExplanationModule: reading regulation file: %s", reg.get("title"))
+                        material_text = await _fetch_file_url_text(reg_url, agent_input.auth_header)
+                        if material_text:
+                            label = f"[لائحة: {reg.get('title', '')}]\n{material_text}"
+                            return await self._explain(label, agent_input, model_id, role, ctx)
+            except Exception as exc:
+                logger.warning("MaterialExplanationModule: regulations fallback failed — %s", exc)
+
+            # Fallback D: give a helpful response
             enrolled = academic_ctx.get("enrolledCourses") or academic_ctx.get("courses") or []
             if enrolled:
                 course_list = ", ".join(
                     (c.get("name") or c.get("subjectName") or str(c))
                     for c in (enrolled[:5] if isinstance(enrolled, list) else [])
                 )
-                suggestion = (
-                    f"شايف إنك مسجّل في: {course_list}.\n"
-                    "قولي إيه المادة اللي عايزها بالظبط "
-                    "(مثال: 'اشرح هياكل البيانات')."
+                return AgentOutput(
+                    status="failed",
+                    response=f"عندك المواد دي: {course_list}\nقولي أي مادة عايز تعرف تفاصيلها؟",
                 )
-            else:
-                suggestion = (
-                    "قولي اسم المادة اللي عايزها "
-                    "(مثال: 'اشرح مادة تعلم الآلة')."
-                )
-
             return AgentOutput(
                 status="failed",
-                response=f"محتاج أعرف إيه المادة اللي عايز تعرف عنها عشان أجيب المحتوى.\n\n{suggestion}",
+                response="قولي اسم المادة أو اللائحة اللي عايز أقرأها.",
             )
 
         logger.info(
@@ -443,4 +483,38 @@ class MaterialExplanationModule:
                 "material_chars":   len(material_text),
                 "model_used":       model_id,
             },
+        )
+
+    async def _explain(
+        self,
+        material_text: str,
+        agent_input: AgentInput,
+        model_id: str,
+        role: str,
+        ctx: dict,
+    ) -> AgentOutput:
+        """Direct explanation from already-fetched material text."""
+        if role == "doctor":
+            system_prompt = _DOCTOR_SYSTEM_PROMPT
+        elif role == "admin":
+            system_prompt = _ADMIN_SYSTEM_PROMPT
+        else:
+            system_prompt = _STUDENT_SYSTEM_PROMPT
+
+        user_prompt = (
+            f"سؤال/طلب المستخدم: {agent_input.message}\n\n"
+            f"=== محتوى الملف/اللائحة ===\n{material_text[:6000]}\n=== نهاية المحتوى ===\n\n"
+            "بناءً على المحتوى أعلاه فقط، أجب على سؤال المستخدم بشكل واضح ومنظم."
+        )
+
+        explanation = await self.model_router.generate(
+            prompt=user_prompt,
+            system_instruction=system_prompt,
+            model_id=model_id,
+        )
+
+        return AgentOutput(
+            status="success",
+            response=explanation or "تعذّر إنشاء الشرح. حاول مرة أخرى.",
+            data={"module": "MaterialExplanationModule", "has_material": True},
         )
