@@ -99,6 +99,18 @@ class Agent:
                 context.user_id, list(prefs.keys()),
             )
 
+        # ── Stage 0.1: Restore last seen file URL into academic_context ──
+        file_ctx = await self._memory_store.get_file_context(context.user_id)
+        if file_ctx and file_ctx.get("file_url"):
+            # Inject into academic_context so FileExtractionModule can find it
+            if not context.academic_context.get("file_url"):
+                context.academic_context["file_url"]   = file_ctx["file_url"]
+                context.academic_context["file_name"]  = file_ctx.get("file_name", "")
+                logger.info(
+                    "[Agent] Restored last file URL for user_id=%s url=%s",
+                    context.user_id, file_ctx["file_url"][:60],
+                )
+
         # ── Stage 0.5: Clarification Disambiguation ───────────────────────
         clarification = await self._memory_store.get_clarification(context.user_id)
         plan = None
@@ -191,6 +203,17 @@ class Agent:
                 "entities":    entities,
             }
             await self._memory_store.save_conversation(context.user_id, memory_data)
+
+            # ── Extract and persist any file URL found in the response ───
+            result_text = str(context.result or "")
+            import re
+            urls_found = re.findall(r'https?://[^\s\)\]"\']+\.(?:pdf|xlsx|xls|docx|csv|png|jpg)', result_text, re.IGNORECASE)
+            if urls_found:
+                best_url = urls_found[0]
+                # extract filename from URL
+                fname = best_url.split("?")[0].split("/")[-1]
+                await self._memory_store.save_file_context(context.user_id, best_url, fname)
+                logger.info("[Agent] Saved file URL to memory for user_id=%s url=%s", context.user_id, best_url[:60])
 
             # Fire-and-forget: compress long conversations in the background
             if len(context.history) >= _SUMMARY_THRESHOLD:

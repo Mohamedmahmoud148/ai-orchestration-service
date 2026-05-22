@@ -223,6 +223,24 @@ class MemoryStore:
         merged = {**existing, **updates}
         await self.save_conversation(user_id, merged)
 
+    # ── Last seen file URL (persists across turns) ────────────────────────
+    _TTL_FILE_CTX = 1_800  # 30 minutes
+
+    async def save_file_context(self, user_id: str, file_url: str, file_name: str = "") -> None:
+        """Store the last file URL shown to the user so next turn can read it."""
+        if not user_id or not file_url:
+            return
+        await self._set(f"user:{user_id}:last_file", {
+            "file_url": file_url,
+            "file_name": file_name,
+        }, self._TTL_FILE_CTX)
+
+    async def get_file_context(self, user_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieve last file URL if user asks to read it."""
+        if not user_id:
+            return None
+        return await self._get(f"user:{user_id}:last_file")
+
     async def save_summary(self, user_id: str, summary: str) -> None:
         """
         Persist a compressed conversation summary with a 24-hour TTL.

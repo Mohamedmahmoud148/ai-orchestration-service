@@ -322,10 +322,18 @@ class FileExtractionModule:
         file_bytes: Optional[bytes]  = ctx.get("file_bytes")
         file_name: str               = ctx.get("file_name", "document.pdf")
         file_reference: Optional[str] = ctx.get("file_reference")
-        file_url: Optional[str]      = (
+
+        # Check academic_context too (restored from memory by Agent)
+        academic_ctx = ctx.get("academic_context", {}) or {}
+        file_url: Optional[str] = (
             ctx.get("file_url") or ctx.get("fileUrl")
             or ctx.get("signedUrl") or ctx.get("url")
+            or academic_ctx.get("file_url") or academic_ctx.get("fileUrl")
         )
+        if not file_name or file_name == "document.pdf":
+            file_name = (
+                ctx.get("file_name") or academic_ctx.get("file_name", "document.pdf")
+            )
 
         # ── 1. Get file bytes ─────────────────────────────────────────────────
 
