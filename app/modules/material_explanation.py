@@ -280,29 +280,19 @@ class MaterialExplanationModule:
                     for c in (enrolled[:5] if isinstance(enrolled, list) else [])
                 )
                 suggestion = (
-                    f"I can see you're enrolled in: {course_list}. "
-                    "Please specify which subject you'd like explained "
-                    "(e.g., 'Explain Data Structures')."
-                    "\n\n"
-                    f"يمكنني رؤية المواد المسجّلة لديك: {course_list}. "
-                    "يرجى تحديد المادة التي تريد شرحها "
-                    "(مثال: 'اشرح مادة هياكل البيانات')."
+                    f"شايف إنك مسجّل في: {course_list}.\n"
+                    "قولي إيه المادة اللي عايزها بالظبط "
+                    "(مثال: 'اشرح هياكل البيانات')."
                 )
             else:
                 suggestion = (
-                    "Please specify the subject name "
-                    "(e.g., 'Explain Machine Learning - Level 3')."
-                    "\n\n"
-                    "يرجى تحديد اسم المادة الدراسية "
-                    "(مثال: 'اشرح مادة تعلم الآلة - المستوى الثالث')."
+                    "قولي اسم المادة اللي عايزها "
+                    "(مثال: 'اشرح مادة تعلم الآلة')."
                 )
 
             return AgentOutput(
                 status="failed",
-                response=(
-                    "I need to know which subject you're asking about before I can "
-                    f"fetch the materials.\n\n{suggestion}"
-                ),
+                response=f"محتاج أعرف إيه المادة اللي عايز تعرف عنها عشان أجيب المحتوى.\n\n{suggestion}",
             )
 
         logger.info(
