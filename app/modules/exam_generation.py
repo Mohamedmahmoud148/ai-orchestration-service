@@ -237,6 +237,7 @@ class ExamGenerationModule:
             )
 
         # ── 5. Persist to backend via generate-ai endpoint ───────────────────
+        # Send pre-generated questions so .NET skips the redundant second AI call.
         exam_payload: Dict[str, Any] = {
             "subjectOfferingId": offering_id,
             "difficulty": difficulty,
@@ -245,6 +246,7 @@ class ExamGenerationModule:
             "topics": topics,
             "isRandomized": is_random,
             "questionsPerStudent": per_student,
+            "preGeneratedQuestions": questions_list,
         }
         logger.info(
             "ExamGenerationModule [POST] endpoint=/api/Exams/generate-ai "
