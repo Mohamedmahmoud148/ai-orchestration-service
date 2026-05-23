@@ -46,6 +46,7 @@ VALID_INTENTS = {
     "academic_advice",
     "material_explanation",
     "backend_api_query",
+    "material_qa",
 }
 
 
@@ -192,6 +193,27 @@ def _detect_backend_query(message: str) -> bool:
     return False
 
 
+# ── Deterministic material_qa keyword override ────────────────────────────────
+_MATERIAL_QA_KEYWORDS: frozenset[str] = frozenset({
+    # English
+    "explain from lecture", "from the material", "what does the lecture say",
+    "according to the course", "course material", "lecture notes",
+    "from the lecture", "from the book", "from the textbook",
+    "in the lecture", "in the material", "in the book",
+    # Arabic
+    "من المحاضرة", "من المادة", "اشرح من", "في الكتاب",
+    "في المحاضرة", "من الملزمة", "من الكتاب",
+})
+
+
+def _detect_material_qa(message: str) -> bool:
+    """Detect if the user is asking a question grounded in course material."""
+    msg = message.strip().lower()
+    for kw in _MATERIAL_QA_KEYWORDS:
+        if kw in msg:
+            return True
+    return False
+
 
 # ── Available backend tools (referenced in system prompt) ─────────────────────
 
@@ -241,6 +263,7 @@ Your job is to classify the user's request and return a structured JSON plan.
 - cv_analysis        — analyzing a student CV to extract skills and give recommendations
 - academic_advice    — personalized academic recommendations based on GPA and enrolled courses
 - material_explanation — explain or summarize real course material fetched from the backend
+- material_qa        — answer a student question grounded ONLY in indexed course material (RAG)
 - action_execute     — execute a write action in the system (enroll student, create entity, etc.)
 
 ## Output Schema (return ONLY this JSON, no markdown, no extra text)
@@ -588,6 +611,14 @@ class PlannerAgent(BaseAgent):
             )
             plan.intent = "backend_api_query"
             plan.goal_summary = "Query dynamic backend APIs to answer the user request."
+
+        if plan.intent == "general_chat" and _detect_material_qa(agent_input.message):
+            logger.warning(
+                "PlannerAgent [Layer-2 override]: Correcting general_chat to material_qa "
+                "for course-material-grounded question."
+            )
+            plan.intent = "material_qa"
+            plan.goal_summary = "Answer question grounded in indexed course material."
 
         # ── Deterministic guard: ensure ResolveSubjectOffering pre-step ───
         plan = self._ensure_resolve_step(plan)

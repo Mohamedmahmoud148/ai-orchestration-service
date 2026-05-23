@@ -23,3 +23,7 @@ Pillow>=10.0.0
 
 # Memory & Caching
 redis>=5.0.0
+
+# RAG pipeline
+chromadb>=0.4.0
+numpy>=1.26.0

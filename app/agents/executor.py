@@ -57,6 +57,7 @@ _MODULE_CLASS_MAP: Dict[str, tuple[str, str]] = {
     "dynamic_api_module": ("app.modules.dynamic_api",         "DynamicApiModule"),
     "backend_api_query":  ("app.modules.dynamic_api",         "DynamicApiModule"),
     "action_execute":     ("app.modules.dynamic_api",         "DynamicApiModule"),
+    "material_qa":        ("app.modules.material_qa",         "MaterialQAModule"),
 }
 
 # ── Tool allowlist ─────────────────────────────────────────────────────────────
@@ -196,6 +197,11 @@ _SUGGESTIONS_MAP: Dict[str, Dict[str, List[str]]] = {
         "student": ["Ask a question about this topic", "Get study tips", "View my grades"],
         "doctor":  ["Generate exam from this material", "Summarize for students", "View enrollments"],
         "admin":   ["View all materials", "Export material report", "Check upload status"],
+    },
+    "material_qa": {
+        "student": ["Ask another question about this topic", "Get study tips", "View my grades"],
+        "doctor":  ["Generate exam from this material", "Index course material", "View enrollments"],
+        "admin":   ["Index new material", "View RAG stats", "Check upload status"],
     },
 }
 

@@ -259,3 +259,107 @@ class MemoryStore:
             "MemoryStore: saved conversation summary for user_id=%s (%d chars)",
             user_id, len(summary),
         )
+
+    # ── Academic Profile Memory (Phase 5) ────────────────────────────────
+
+    # TTL: 30 days
+    _TTL_ACADEMIC_PROFILE = 2_592_000
+
+    async def save_academic_profile(self, user_id: str, profile: dict) -> None:
+        """
+        Persist student's academic profile for cross-session context.
+
+        Profile structure:
+          {
+            "weak_subjects":         [],   # list of subject names
+            "strong_subjects":       [],
+            "gpa":                   float | None,
+            "attendance_warnings":   [],   # subjects with low attendance
+            "last_recommendations":  [],   # recent advice strings
+          }
+        Stored with a 30-day TTL so it survives across sessions.
+        """
+        if not user_id:
+            return
+        await self._set(f"user:{user_id}:academic_profile", profile, self._TTL_ACADEMIC_PROFILE)
+        logger.info(
+            "MemoryStore: saved academic profile for user_id=%s gpa=%s",
+            user_id, profile.get("gpa"),
+        )
+
+    async def get_academic_profile(self, user_id: str) -> dict:
+        """
+        Retrieve the persistent academic profile for a user.
+
+        Returns an empty dict (never None) so callers never need a null check.
+        """
+        if not user_id:
+            return {}
+        data = await self._get(f"user:{user_id}:academic_profile")
+        return data if isinstance(data, dict) else {}
+
+    async def update_weak_subjects(self, user_id: str, subject: str) -> None:
+        """
+        Add a subject to the user's weak_subjects list (de-duplicated).
+        Resets the 30-day TTL on the whole profile.
+        """
+        if not user_id or not subject:
+            return
+        profile = await self.get_academic_profile(user_id)
+        weak = profile.get("weak_subjects", [])
+        if subject not in weak:
+            weak.append(subject)
+            profile["weak_subjects"] = weak
+            await self.save_academic_profile(user_id, profile)
+            logger.info(
+                "MemoryStore: added weak subject '%s' for user_id=%s",
+                subject, user_id,
+            )
+
+    async def get_personalized_context(self, user_id: str) -> str:
+        """
+        Build a plain-text personalized context string for LLM prompt injection.
+
+        Example output:
+            "Student profile: GPA 2.8, weak in Algorithms and OS,
+             attendance warning in Data Structures,
+             previously recommended: review chapter 3"
+
+        Returns empty string (never raises) so the Planner degrades gracefully.
+        """
+        if not user_id:
+            return ""
+        try:
+            profile = await self.get_academic_profile(user_id)
+            if not profile:
+                return ""
+
+            parts: list[str] = []
+
+            gpa = profile.get("gpa")
+            if gpa is not None:
+                parts.append(f"GPA {gpa:.2f}")
+
+            weak = profile.get("weak_subjects", [])
+            if weak:
+                parts.append(f"weak in {', '.join(weak[:5])}")
+
+            strong = profile.get("strong_subjects", [])
+            if strong:
+                parts.append(f"strong in {', '.join(strong[:5])}")
+
+            warnings = profile.get("attendance_warnings", [])
+            if warnings:
+                parts.append(f"attendance warning in {', '.join(warnings[:5])}")
+
+            recs = profile.get("last_recommendations", [])
+            if recs:
+                parts.append(f"previously recommended: {'; '.join(recs[:3])}")
+
+            return "Student profile: " + ", ".join(parts) if parts else ""
+        except Exception as exc:
+            logger.warning(
+                "MemoryStore.get_personalized_context failed for user_id=%s: %s",
+                user_id, exc,
+            )
+            return ""

@@ -37,6 +37,7 @@ Permission matrix
   material_explanation    ✅       ✅      ✅
   generate_exam           ❌       ✅      ✅
   backend_api_query       ✅       ✅      ✅
+  material_qa             ✅       ✅      ✅
 """
 from __future__ import annotations
 
@@ -62,6 +63,7 @@ _STUDENT_ALLOWED: FrozenSet[str] = frozenset({
     "material_explanation",
     "backend_api_query",
     "action_execute",     # Students can enroll, submit — JWT enforces data-level RBAC
+    "material_qa",
 })
 
 _DOCTOR_ALLOWED: FrozenSet[str] = frozenset({
@@ -76,6 +78,7 @@ _DOCTOR_ALLOWED: FrozenSet[str] = frozenset({
     "cv_analysis",
     "backend_api_query",
     "action_execute",     # Doctors can create exams, grade submissions
+    "material_qa",
 })
 
 # admin → _ALL (checked dynamically — no explicit list needed)
@@ -102,6 +105,7 @@ _INTENT_LABELS: dict[str, str] = {
     "generate_exam":        "Exam Generation",
     "backend_api_query":    "Data Query",
     "action_execute":       "System Action",
+    "material_qa":          "Course Material Q&A",
 }
 
 

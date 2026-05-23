@@ -99,6 +99,21 @@ class Agent:
                 context.user_id, list(prefs.keys()),
             )
 
+        # ── Stage 0.2: Load Academic Profile (Phase 5) ──────────────────
+        academic_profile = await self._memory_store.get_academic_profile(context.user_id)
+        if academic_profile:
+            context.add_metadata("academic_profile", academic_profile)
+
+        personalized_context = await self._memory_store.get_personalized_context(context.user_id)
+        if personalized_context:
+            context.add_metadata("personalized_context", personalized_context)
+            # Also inject into academic_context so modules can use it directly
+            context.academic_context["personalized_context"] = personalized_context
+            logger.info(
+                "[Agent] Loaded personalized context for user_id=%s context=%.80r",
+                context.user_id, personalized_context,
+            )
+
         # ── Stage 0.1: Restore last seen file URL into academic_context ──
         file_ctx = await self._memory_store.get_file_context(context.user_id)
         if file_ctx and file_ctx.get("file_url"):

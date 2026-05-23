@@ -19,7 +19,7 @@ from app.agents.executor import PlanExecutor
 from app.agents.model_router import ModelRouter
 from app.agents.planner import PlannerAgent
 
-from app.api.routes import chat, health, complaint_intelligence
+from app.api.routes import chat, health, complaint_intelligence, rag as rag_routes, memory as memory_routes, ai_grading
 from app.core.config import settings
 from app.core.logging import logger, setup_logging
 from app.core.middleware import CorrelationIDMiddleware, RequestTimingMiddleware
@@ -80,6 +80,7 @@ async def lifespan(app: FastAPI):
             "X-Title": "University AI Agent",
         },
     )
+    app.state.openrouter_client = openai_client
     logger.info("OpenRouter client initialised (base_url=https://openrouter.ai/api/v1).")
 
     # ── 3. Component assembly ─────────────────────────────────────────
@@ -112,6 +113,18 @@ async def lifespan(app: FastAPI):
     )
 
     logger.info("Agent ready — flow: User → Agent → Planner → Module → Response")
+
+    # ── 5. RAG services (EmbeddingService + VectorStore) ─────────────
+    from app.services.embedding_service import embedding_service
+    from app.services.vector_store import vector_store
+    app.state.embedding_service = embedding_service
+    app.state.vector_store = vector_store
+    logger.info(
+        "RAG services ready — embedding_fallback=%s, vector_store_available=%s.",
+        embedding_service._fallback_mode,
+        vector_store._available,
+    )
+
     yield
 
     # ── Shutdown ───────────────────────────────────────────────────────
@@ -167,6 +180,9 @@ app.add_middleware(CorrelationIDMiddleware)
 app.include_router(health.router)
 app.include_router(chat.router, prefix="/api")
 app.include_router(complaint_intelligence.router, prefix="/api")
+app.include_router(rag_routes.router)
+app.include_router(memory_routes.router)
+app.include_router(ai_grading.router)
 
 
 @app.get("/")
