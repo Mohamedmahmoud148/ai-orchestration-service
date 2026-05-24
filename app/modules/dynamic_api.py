@@ -60,7 +60,11 @@ STEP 1 — CONTEXT-FIRST CHECK (always do this first):
 If the answer is ALREADY in the academic_context, return: {{"endpoint": "", "method": "GET", "params": {{}}}}
 
 Already-known fields (no API call needed):
-  collegeName, departmentName, batchName, studentName, gpa
+  collegeName, departmentName, batchName, studentName, fullName, name, gpa
+
+⚡ IDENTITY SHORTCUT: If the user asks "من أنا", "اسمي ايه", "انا مين", "who am i", "my name"
+   AND academic_context contains fullName or studentName → return {{"endpoint": "", "method": "GET", "params": {{}}}}
+   The _answer_from_context handler will answer directly from context without any API call.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 STEP 2 — INTENT CLASSIFICATION:
@@ -90,10 +94,15 @@ ROUTING RULES BY CATEGORY:
 
 ── A. IDENTITY / MY PROFILE ──────────────────────
 Keywords: "انا مين", "اسمي", "معلوماتي", "بياناتي", "بروفايلي", "who am i", "my profile", "my name"
-- student → GET /api/Gpa/my-gpa  (best single-call profile summary)
-- doctor  → GET /api/SubjectOfferings/my-offerings
+
+⚡ FIRST: check academic_context for fullName/studentName. If present → return empty endpoint (context-only answer).
+
+If not in context, use:
+- ALL roles → GET /api/auth/me  (JWT-aware, returns name + role + email for ANY role)
+- student (extra detail) → GET /api/Students/me  (returns batchId, groupId, departmentId)
 - admin   → GET /api/Admins/{{profileId}}  ← use profileId from context, NOT userId
 
+⛔ NEVER use /api/SubjectOfferings/my-offerings for identity questions — that answers "what do I teach", not "who am I".
 ⛔ /api/Students/{{code}} and /api/Doctors/{{code}} use SHORT CODE strings, NEVER ULIDs.
 
 ── B. DOCTOR QUERIES ─────────────────────────────
