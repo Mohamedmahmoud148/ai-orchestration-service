@@ -21,6 +21,11 @@ _allowed_endpoints: Set[Tuple[str, str]] = set()
 # ── BLOCKED methods completely ────────────────────────────────────────────────
 _BLOCKED_METHODS = {"delete", "put", "patch"}
 
+# ── ALLOWED auth exceptions (override _BLOCKED_PREFIXES below) ───────────────
+_AUTH_WHITELIST = {
+    "/api/auth/me",       # GET — fetch current user profile (name, role, etc.)
+}
+
 # ── BLOCKED path prefixes (never exposed to AI regardless of method) ──────────
 _BLOCKED_PREFIXES = (
     "/api/auth",          # Authentication — AI never handles login/logout
@@ -81,6 +86,10 @@ def _is_allowed(path: str, method: str) -> bool:
     # Block destructive methods entirely
     if method in _BLOCKED_METHODS:
         return False
+
+    # Auth whitelist overrides blocked prefixes
+    if path_lower in _AUTH_WHITELIST:
+        return method == "get"
 
     # Block forbidden prefixes
     for prefix in _BLOCKED_PREFIXES:
