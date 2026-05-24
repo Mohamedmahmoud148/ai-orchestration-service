@@ -28,20 +28,33 @@ router = APIRouter()
 # ── Request / Response models ─────────────────────────────────────────────────
 
 class GenerateExamRequest(BaseModel):
+    # Accept both camelCase (from C# SnakeCaseLower serializer → question_count)
+    # and fallback aliases
     subject: str = "General"
     department: str = ""
     batch: str = ""
     difficulty: str = "Medium"
-    questionCount: int = 10
-    examType: str = "Final"
+    question_count: int = 10   # C# sends snake_case
+    exam_type: str = "Final"
     topics: List[str] = []
 
+    # camelCase aliases for forward compatibility
+    questionCount: Optional[int] = None
+    examType: Optional[str] = None
 
+    def resolved_count(self) -> int:
+        return self.questionCount if self.questionCount is not None else self.question_count
+
+    def resolved_type(self) -> str:
+        return self.examType if self.examType is not None else self.exam_type
+
+
+# Response uses snake_case to match C# AiService._jsonOptions (SnakeCaseLower)
 class ExamQuestionOut(BaseModel):
-    questionText: str
+    question_text: str
     options: Optional[List[str]] = None
-    correctAnswer: str
-    questionType: int = 0   # 0=MCQ, 1=TrueFalse, 2=Essay
+    correct_answer: str
+    question_type: int = 0   # 0=MCQ, 1=TrueFalse, 2=Essay
     mark: int = 5
 
 
@@ -68,12 +81,24 @@ def _build_prompt(req: GenerateExamRequest) -> str:
         context_parts.append(f"Topics: {', '.join(req.topics)}")
     context = "\n".join(context_parts)
 
+    count = req.resolved_count()
+    etype = req.resolved_type()
+
     return (
-        f"Generate {req.questionCount} {req.difficulty}-difficulty {req.examType} "
+        f"Generate {count} {req.difficulty}-difficulty {etype} "
         f"exam questions for the subject '{req.subject}'.\n"
         f"{context}\n\n"
         f"Return a valid JSON array only."
     )
+
+
+def _get(q: dict, *keys, default=""):
+    """Try multiple key names (camelCase + snake_case) and return first non-empty value."""
+    for k in keys:
+        v = q.get(k)
+        if v is not None and v != "":
+            return v
+    return default
 
 
 # ── Endpoint ──────────────────────────────────────────────────────────────────
@@ -112,19 +137,20 @@ async def generate_exam(req: GenerateExamRequest, request: Request) -> List[Exam
 
         result = []
         for q in questions:
-            text = (q.get("questionText") or q.get("question") or "").strip()
+            # Handle both camelCase and snake_case from different AI models
+            text    = str(_get(q, "questionText", "question_text", "question")).strip()
             if not text:
                 continue
-            q_type = int(q.get("questionType", 0))
+            q_type  = int(_get(q, "questionType", "question_type") or 0)
             options = q.get("options") if q_type == 0 else None
-            correct = (q.get("correctAnswer") or "").strip()
+            correct = str(_get(q, "correctAnswer", "correct_answer")).strip()
             mark    = max(1, min(int(q.get("mark", 5)), 100))
 
             result.append(ExamQuestionOut(
-                questionText=text,
+                question_text=text,
                 options=options,
-                correctAnswer=correct,
-                questionType=q_type,
+                correct_answer=correct,
+                question_type=q_type,
                 mark=mark,
             ))
 
