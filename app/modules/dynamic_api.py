@@ -753,19 +753,40 @@ class DynamicApiModule:
         self, message: str, academic_ctx: str, model_id: str
     ) -> AgentOutput:
         """Answer directly from academic_context when no API call is needed."""
+        import json as _json
+        # Fast-path: identity questions — extract name directly without LLM
+        _identity_kw = ("اسمي", "اسمك", "من أنا", "انا مين", "who am i", "my name", "اسم", "name")
+        msg_lower = message.lower()
+        if any(kw in msg_lower for kw in _identity_kw):
+            try:
+                ctx = _json.loads(academic_ctx) if isinstance(academic_ctx, str) else academic_ctx
+                name = (
+                    ctx.get("fullName") or ctx.get("studentName")
+                    or ctx.get("name") or ctx.get("doctorName")
+                )
+                if name:
+                    return AgentOutput(
+                        status="success",
+                        response=f"اسمك هو **{name}** 😊",
+                        data={"source": "academic_context"},
+                    )
+            except Exception:
+                pass
+
         messages = [
             {
                 "role": "system",
                 "content": (
                     "You are a helpful university AI assistant. "
-                    "Answer the student's question using ONLY the academic context provided. "
-                    "Be warm, concise, and natural. Match the student's language (Arabic/English). "
-                    "NEVER invent data not present in the context."
+                    "The academic context below contains the user's real profile data — treat it as ground truth. "
+                    "Answer the user's question using this context. Be warm, concise, and natural. "
+                    "Match the user's language (Arabic/English). "
+                    "If the answer is clearly present in the context, state it directly without hesitation."
                 ),
             },
             {
                 "role": "user",
-                "content": f"Student question: {message}\n\nAcademic context: {academic_ctx}",
+                "content": f"User question: {message}\n\nAcademic context: {academic_ctx}",
             },
         ]
         answer = await self.model_router.generate_with_messages(messages=messages, model_id=model_id)
