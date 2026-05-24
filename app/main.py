@@ -19,7 +19,7 @@ from app.agents.executor import PlanExecutor
 from app.agents.model_router import ModelRouter
 from app.agents.planner import PlannerAgent
 
-from app.api.routes import chat, health, complaint_intelligence, rag as rag_routes, memory as memory_routes, ai_grading
+from app.api.routes import chat, health, complaint_intelligence, rag as rag_routes, memory as memory_routes, ai_grading, exam_generation_api
 from app.core.config import settings
 from app.core.logging import logger, setup_logging
 from app.core.middleware import CorrelationIDMiddleware, RequestTimingMiddleware
@@ -183,6 +183,7 @@ app.include_router(complaint_intelligence.router, prefix="/api")
 app.include_router(rag_routes.router)
 app.include_router(memory_routes.router)
 app.include_router(ai_grading.router)
+app.include_router(exam_generation_api.router)
 
 
 @app.get("/")
