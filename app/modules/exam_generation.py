@@ -24,8 +24,20 @@ import io
 import json
 from typing import Any, Dict, List, Optional
 
+import httpx
+
 from app.agents.schemas import AgentInput, AgentOutput
 from app.core.logging import logger
+
+
+async def _download_pdf(url: str, auth_header: Optional[str] = None) -> bytes:
+    headers = {}
+    if auth_header:
+        headers["Authorization"] = auth_header
+    async with httpx.AsyncClient(timeout=30.0, verify=False) as client:
+        r = await client.get(url, headers=headers)
+        r.raise_for_status()
+        return r.content
 
 _BACKEND_UNAVAILABLE_MSG = (
     "The backend service is currently unavailable. Please try again later."
@@ -158,27 +170,64 @@ class ExamGenerationModule:
 
         # ── 2. Fetch course material ──────────────────────────────────────────
         material_text = ""
-        logger.info(
-            "ExamGenerationModule [GET] endpoint=/api/Materials/by-offering/%s",
-            offering_id,
+
+        # 2a. Check if a PDF was sent directly in context (file_url / fileUrl)
+        ctx = agent_input.context or {}
+        ac = ctx.get("academic_context", {}) or {}
+        direct_file_url = (
+            ctx.get("file_url") or ctx.get("fileUrl")
+            or ac.get("file_url") or ac.get("fileUrl")
         )
-        try:
-            result = await self.backend_client.fetch(
-                route=f"/api/Materials/by-offering/{offering_id}",
-                auth_header=agent_input.auth_header,
+        if direct_file_url and direct_file_url.startswith("http"):
+            logger.info("ExamGenerationModule: using direct PDF from context url=%s", direct_file_url[:80])
+            try:
+                pdf_bytes = await _download_pdf(direct_file_url, agent_input.auth_header)
+                material_text = _pdf_to_text(pdf_bytes)
+                logger.info("ExamGenerationModule: extracted %d chars from context PDF", len(material_text))
+            except Exception as pdf_exc:
+                logger.warning("ExamGenerationModule: context PDF download failed — %s", pdf_exc)
+
+        # 2b. Fetch from offering if no direct PDF
+        if not material_text:
+            logger.info(
+                "ExamGenerationModule [GET] endpoint=/api/Materials/by-offering/%s",
+                offering_id,
             )
-            if "error" not in result:
-                if "_raw_bytes" in result:
-                    material_text = _pdf_to_text(result["_raw_bytes"])
-                else:
-                    material_text = str(
-                        result.get("content") or result.get("text") or ""
-                    )
-        except Exception as material_exc:
-            logger.warning(
-                "ExamGenerationModule: material fetch failed (non-fatal) — %s",
-                material_exc,
-            )
+            try:
+                result = await self.backend_client.fetch(
+                    route=f"/api/Materials/by-offering/{offering_id}",
+                    auth_header=agent_input.auth_header,
+                )
+                if "error" not in result:
+                    if "_raw_bytes" in result:
+                        material_text = _pdf_to_text(result["_raw_bytes"])
+                    else:
+                        # Try direct text fields first
+                        material_text = str(result.get("content") or result.get("text") or "")
+
+                    # Follow fileUrl / signedUrl to the actual PDF if text is empty
+                    if not material_text.strip():
+                        items = result if isinstance(result, list) else result.get("data", [result])
+                        for item in (items if isinstance(items, list) else [items]):
+                            mat_url = (
+                                item.get("fileUrl") or item.get("signedUrl")
+                                or item.get("filePath") or item.get("url") or ""
+                            )
+                            if mat_url and mat_url.startswith("http"):
+                                logger.info("ExamGenerationModule: fetching PDF from fileUrl=%s", mat_url[:80])
+                                try:
+                                    pdf_bytes = await _download_pdf(mat_url, agent_input.auth_header)
+                                    material_text = _pdf_to_text(pdf_bytes)
+                                    logger.info("ExamGenerationModule: extracted %d chars from material PDF", len(material_text))
+                                    if material_text.strip():
+                                        break
+                                except Exception as dl_exc:
+                                    logger.warning("ExamGenerationModule: material PDF download failed — %s", dl_exc)
+            except Exception as material_exc:
+                logger.warning(
+                    "ExamGenerationModule: material fetch failed (non-fatal) — %s",
+                    material_exc,
+                )
 
         if not material_text:
             material_text = (
