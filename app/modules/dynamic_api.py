@@ -63,8 +63,9 @@ Already-known fields (no API call needed):
   collegeName, departmentName, batchName, studentName, fullName, name, gpa
 
 ⚡ IDENTITY SHORTCUT: If the user asks "من أنا", "اسمي ايه", "انا مين", "who am i", "my name"
-   AND academic_context contains fullName or studentName → return {{"endpoint": "", "method": "GET", "params": {{}}}}
-   The _answer_from_context handler will answer directly from context without any API call.
+   → Check academic_context FIRST:
+     • IF fullName OR studentName OR name is present in academic_context → return {{"endpoint": "", "method": "GET", "params": {{}}}}
+     • IF NOT present → do NOT return empty endpoint. Proceed to routing rules below and use GET /api/auth/me
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 STEP 2 — INTENT CLASSIFICATION:
