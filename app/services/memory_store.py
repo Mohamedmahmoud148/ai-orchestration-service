@@ -26,43 +26,61 @@ class MemoryStore:
     _TTL_SUMMARY       = 86_400       # 24 hours
 
     def __init__(self):
-        url = settings.REDIS_URL.strip() if settings.REDIS_URL else None
-        if url:
-            url = url.strip('"').strip("'")
-
-        self.redis_url = url
         self.redis_client = None
-        self._disabled = False  # set True permanently after auth failure
+        self._disabled = False
+        self.redis_url = self._resolve_url()
 
-        if self.redis_url and self.redis_url.startswith(("redis://", "rediss://", "unix://")):
+        if self.redis_url:
             self.pool = redis.ConnectionPool.from_url(
                 self.redis_url, decode_responses=True
             )
             self.redis_client = redis.Redis(connection_pool=self.pool)
         else:
             self._disabled = True
-            logger.warning(
-                "REDIS_URL not configured or missing scheme ('%s'). "
-                "MemoryStore will act as a no-op.",
-                self.redis_url,
-            )
+            logger.warning("MemoryStore: no valid Redis URL found — running as no-op.")
+
+    def _resolve_url(self) -> str | None:
+        """
+        Build Redis URL from whatever Railway provides.
+        Priority:
+          1. REDIS_URL (internal private network — fastest)
+          2. REDIS_PUBLIC_URL (external proxy — works across projects)
+          3. Build from REDISHOST + REDISPORT + REDISUSER + REDISPASSWORD
+        """
+        def clean(u: str) -> str | None:
+            u = u.strip().strip('"').strip("'")
+            return u if u.startswith(("redis://", "rediss://")) else None
+
+        if settings.REDIS_URL:
+            url = clean(settings.REDIS_URL)
+            if url:
+                logger.info("MemoryStore: using REDIS_URL (internal)")
+                return url
+
+        if settings.REDIS_PUBLIC_URL:
+            url = clean(settings.REDIS_PUBLIC_URL)
+            if url:
+                logger.info("MemoryStore: using REDIS_PUBLIC_URL (public proxy)")
+                return url
+
+        if settings.REDISHOST and settings.REDISPASSWORD:
+            user = settings.REDISUSER or "default"
+            url = f"redis://{user}:{settings.REDISPASSWORD}@{settings.REDISHOST}:{settings.REDISPORT}"
+            logger.info("MemoryStore: built URL from REDISHOST/REDISPASSWORD")
+            return url
+
+        return None
 
     async def ping(self) -> bool:
-        """
-        Test Redis connectivity at startup. If auth fails, permanently disable
-        Redis so no per-request errors are logged.
-        """
+        """Test Redis at startup — disable permanently if unreachable so no per-request errors."""
         if not self.redis_client or self._disabled:
             return False
         try:
             await self.redis_client.ping()
-            logger.info("MemoryStore: Redis connection OK (%s)", self.redis_url.split("@")[-1] if self.redis_url else "")
+            logger.info("MemoryStore: Redis OK — %s", (self.redis_url or "").split("@")[-1])
             return True
         except Exception as exc:
-            logger.warning(
-                "MemoryStore: Redis unreachable (%s) — disabling permanently, running as no-op.",
-                exc,
-            )
+            logger.warning("MemoryStore: Redis failed (%s) — disabling, running as no-op.", exc)
             self.redis_client = None
             self._disabled = True
             return False

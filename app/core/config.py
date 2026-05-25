@@ -19,8 +19,13 @@ class Settings(BaseSettings):
     # Backend Config — REQUIRED.  The service cannot operate without this.
     BACKEND_BASE_URL: str = ""
 
-    # Redis Config
+    # Redis Config — primary URL or individual parts (Railway exposes both)
     REDIS_URL: str = ""
+    REDIS_PUBLIC_URL: str = ""   # Railway public proxy URL (fallback)
+    REDISHOST: str = ""
+    REDISPORT: int = 6379
+    REDISUSER: str = "default"
+    REDISPASSWORD: str = ""
 
     # Rate limiting — requests per minute per user_id (0 = disabled)
     RATE_LIMIT_RPM: int = 30
