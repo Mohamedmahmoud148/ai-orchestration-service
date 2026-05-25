@@ -108,6 +108,11 @@ class ExamGenerationModule:
                             params={"subject": subject_name},
                         )
 
+                        # ASP.NET returns { count, note, offerings: [...] }
+                        # Normalise to a plain list before processing.
+                        if isinstance(res, dict) and "offerings" in res:
+                            res = res["offerings"]
+
                         if isinstance(res, list) and len(res) > 1:
                             logger.info(
                                 "ExamGenerationModule: resolve-offering returned %d results "
@@ -135,10 +140,10 @@ class ExamGenerationModule:
                         else:
                             offering_id = (
                                 res.get("subjectOfferingId")
-                                if res and "error" not in res
+                                if res and isinstance(res, dict) and "error" not in res
                                 else None
                             )
-                            subject = res.get("subjectName", subject) if res else subject
+                            subject = res.get("subjectName", subject) if isinstance(res, dict) else subject
                         logger.info(
                             "ExamGenerationModule: resolved subjectOfferingId=%s",
                             offering_id,

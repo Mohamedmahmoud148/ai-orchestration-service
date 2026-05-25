@@ -111,6 +111,50 @@ class ModelRouter:
         )
         return response.choices[0].message.content
 
+    async def stream_with_messages(
+        self,
+        messages: List[dict],
+        model_id: str = "openai/gpt-4o-mini",
+    ):
+        """
+        Stream tokens from OpenRouter as an async generator yielding text chunks.
+
+        Falls back to the configured fallback chain on failure. Used by the SSE
+        chat endpoint so the user sees the response materialise live.
+        """
+        if not self.openai_client:
+            yield ""
+            return
+
+        models_to_try = [model_id]
+        if self._fallback_1 and self._fallback_1 != model_id:
+            models_to_try.append(self._fallback_1)
+        if self._fallback_2 and self._fallback_2 not in models_to_try:
+            models_to_try.append(self._fallback_2)
+
+        last_exc: Optional[Exception] = None
+        for mdl in models_to_try:
+            try:
+                stream = await self.openai_client.chat.completions.create(
+                    model=mdl,
+                    messages=messages,
+                    stream=True,
+                )
+                async for chunk in stream:
+                    try:
+                        delta = chunk.choices[0].delta.content
+                    except (AttributeError, IndexError):
+                        delta = None
+                    if delta:
+                        yield delta
+                return
+            except Exception as exc:
+                last_exc = exc
+                logger.warning("ModelRouter.stream: %s failed (%s) — trying next", mdl, exc)
+                continue
+
+        logger.error("ModelRouter.stream: all models exhausted — %s", last_exc)
+
     # ─────────────────────────────────────────────────────────────────────────
     #  Public: generate_structured_json
     # ─────────────────────────────────────────────────────────────────────────

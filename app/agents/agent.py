@@ -88,7 +88,9 @@ class Agent:
         pipeline_start = time.perf_counter()
 
         # ── Stage 0: Load Memory + User Preferences ─────────────────────
-        memory = await self._memory_store.get_conversation(context.user_id)
+        # Use composite key so different conversations don't share memory.
+        memory_key = f"{context.user_id}:{context.conversation_id}" if context.conversation_id else context.user_id
+        memory = await self._memory_store.get_conversation(memory_key)
         prefs  = await self._memory_store.get_preferences(context.user_id)
         if memory:
             context.add_metadata("memory", memory)
@@ -217,7 +219,7 @@ class Agent:
                 "last_result": context.result,
                 "entities":    entities,
             }
-            await self._memory_store.save_conversation(context.user_id, memory_data)
+            await self._memory_store.save_conversation(memory_key, memory_data)
 
             # ── Extract and persist any file URL found in the response ───
             result_text = str(context.result or "")
@@ -313,17 +315,15 @@ class Agent:
         role   = context.role   or "student"
 
         if intent == "summarization":
-            # Route to local HuggingFace BART — free, no API cost
             model = "hf/facebook/bart-large-cnn"
-        elif intent == "generate_exam" and role in ("doctor", "admin"):
+        elif intent == "generate_exam" and role in ("doctor", "admin", "superadmin"):
             model = "openai/gpt-4o"
-        elif intent == "material_explanation" and role == "doctor":
-            # Doctors need high-quality summaries for academic use
+        elif intent in ("material_explanation", "material_qa", "file_extraction"):
+            # Deep explanation tasks need full GPT-4o for all roles
             model = "openai/gpt-4o"
-        elif intent == "file_processing" and role == "admin":
-            # Bulk data operations benefit from stronger reasoning
+        elif intent == "file_processing" and role in ("admin", "superadmin"):
             model = "openai/gpt-4o"
-        elif role == "admin":
+        elif role in ("admin", "superadmin"):
             model = "openai/gpt-4o"
         else:
             model = "openai/gpt-4o-mini"

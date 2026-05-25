@@ -498,6 +498,68 @@ class DynamicApiModule:
         auth_header    = ctx.get("auth_header")
         schema_text    = get_allowed_endpoints_schema()
 
+        # ── Confirmation flow for pending write actions ──────────────────
+        # If a write action is already queued from a previous turn and the
+        # user has now confirmed (or denied) it, resolve that first instead
+        # of re-routing.
+        from app.services.memory_store import MemoryStore
+        _memory = MemoryStore()
+        pending = await _memory.get_pending_action(input_context.user_id)
+        if pending:
+            msg_lower = message.strip().lower()
+            confirm_words = (
+                "نعم", "اه", "أه", "ايوه", "أيوه", "تمام", "اوكي", "أوكي", "موافق",
+                "اعمل", "اعملها", "نفذ", "نفذها", "اكد", "أكد",
+                "yes", "ok", "okay", "confirm", "go", "do it", "proceed", "y",
+            )
+            deny_words = (
+                "لا", "لأ", "كنسل", "الغي", "ألغ", "إلغاء", "متعملش", "بطل",
+                "no", "cancel", "stop", "abort", "n",
+            )
+            if any(w in msg_lower for w in deny_words):
+                await _memory.delete_pending_action(input_context.user_id)
+                return AgentOutput(
+                    status="success",
+                    response="تمام، تم إلغاء العملية. مفيش حاجة تنفذت. 👍",
+                )
+            if any(w in msg_lower for w in confirm_words) and len(msg_lower) < 60:
+                # Execute the saved action immediately
+                endpoint = pending.get("endpoint", "")
+                method   = pending.get("method", "POST").upper()
+                params   = pending.get("params", {}) or {}
+                logger.info(
+                    "DynamicApiModule: executing confirmed pending action %s %s",
+                    method, endpoint,
+                )
+                await _memory.delete_pending_action(input_context.user_id)
+                try:
+                    raw_data = await self.backend_client.post(
+                        route=endpoint, payload=params, auth_header=auth_header
+                    )
+                except Exception as exc:
+                    logger.error("DynamicApiModule: confirmed action failed — %s", exc)
+                    return AgentOutput(
+                        status="failed",
+                        response="حصلت مشكلة وانا بنفذ العملية. حاول تاني.",
+                    )
+                narrative, suggestions, _ = await self._summarize(
+                    message=pending.get("summary", "تنفيذ العملية المؤكدة"),
+                    method=method, endpoint=endpoint,
+                    role=role, academic_ctx=academic_ctx,
+                    raw_data=raw_data, model_id=selected_model,
+                )
+                return AgentOutput(
+                    status="success",
+                    response=f"✅ {narrative}",
+                    data={
+                        "endpoint_called": endpoint,
+                        "method_called":   method,
+                        "raw_backend_data": raw_data,
+                        "suggestions":      suggestions,
+                        "actions_available": suggestions,
+                    },
+                )
+
         failed_attempts: list[dict] = []   # [{endpoint, method, reason}]
         last_raw_data  = None
         winning_endpoint = ""
@@ -552,6 +614,36 @@ class DynamicApiModule:
             if method == "GET":
                 clean_params.setdefault("page", 1)
                 clean_params.setdefault("size", 10)
+
+            # 5.5 Confirmation gate for write actions ────────────────────
+            # Before executing any POST (write), show the user what we're
+            # about to do and wait for confirmation. Prevents accidental
+            # enrollments / submissions and gives the AI agency without risk.
+            if method == "POST":
+                preview_lines = [self._action_preview(endpoint, clean_params)]
+                pending_data = {
+                    "endpoint": endpoint,
+                    "method":   method,
+                    "params":   clean_params,
+                    "summary":  preview_lines[0],
+                }
+                await _memory.save_pending_action(input_context.user_id, pending_data)
+                logger.info(
+                    "DynamicApiModule: queued pending action %s %s — awaiting user confirmation",
+                    method, endpoint,
+                )
+                return AgentOutput(
+                    status="success",
+                    response=(
+                        f"⚠️ قبل ما أنفذ العملية، اتأكد:\n\n"
+                        f"{preview_lines[0]}\n\n"
+                        f"تحب أنفذها؟ ردّ بـ **نعم** للتأكيد أو **لا** للإلغاء."
+                    ),
+                    data={
+                        "pending_action":    pending_data,
+                        "requires_confirmation": True,
+                    },
+                )
 
             # 6. Execute backend call ──────────────────────────────────────
             logger.info("DynamicApiModule: executing %s %s params=%s", method, endpoint, clean_params)
@@ -807,6 +899,36 @@ class DynamicApiModule:
             response=answer or "معلوماتك موجودة في الـ profile بتاعك.",
             data={"source": "academic_context"},
         )
+
+    @staticmethod
+    def _action_preview(endpoint: str, params: dict) -> str:
+        """
+        Build a short, human-readable preview of a write action so the user
+        knows exactly what's about to happen before they confirm.
+        """
+        ep = endpoint.lower()
+        if "auto-enroll" in ep:
+            return "🎓 سأقوم بتسجيلك تلقائياً في مواد الترم الجاي حسب اللائحة الأكاديمية."
+        if "enrollments" in ep:
+            sid = params.get("studentId") or params.get("userId") or ""
+            oid = params.get("subjectOfferingId") or params.get("offeringId") or ""
+            return f"📝 تسجيل في المادة (offering={oid}) للطالب {sid}."
+        if "create-complaint" in ep or "complaint" in ep:
+            tgt = params.get("targetType") or params.get("target") or ""
+            return f"📨 تقديم شكوى ({tgt}) باسمك للجهة المختصة."
+        if "bulk-create-students" in ep:
+            return "👥 رفع دفعة طلاب جديدة (bulk insert)."
+        if "bulk-upload-grades" in ep:
+            return "📊 رفع درجات للطلاب بالجملة."
+        if "attendance/check-in" in ep:
+            return "✅ تسجيل حضور للجلسة الحالية."
+        if "grades/calculate" in ep:
+            return "🧮 إعادة حساب الـ GPA / الدرجات للطالب."
+        if "materials/upload" in ep or "file/upload" in ep:
+            return "📤 رفع ملف للمواد التعليمية."
+        # Fallback: show endpoint + key params
+        keys = ", ".join(f"{k}={v}" for k, v in list(params.items())[:5] if v)
+        return f"⚙️ تنفيذ POST على `{endpoint}` بالـ params: {keys or 'مفيش'}"
 
     async def _summarize(
         self,

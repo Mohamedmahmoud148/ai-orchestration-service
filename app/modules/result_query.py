@@ -55,19 +55,10 @@ class ResultQueryModule:
                 result_data = result
         else:
             # No exam ID: fall back to a general results query
-            result = await self.backend_client.execute_tool(
-                route="/api/ai/execute/query-results",
-                parameters={
-                    "userId":  student_id,
-                    "query":   agent_input.message,
-                    **{
-                        k: context[k]
-                        for k in ("subjectId", "semesterId", "batchId")
-                        if k in context
-                    },
-                },
+            result = await self.backend_client.fetch(
+                route="/api/Gpa/my-gpa",
                 auth_header=agent_input.auth_header,
-                user_id=student_id,
+                params={},
             )
             if result and "error" not in result:
                 result_data = result

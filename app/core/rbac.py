@@ -85,9 +85,10 @@ _DOCTOR_ALLOWED: FrozenSet[str] = frozenset({
 
 # ── Permission map ─────────────────────────────────────────────────────────────
 ROLE_PERMISSIONS: dict[str, Union[FrozenSet[str], str]] = {
-    "student": _STUDENT_ALLOWED,
-    "doctor":  _DOCTOR_ALLOWED,
-    "admin":   _ALL,
+    "student":    _STUDENT_ALLOWED,
+    "doctor":     _DOCTOR_ALLOWED,
+    "admin":      _ALL,
+    "superadmin": _ALL,   # C# sends "superadmin" (ToLower of "SuperAdmin")
 }
 
 # ── Human-readable intent labels for error messages ────────────────────────────

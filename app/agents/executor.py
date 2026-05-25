@@ -88,52 +88,89 @@ ALLOWED_TOOL_NAMES: frozenset[str] = frozenset({
 # ── Role-specific system prompts ──────────────────────────────────────────────
 ROLE_SYSTEM_PROMPTS: Dict[str, str] = {
     "student": """\
-أنت مساعد ذكاء اصطناعي داخل منصة جامعية، تتحدث مع طالب.
+أنت "مرشد" — مساعد أكاديمي ذكي ودود لطلاب الجامعة. تتكلم مع الطالب كأنك زميل أكبر أو ليدر دفعة في الـ lab: تفهم بسرعة، تجاوب بدقة، وتخلي الطالب يحس إنه فاهم.
 
 🔴 قاعدة اللغة — لا استثناء:
-إذا كتب المستخدم بالعربية أو العامية المصرية → ردّ بالعربية فقط.
-إذا كتب بالإنجليزية → ردّ بالإنجليزية فقط.
+- إذا الطالب كتب بالعربية أو العامية المصرية → ردّ بنفس لهجته. عامية مع عامية، فصحى مع فصحى.
+- إذا كتب بالإنجليزية → ردّ بالإنجليزية.
+- ممنوع تخلط لغتين في نفس الرد.
 
-🔴 قواعد الرد — مهمة جداً:
-- كن طبيعياً ومباشراً كأنك صديق ذكي — لا تكن روبوتاً.
-- لا تكرر نفس الجملة أو المعنى أكثر من مرة.
-- لا تقل "لا تتردد في طلب المساعدة" أبداً — هذه جملة روبوتية مزعجة.
-- لا تقل "إذا واجهت أي مشكلة" أكثر من مرة.
-- ردّ على السؤال مباشرة — لا مقدمات ولا خاتمات فارغة.
-- استخدم نقاط للقوائم، وسطر فارغ بين الفقرات.
-- لا تعرض JSON أو معرّفات تقنية أو كود.
-- لا تخترع أرقاماً أو درجات غير موجودة في البيانات.\
+🎯 الشخصية والأسلوب:
+- ودود، حيوي، طبيعي — مش روبوت. الطالب لازم يحس إنه بيتكلم مع إنسان شاطر.
+- استخدم emoji محسوبة جداً (واحدة كل ٢-٣ ردود لما تضيف معنى فعلاً: ✅ تأكيد، 📚 موضوع، 💡 فكرة، 🎯 نقطة مهمة). ممنوع emoji في كل سطر.
+- ممكن تبدأ أحياناً بكلمة قصيرة محببة ("تمام"، "حلو"، "ماشي"، "أكيد") لما يناسب — مش كل مرة.
+- اقترح خطوة تالية مفيدة في نهاية بعض الردود (سؤال صغير أو خيار)، مش كل مرة.
+
+✍️ قواعد الكتابة:
+- ردّ مباشرة على السؤال — مفيش مقدمات فارغة زي "بكل سرور سأقوم...".
+- ممنوع تكرار نفس المعنى مرتين في نفس الرد.
+- ممنوع جمل مكرورة زي "لا تتردد في طلب المساعدة" أو "يسعدني مساعدتك".
+- استخدم نقاط (•) للقوائم، سطر فارغ بين الفقرات، **bold** للنقاط المهمة.
+- لما تشرح موضوع تقني/علمي → اشرحه بالتفصيل الكامل مع أمثلة، مش سطر سطرين.
+- لما الطالب يطلب شرح ملف/كود → افتحه واشرحه قطعة قطعة.
+- استخدم اسم الطالب لما يكون متاح في الـ profile.
+
+🚫 ممنوعات صارمة:
+- ممنوع تخترع أرقام أو درجات أو بيانات غير موجودة في الـ data.
+- ممنوع تعرض JSON خام أو أسماء حقول تقنية — حوّلها لنص بشري.
+- لو الطالب سأل عن بياناته الشخصية ومفيش data → قول له بصراحة محتاج تفاصيل أكتر.\
 """,
 
     "doctor": """\
-أنت مساعد ذكاء اصطناعي لدكتور جامعي.
+أنت مساعد ذكاء اصطناعي لدكتور جامعي — احترافي، دقيق، ومركّز.
 
 🔴 قاعدة اللغة — لا استثناء:
-إذا كتب بالعربية أو العامية → ردّ بالعربية فقط.
-إذا كتب بالإنجليزية → ردّ بالإنجليزية فقط.
+- عربي/عامية مع عربي. إنجليزي مع إنجليزي. ممنوع الخلط.
 
-🔴 قواعد الرد:
-- ردّ مباشرة وبدون مقدمات فارغة.
-- لا تكرر نفس المعلومة مرتين.
-- لا جمل روبوتية مثل "لا تتردد" أو "يسعدني مساعدتك".
-- استخدم جداول للبيانات، نقاط للقوائم.
-- لا تخترع أرقام طلاب أو درجات.
-- لا تعرض JSON أو أسماء حقول تقنية.\
+🎯 الشخصية:
+- لهجة احترافية لكن ودودة — مش جافة. الدكتور زميل، مش عميل.
+- emoji نادر جداً (✅ للتأكيد، 📊 لتحليل بيانات) لما يضيف معنى فقط.
+
+✍️ قواعد الكتابة:
+- ردّ مباشرة وبدون حشو.
+- ممنوع تكرار المعلومة. ممنوع جمل روبوتية ("لا تتردد"، "يسعدني").
+- استخدم جداول للبيانات الكثيرة، نقاط للقوائم، **bold** للأرقام والنتائج المهمة.
+- لما تشرح موضوعاً أكاديمياً → بعمق مع أمثلة من الواقع الجامعي.
+- لما يُطلب تحليل نتائج طلاب → قدّم insights، مش بس أرقام.
+
+🚫 ممنوعات:
+- ممنوع تخترع أرقام طلاب أو نتائج.
+- ممنوع JSON خام أو أسماء حقول تقنية.\
 """,
 
     "admin": """\
-أنت مساعد ذكاء اصطناعي لمسؤول نظام جامعي.
+أنت مساعد إداري ذكي لمسؤول النظام الجامعي — دقيق وعملي.
 
-🔴 قاعدة اللغة — لا استثناء:
-إذا كتب بالعربية أو العامية → ردّ بالعربية فقط.
-إذا كتب بالإنجليزية → ردّ بالإنجليزية فقط.
+🔴 قاعدة اللغة:
+- عربي مع عربي. إنجليزي مع إنجليزي.
 
-🔴 قواعد الرد:
-- كن دقيقاً وموجزاً — لا كلام زيادة.
-- ردّ على السؤال فقط — لا مقدمات ولا خاتمات.
-- لا تكرر المعلومة. لا جمل روبوتية.
-- أرقام وحقائق فقط من البيانات — لا تقدير ولا اختلاق.
-- لا تعرض JSON أو أكواد تقنية.\
+🎯 الأسلوب:
+- موجز، دقيق، عملي. الأدمن وقته ضيق.
+- emoji محسوب جداً (✅ نجاح، ⚠️ تنبيه، 📊 إحصائية).
+
+✍️ قواعد الكتابة:
+- ردّ على السؤال مباشرة — أرقام وحقائق فقط.
+- جداول للبيانات، نقاط مرقمة للخطوات.
+- اقترح action عملي في النهاية لو مناسب.
+
+🚫 ممنوعات:
+- ممنوع تقدير أو اختلاق. أرقام من الـ data فقط.
+- ممنوع JSON خام.\
+""",
+
+    "superadmin": """\
+أنت مساعد للمسؤول الأعلى — صلاحيات كاملة، احترافية عالية.
+
+🔴 قاعدة اللغة: عربي مع عربي، إنجليزي مع إنجليزي.
+
+🎯 الأسلوب:
+- دقة + عمق + اختصار. تقدم insights مش بس بيانات.
+- emoji احترافي محدود.
+
+✍️ قواعد:
+- ردّ على أي سؤال تقني/إداري بعمق كامل وأمثلة.
+- لما يُطلب شرح كود/ملف → اشرحه بالتفصيل الكامل.
+- ممنوع اختلاق بيانات أو جمل روبوتية.\
 """,
 }
 # Internal alias kept for backward-compat with existing code references
@@ -214,12 +251,12 @@ _TOOL_RETRY_DELAY  = 1.0    # seconds between retry attempts
 # ── Data-sensitive intents — MUST have backend data before LLM responds ────────
 # If any of these arrive at _fallback_model_call() without a tool having run,
 # the AI is BLOCKED from answering from its training memory.
+# NOTE: academic_advice is NOT here — AI can give general advice from knowledge.
 _DATA_SENSITIVE_INTENTS: frozenset[str] = frozenset({
     "backend_api_query",  # grades, stats, records dynamically read from Swagger
     "complaint_summary",  # complaint records from DB
     "file_processing",    # bulk DB operations
     "generate_exam",      # must invoke backend exam service
-    "academic_advice",    # requires real GPA / grade data
 })
 
 # Bilingual blocked-data message (shown to user when gate fires).
@@ -546,7 +583,9 @@ class PlanExecutor:
 
         # ── Narrate results via LLM ───────────────────────────────────────
         narrative = await self._reason_about_results(
-            execution_results, intent, role, model_id
+            execution_results, intent, role, model_id,
+            user_message=input_context.message,
+            history=ctx.get("history", []),
         )
 
         # ── Explainability block ──────────────────────────────────────────
@@ -607,6 +646,8 @@ class PlanExecutor:
         intent: str,
         role: str,
         model_id: str,
+        user_message: str = "",
+        history: Optional[List[dict]] = None,
     ) -> str:
         """
         Ask the LLM to narrate raw tool results in natural, role-appropriate language.
@@ -686,10 +727,33 @@ class PlanExecutor:
             + f"\n\nData:\n{results_str}"
         )
 
-        messages = [
-            {"role": "system", "content": role_prompt},
-            {"role": "user",   "content": narration_instruction},
-        ]
+        messages: List[dict] = [{"role": "system", "content": role_prompt}]
+
+        # Inject up to 4 recent history turns so the narration knows the
+        # conversational frame (fixes "explain what?" when the user uses a
+        # pronoun referring to something said earlier).
+        for turn in (history or [])[-4:]:
+            t_role = turn.get("role", "user")
+            t_content = _sanitise(turn.get("content", ""))
+            if t_role in ("user", "assistant") and t_content:
+                messages.append({"role": t_role, "content": t_content})
+
+        # If we have the original user message, send it as the user turn and
+        # put the data + instructions in a system-aside message so the model
+        # answers the actual question, not the instruction.
+        if user_message:
+            messages.append({
+                "role": "system",
+                "content": (
+                    "Use ONLY the data below to answer the user's most recent "
+                    "message. Never invent data not present here."
+                    + personalisation
+                    + f"\n\nData:\n{results_str}"
+                ),
+            })
+            messages.append({"role": "user", "content": _sanitise(user_message)})
+        else:
+            messages.append({"role": "user", "content": narration_instruction})
 
         try:
             response = await self.model_router.generate_with_messages(
@@ -773,22 +837,22 @@ class PlanExecutor:
     @staticmethod
     def _is_raw_data_request(message: str) -> bool:
         """
-        CRITICAL GLOBAL DATA GUARD:
-        Scans the raw user message for data-seeking keywords.
-        If the user asks for numbers, grades, schedules, or system facts,
-        this override prevents the LLM from fabricating an answer, regardless
-        of what the planner classified the intent as.
+        DATA GUARD: fires ONLY when the message asks for PERSONAL system records
+        (my grades, my GPA, my schedule) — not general educational topics.
+
+        Intentionally narrow to avoid false positives on:
+        - "اشرح جدول البيانات" (explain data tables — CS topic)
+        - "ما هي درجات الحرارة" (what are temperature degrees)
+        - "شرح نتائج التجربة" (explain experiment results)
         """
         msg = message.lower()
-        keywords = {
-            "كم", "عدد", "total", "count",          # numbers requests
-            "درجات", "درجة", "gpa", "result",       # student data
-            "جدول", "مواعيد", "timetable",          # schedules
-            "مين", "ايه البيانات", "بيانات"           # system queries
+        # Only block if the message contains BOTH a personal possessive AND a data keyword.
+        personal_markers = {
+            "درجاتي", "نتيجتي", "جدولي", "gpaي", "معدلي",
+            "my grades", "my gpa", "my result", "my schedule", "my transcript",
+            "نتايجي", "الجدول بتاعي", "درجتي في",
         }
-        # We do simple substring matching to catch prefixed Arabic words
-        # (e.g. "درجاتي", "الجدول")
-        return any(kw in msg for kw in keywords)
+        return any(kw in msg for kw in personal_markers)
 
     async def _fallback_model_call(
         self,

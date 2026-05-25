@@ -157,6 +157,35 @@ class MemoryStore:
         await self._delete(f"user:{user_id}:clarification")
         logger.info("MemoryStore: deleted clarification for user_id=%s", user_id)
 
+    # ── Pending action (write-action confirmation) ────────────────────────
+
+    async def save_pending_action(self, user_id: str, data: Dict[str, Any]) -> None:
+        """
+        Persist a pending write action awaiting user confirmation. TTL = 5 min.
+
+        Structure:
+          {"endpoint": "/api/...", "method": "POST", "params": {...},
+           "summary": "human-readable preview"}
+        """
+        if not user_id:
+            return
+        await self._set(f"user:{user_id}:pending_action", data, self._TTL_CLARIFICATION)
+        logger.info(
+            "MemoryStore: saved pending_action for user_id=%s endpoint=%s",
+            user_id, data.get("endpoint"),
+        )
+
+    async def get_pending_action(self, user_id: str) -> Optional[Dict[str, Any]]:
+        if not user_id:
+            return None
+        return await self._get(f"user:{user_id}:pending_action")
+
+    async def delete_pending_action(self, user_id: str) -> None:
+        if not user_id:
+            return
+        await self._delete(f"user:{user_id}:pending_action")
+        logger.info("MemoryStore: deleted pending_action for user_id=%s", user_id)
+
     # ── User preferences ──────────────────────────────────────────────────
 
     async def get_preferences(self, user_id: str) -> Optional[Dict[str, Any]]:

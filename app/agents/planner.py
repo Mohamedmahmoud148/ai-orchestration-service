@@ -38,7 +38,6 @@ VALID_INTENTS = {
     "generate_exam",
     "result_query",
     "file_extraction",
-    # ── New modules ──
     "complaint_submit",
     "complaint_summary",
     "file_processing",
@@ -48,6 +47,7 @@ VALID_INTENTS = {
     "backend_api_query",
     "material_qa",
     "regulation",
+    "action_execute",   # enrollment, submissions — routed to DynamicApiModule
 }
 
 
@@ -504,6 +504,47 @@ Rules for action_execute:
 
 ### 14. When in doubt → use general_chat with steps=[].
 
+### 15. CONTEXT & PRONOUNS — use conversation history (CRITICAL)
+You ARE given the previous turns of the conversation. USE THEM. Never treat the current message in isolation when the user clearly refers to something said earlier.
+
+Rules:
+- If the current message contains a pronoun ("ها"، "ه"، "it"، "this"، "them") or is very short (≤6 words) without a clear subject, resolve it from the PREVIOUS turns.
+- If the prior turns mention the regulation / اللائحة / دليل / curriculum and the user now says "اشرحها / لخصها / explain it / summarize it / اقراها / show me" → intent = **regulation**.
+- If the prior turns mention a specific subject material / محاضرة / lecture and the user says "اشرحها / explain it" → intent = **material_explanation**.
+- If the prior turns mention an exam and the user says "ابعتها / send it / distribute it" → intent = **action_execute**.
+- NEVER reply with "اشرح إيه؟" or "which one?" when the answer is sitting in the previous turn.
+
+### Few-shot examples (study these — they show language variety + coreference)
+
+Example A — Egyptian dialect + pronoun referring to regulation (from previous turn):
+  [prior turn] user: "عندي لائحة اسمها fbn ضيفتها هنا"
+  [prior turn] assistant: "تمام، اللائحة 'fbn' متاحة. تحب أعمل إيه فيها؟"
+  current user: "طيب اقرا اللائحه وقولي الملخص بتاعها"
+  → intent = "regulation"
+
+Example B — Even shorter pronoun, same context:
+  [prior turn] assistant: "موجود ملف اللائحة fbn..."
+  current user: "لخصهالي"
+  → intent = "regulation"   (NOT general_chat, NOT material_explanation)
+
+Example C — Variant of "create exam" the keyword list might miss:
+  current user: "ممكن تجهزلي امتحان نص الترم في الـ data structures على السريع"
+  → intent = "generate_exam"
+
+Example D — Pronoun referring to material (lecture) from prior turn:
+  [prior turn] user: "اشرحلي محاضرة الـ binary trees"
+  [prior turn] assistant: "تمام، فيها 4 أقسام: ..."
+  current user: "اشرحلي الجزء الأخير تاني"
+  → intent = "material_explanation"
+
+Example E — User uses dialect "ايه اللي فيها":
+  [prior turn] assistant: "اللائحة الأكاديمية موجودة..."
+  current user: "ايه اللي فيها؟"
+  → intent = "regulation"
+
+Example F — When NOT to assume coreference:
+  current user: "ازيك" (greeting, no pronoun, no prior topic relevant)
+  → intent = "general_chat"
 
 ### Multi-step example (result_query — grades then GPA):
 {{
