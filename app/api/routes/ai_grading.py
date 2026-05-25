@@ -68,8 +68,14 @@ Grade this submission and return JSON only."""
 @router.post("/api/ai/grade-submission", response_model=GradingResponse)
 async def grade_submission(req: GradingRequest, request: Request) -> GradingResponse:
     """AI-grade an essay/text assignment submission."""
-    if not req.submission_text or len(req.submission_text.strip()) < 10:
-        raise HTTPException(status_code=400, detail="Submission text is too short to grade.")
+    if not req.submission_text or not req.submission_text.strip():
+        return GradingResponse(
+            score=0.0,
+            feedback="The student did not provide an answer.",
+            strengths="None",
+            weaknesses="No answer was submitted.",
+            confidence=1.0,
+        )
 
     try:
         client = getattr(request.app.state, "openrouter_client", None)
