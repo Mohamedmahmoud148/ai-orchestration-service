@@ -565,9 +565,21 @@ class DynamicApiModule:
                         route=endpoint, payload=clean_params, auth_header=auth_header
                     )
             except Exception as exc:
+                exc_str = str(exc)
+                # 405 = endpoint exists but method not supported — terminal, stop retrying
+                if "405" in exc_str:
+                    logger.warning(
+                        "DynamicApiModule: 405 Method Not Allowed on %s %s — stopping retries",
+                        method, endpoint,
+                    )
+                    failed_attempts.append({
+                        "endpoint": endpoint, "method": method,
+                        "reason": "405 Method Not Allowed — endpoint does not support this method",
+                    })
+                    break
                 failed_attempts.append({
                     "endpoint": endpoint, "method": method,
-                    "reason": f"network/backend exception: {exc}",
+                    "reason": f"network/backend exception: {exc_str}",
                 })
                 logger.error("DynamicApiModule: backend exception attempt %d: %s", attempt, exc)
                 continue
@@ -848,38 +860,15 @@ class DynamicApiModule:
         All attempts failed. Try to give a partial answer from academic_context,
         otherwise return a helpful bilingual message.
         """
-        # Last resort: try to answer from context or general knowledge
-        context_messages = [
-            {
-                "role": "system",
-                "content": (
-                    "أنت مساعد جامعي ذكي. الـ API مش متاح مؤقتًا.\n"
-                    "المطلوب:\n"
-                    "1. لو في academic_context يحتوي على إجابة للسؤال → استخدمه وأجب مباشرة.\n"
-                    "2. لو مفيش context كافٍ → حاول تجاوب من معرفتك العامة بالأنظمة الجامعية.\n"
-                    "3. لو السؤال محتاج بيانات حقيقية من السيستم فقط → اعتذر بجملة واحدة وقول للمستخدم يعيد المحاولة بعد ثانية.\n"
-                    "لا تعتذر أكثر من جملة واحدة. لا تكشف أسباب تقنية. تكلم بلغة المستخدم."
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"سؤال المستخدم: {message}\n\n"
-                    f"السياق الأكاديمي المتاح: {academic_ctx}"
-                ),
-            },
-        ]
-        try:
-            fallback = await self.model_router.generate_with_messages(
-                messages=context_messages, model_id=model_id
-            )
-            return AgentOutput(
-                status="partial",
-                response=fallback or "في مشكلة مؤقتة — حاول تاني بعد ثواني.",
-                data={"failed_attempts": failed_attempts},
-            )
-        except Exception:
-            return AgentOutput(
-                status="failed",
-                response="في مشكلة مؤقتة — حاول تاني بعد ثواني.",
-            )
+        # Never answer from general knowledge — only use real backend data.
+        # If all endpoints failed, tell the user clearly without fabricating.
+        reasons = "; ".join(a.get("reason", "") for a in failed_attempts)
+        logger.warning("DynamicApiModule: graceful failure — reasons: %s", reasons)
+        return AgentOutput(
+            status="failed",
+            response=(
+                "مش قادر أجيب البيانات دي دلوقتي من السيستم.\n"
+                "حاول تاني بعد ثوانٍ، أو اسألني سؤال تاني."
+            ),
+            data={"failed_attempts": failed_attempts},
+        )

@@ -312,27 +312,7 @@ class MaterialExplanationModule:
                     if material_text:
                         return await self._explain(material_text, agent_input, model_id, role, ctx)
 
-            # Fallback C: fetch regulations and use their fileUrl
-            logger.info("MaterialExplanationModule: trying regulations endpoint")
-            try:
-                regs_data = await self.backend_client.fetch(
-                    route="/api/Regulations",
-                    auth_header=agent_input.auth_header,
-                    params={"page": 1, "size": 10},
-                )
-                regs_list = regs_data if isinstance(regs_data, list) else regs_data.get("data") or []
-                for reg in regs_list[:3]:
-                    reg_url = reg.get("fileUrl") or reg.get("filePath") or ""
-                    if reg_url:
-                        logger.info("MaterialExplanationModule: reading regulation file: %s", reg.get("title"))
-                        material_text = await _fetch_file_url_text(reg_url, agent_input.auth_header)
-                        if material_text:
-                            label = f"[لائحة: {reg.get('title', '')}]\n{material_text}"
-                            return await self._explain(label, agent_input, model_id, role, ctx)
-            except Exception as exc:
-                logger.warning("MaterialExplanationModule: regulations fallback failed — %s", exc)
-
-            # Fallback D: give a helpful response
+            # Fallback C: give a helpful response
             enrolled = academic_ctx.get("enrolledCourses") or academic_ctx.get("courses") or []
             if enrolled:
                 course_list = ", ".join(
