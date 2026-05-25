@@ -31,6 +31,8 @@ class MemoryStore:
             url = url.strip('"').strip("'")
 
         self.redis_url = url
+        self.redis_client = None
+        self._disabled = False  # set True permanently after auth failure
 
         if self.redis_url and self.redis_url.startswith(("redis://", "rediss://", "unix://")):
             self.pool = redis.ConnectionPool.from_url(
@@ -38,12 +40,32 @@ class MemoryStore:
             )
             self.redis_client = redis.Redis(connection_pool=self.pool)
         else:
-            self.redis_client = None
+            self._disabled = True
             logger.warning(
                 "REDIS_URL not configured or missing scheme ('%s'). "
                 "MemoryStore will act as a no-op.",
                 self.redis_url,
             )
+
+    async def ping(self) -> bool:
+        """
+        Test Redis connectivity at startup. If auth fails, permanently disable
+        Redis so no per-request errors are logged.
+        """
+        if not self.redis_client or self._disabled:
+            return False
+        try:
+            await self.redis_client.ping()
+            logger.info("MemoryStore: Redis connection OK (%s)", self.redis_url.split("@")[-1] if self.redis_url else "")
+            return True
+        except Exception as exc:
+            logger.warning(
+                "MemoryStore: Redis unreachable (%s) — disabling permanently, running as no-op.",
+                exc,
+            )
+            self.redis_client = None
+            self._disabled = True
+            return False
 
     # ── Internal helpers ──────────────────────────────────────────────────
 

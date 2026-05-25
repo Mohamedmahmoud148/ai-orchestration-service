@@ -90,6 +90,7 @@ async def lifespan(app: FastAPI):
     )
 
     memory_store = MemoryStore()
+    await memory_store.ping()          # disable permanently if auth fails
     app.state.memory_store = memory_store
     app.state.rate_limiter = RateLimiter()
 
