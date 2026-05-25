@@ -47,6 +47,7 @@ VALID_INTENTS = {
     "material_explanation",
     "backend_api_query",
     "material_qa",
+    "regulation",
 }
 
 
@@ -188,6 +189,40 @@ def _detect_backend_query(message: str) -> bool:
         "profile", "courses i have", "subjects i have",
     }
     for kw in _BACKEND_KEYWORDS:
+        if kw in msg:
+            return True
+    return False
+
+
+# ── Deterministic regulation keyword override ─────────────────────────────────
+_REGULATION_KEYWORDS: frozenset[str] = frozenset({
+    # Arabic — explicit regulation/curriculum content questions
+    "اشرح الليحه", "اشرح اللائحه", "اشرح اللائحة",
+    "ايه الليحه", "ايه اللائحه", "ايه اللائحة",
+    "محتوى اللائحة", "محتوى الليحه",
+    "مواد سنة اولى", "مواد السنة الاولى", "مواد سنة اولي",
+    "مواد سنة تانية", "مواد السنة التانية", "مواد سنة ثانية",
+    "مواد سنة تالتة", "مواد السنة التالتة", "مواد سنة ثالثة",
+    "مواد سنة رابعة", "مواد السنة الرابعة",
+    "مواد الترم الاول", "مواد الترم الثاني",
+    "مواد جوه الليحه", "مواد في اللائحة",
+    "ساعات اللائحة", "متطلبات التخرج", "شروط التخرج",
+    "الخطة الدراسية", "خطة الدراسة",
+    "دليل الطالب", "الدليل الاكاديمي",
+    # English
+    "explain the regulation", "what is in the regulation",
+    "subjects in year one", "subjects in first year",
+    "subjects in second year", "subjects in third year",
+    "graduation requirements", "credit hours required",
+    "study plan subjects", "curriculum subjects",
+    "student handbook", "academic handbook",
+})
+
+
+def _detect_regulation(message: str) -> bool:
+    """Detect if the user wants to know content FROM the regulation document."""
+    msg = message.strip().lower()
+    for kw in _REGULATION_KEYWORDS:
         if kw in msg:
             return True
     return False
@@ -619,6 +654,19 @@ class PlannerAgent(BaseAgent):
             )
             plan.intent = "material_qa"
             plan.goal_summary = "Answer question grounded in indexed course material."
+
+        # ── Layer 2: Regulation document override ──────────────────────────
+        # Fires when user is asking about content INSIDE the regulation PDF
+        # (subjects per year, graduation requirements, study plan, etc.)
+        if _detect_regulation(agent_input.message):
+            if plan.intent not in ("regulation",):
+                logger.warning(
+                    "PlannerAgent [Layer-2 override]: Correcting %r to regulation "
+                    "for regulation content question.", plan.intent
+                )
+            plan.intent = "regulation"
+            plan.goal_summary = "Read and answer from the official academic regulation PDF."
+            plan.is_executable = True
 
         # ── Deterministic guard: ensure ResolveSubjectOffering pre-step ───
         plan = self._ensure_resolve_step(plan)

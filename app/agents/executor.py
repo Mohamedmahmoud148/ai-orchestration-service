@@ -54,6 +54,7 @@ _MODULE_CLASS_MAP: Dict[str, tuple[str, str]] = {
     "cv_analysis":        ("app.modules.cv_analysis",         "CVAnalysisModule"),
     "academic_advice":    ("app.modules.academic_advisor",    "AcademicAdvisorModule"),
     "material_explanation": ("app.modules.material_explanation", "MaterialExplanationModule"),
+    "regulation":          ("app.modules.regulation",          "RegulationModule"),
     "dynamic_api_module": ("app.modules.dynamic_api",         "DynamicApiModule"),
     "backend_api_query":  ("app.modules.dynamic_api",         "DynamicApiModule"),
     "action_execute":     ("app.modules.dynamic_api",         "DynamicApiModule"),
