@@ -477,6 +477,10 @@ class DynamicApiModule:
     def __init__(self, model_router: Any, backend_client: Any) -> None:
         self.model_router = model_router
         self.backend_client = backend_client
+        # Shared store — created once, ping() already ran at startup so _disabled
+        # is set correctly. Never instantiate MemoryStore inside run().
+        from app.services.memory_store import MemoryStore
+        self._memory = MemoryStore()
 
     # ── Public entry-point ────────────────────────────────────────────────
 
@@ -499,11 +503,10 @@ class DynamicApiModule:
         schema_text    = get_allowed_endpoints_schema()
 
         # ── Confirmation flow for pending write actions ──────────────────
-        # If a write action is already queued from a previous turn and the
-        # user has now confirmed (or denied) it, resolve that first instead
-        # of re-routing.
-        from app.services.memory_store import MemoryStore
-        _memory = MemoryStore()
+        # Reuse the module-level singleton (set in __init__) — never create
+        # a new MemoryStore per request, that bypasses the startup ping-disable
+        # and causes one auth error log per call when Redis is down.
+        _memory = self._memory
         pending = await _memory.get_pending_action(input_context.user_id)
         if pending:
             msg_lower = message.strip().lower()

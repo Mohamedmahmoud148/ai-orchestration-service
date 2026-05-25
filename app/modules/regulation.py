@@ -124,6 +124,8 @@ class RegulationModule:
 
         # ── 2. Read each regulation's PDF ──────────────────────────────────────
         all_text_parts: List[str] = []
+        pdf_failed_titles: List[str] = []
+
         for reg in regs_list[:3]:
             title   = reg.get("title") or "لائحة"
             content = reg.get("content") or ""
@@ -135,21 +137,37 @@ class RegulationModule:
                 if pdf_text:
                     all_text_parts.append(f"=== {title} ===\n{pdf_text}")
                     continue
+                else:
+                    pdf_failed_titles.append(title)
+                    logger.warning("RegulationModule: PDF empty/failed for '%s' — using content field", title)
 
-            # Fallback: use inline content field if no PDF
+            # Fallback: inline content field (may be a short description, still useful)
             if content:
-                all_text_parts.append(f"=== {title} ===\n{content}")
+                all_text_parts.append(f"=== {title} (وصف مختصر) ===\n{content}")
 
         if not all_text_parts:
+            # Nothing at all — tell user clearly instead of letting LLM guess
+            first_title = regs_list[0].get("title") or "غير محدد"
+            first_url   = regs_list[0].get("fileUrl") or ""
+            link_note   = f"\nرابط الملف: {first_url}" if first_url else ""
             return AgentOutput(
                 status="success",
                 response=(
-                    "اللائحة موجودة في السيستم بس مش قادر أقراها دلوقتي.\n"
-                    "اسم اللائحة: " + (regs_list[0].get("title") or "غير محدد")
+                    f"📄 اللائحة '{first_title}' موجودة في السيستم بس مش قادر أقرأ محتواها دلوقتي "
+                    f"(ممكن الملف محمي أو مش قابل للاستخراج).{link_note}\n\n"
+                    "تقدر تفتح الرابط ده مباشرة أو تطلب من الإدارة إتاحة الملف."
                 ),
             )
 
         regulation_text = "\n\n".join(all_text_parts)
+
+        # Warn in the prompt if only partial content is available (PDF failed)
+        pdf_warning = ""
+        if pdf_failed_titles:
+            pdf_warning = (
+                f"\n⚠️ ملاحظة: تعذّر استخراج نص PDF لـ ({', '.join(pdf_failed_titles)}). "
+                "المحتوى المتاح هو الوصف المختصر فقط — وضّح ذلك للمستخدم بصدق إذا سأل عن تفاصيل.\n"
+            )
 
         # ── 3. LLM answers from document only ─────────────────────────────────
         # Inject the last 4 conversation turns so vague follow-ups like
@@ -173,13 +191,14 @@ class RegulationModule:
 
         user_prompt = (
             f"{history_block}"
+            f"{pdf_warning}"
             f"سؤال المستخدم الحالي: {agent_input.message}\n\n"
             f"=== محتوى اللائحة الأكاديمية الرسمية ===\n"
             f"{regulation_text}\n"
             f"=== نهاية اللائحة ===\n\n"
-            "بناءً على محتوى اللائحة أعلاه فقط، أجب على سؤال المستخدم بشكل واضح ومنظم. "
+            "بناءً على المحتوى أعلاه، أجب على سؤال المستخدم بشكل واضح ومنظم. "
             "لو السؤال قصير أو فيه ضمير (زي 'اشرحهالي' أو 'لخصها')، افهم المقصود من السياق السابق "
-            "وقدّم ملخصاً شاملاً للائحة بدلاً من سؤال المستخدم عن المادة."
+            "وقدّم ما لديك. لو المحتوى محدود — قل ذلك بصراحة وأرشد المستخدم."
         )
 
         try:

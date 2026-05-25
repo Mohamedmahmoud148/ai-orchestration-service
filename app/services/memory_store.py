@@ -72,7 +72,11 @@ class MemoryStore:
         return None
 
     async def ping(self) -> bool:
-        """Test Redis at startup — disable permanently if unreachable so no per-request errors."""
+        """
+        Test Redis at startup. If the primary URL fails with an auth error,
+        automatically retry with REDIS_PUBLIC_URL before giving up.
+        Disables permanently on final failure so no per-request error logs.
+        """
         if not self.redis_client or self._disabled:
             return False
         try:
@@ -80,38 +84,76 @@ class MemoryStore:
             logger.info("MemoryStore: Redis OK — %s", (self.redis_url or "").split("@")[-1])
             return True
         except Exception as exc:
-            logger.warning("MemoryStore: Redis failed (%s) — disabling, running as no-op.", exc)
+            logger.warning("MemoryStore: primary Redis failed (%s)", exc)
+
+            # Try REDIS_PUBLIC_URL as fallback before giving up
+            if settings.REDIS_PUBLIC_URL and settings.REDIS_PUBLIC_URL != self.redis_url:
+                try:
+                    fallback_url = settings.REDIS_PUBLIC_URL.strip().strip('"').strip("'")
+                    if fallback_url.startswith(("redis://", "rediss://")):
+                        pool = redis.ConnectionPool.from_url(fallback_url, decode_responses=True)
+                        client = redis.Redis(connection_pool=pool)
+                        await client.ping()
+                        self.redis_client = client
+                        self.redis_url = fallback_url
+                        logger.info("MemoryStore: switched to REDIS_PUBLIC_URL — %s", fallback_url.split("@")[-1])
+                        return True
+                except Exception as exc2:
+                    logger.warning("MemoryStore: public Redis also failed (%s)", exc2)
+
+            logger.warning("MemoryStore: all Redis URLs failed — disabling, running as no-op.")
             self.redis_client = None
             self._disabled = True
             return False
 
     # ── Internal helpers ──────────────────────────────────────────────────
 
+    # Auth-error strings that indicate the Redis credentials are permanently wrong.
+    _AUTH_ERRORS = ("invalid username-password", "WRONGPASS", "NOAUTH", "user is disabled")
+
+    def _is_auth_error(self, exc: Exception) -> bool:
+        return any(s in str(exc) for s in self._AUTH_ERRORS)
+
     async def _get(self, key: str) -> Optional[Any]:
-        if not self.redis_client:
+        if not self.redis_client or self._disabled:
             return None
         try:
             raw = await self.redis_client.get(key)
             return json.loads(raw) if raw else None
         except Exception as exc:
-            logger.error("MemoryStore._get key=%s error=%s", key, exc)
+            if self._is_auth_error(exc):
+                logger.warning("MemoryStore: auth error — disabling permanently (%s)", exc)
+                self.redis_client = None
+                self._disabled = True
+            else:
+                logger.error("MemoryStore._get key=%s error=%s", key, exc)
             return None
 
     async def _set(self, key: str, value: Any, ttl: int) -> None:
-        if not self.redis_client:
+        if not self.redis_client or self._disabled:
             return
         try:
             await self.redis_client.setex(key, ttl, json.dumps(value, ensure_ascii=False))
         except Exception as exc:
-            logger.error("MemoryStore._set key=%s error=%s", key, exc)
+            if self._is_auth_error(exc):
+                logger.warning("MemoryStore: auth error — disabling permanently (%s)", exc)
+                self.redis_client = None
+                self._disabled = True
+            else:
+                logger.error("MemoryStore._set key=%s error=%s", key, exc)
 
     async def _delete(self, key: str) -> None:
-        if not self.redis_client:
+        if not self.redis_client or self._disabled:
             return
         try:
             await self.redis_client.delete(key)
         except Exception as exc:
-            logger.error("MemoryStore._delete key=%s error=%s", key, exc)
+            if self._is_auth_error(exc):
+                logger.warning("MemoryStore: auth error — disabling permanently (%s)", exc)
+                self.redis_client = None
+                self._disabled = True
+            else:
+                logger.error("MemoryStore._delete key=%s error=%s", key, exc)
 
     # ── Conversation memory ───────────────────────────────────────────────
 

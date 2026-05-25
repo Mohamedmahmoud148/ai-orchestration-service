@@ -319,13 +319,12 @@ class Agent:
         elif intent == "generate_exam" and role in ("doctor", "admin", "superadmin"):
             model = "openai/gpt-4o"
         elif intent in ("material_explanation", "material_qa", "file_extraction"):
-            # Deep explanation tasks need full GPT-4o for all roles
             model = "openai/gpt-4o"
         elif intent == "file_processing" and role in ("admin", "superadmin"):
             model = "openai/gpt-4o"
-        elif role in ("admin", "superadmin"):
-            model = "openai/gpt-4o"
         else:
+            # gpt-4o-mini for everything else including admin general_chat —
+            # fast, cheap, good enough. gpt-4o reserved for quality-critical tasks above.
             model = "openai/gpt-4o-mini"
 
         context.set_model(model)
