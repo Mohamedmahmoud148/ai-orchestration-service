@@ -65,3 +65,7 @@ class ChatResponse(BaseModel):
         default_factory=list,
         description="Quick-action labels for UI buttons or prompts",
     )
+    emotion: str = Field(
+        default="neutral",
+        description="Detected emotion of the response for UI animations: happy, sad, thinking, excited, confused, neutral",
+    )

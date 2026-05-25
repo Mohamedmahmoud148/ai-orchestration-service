@@ -23,6 +23,7 @@ from app.agents.agent import Agent
 from app.agents.execution_context import ExecutionContext
 from app.agents.pipeline import _PipelineStageError
 from app.core.logging import logger, get_correlation_id, set_request_user_id
+from app.core.emotion import detect_emotion
 from app.models.chat import ChatRequest, ChatResponse
 
 # ─────────────────────────────────────────────────────────────
@@ -136,14 +137,16 @@ async def chat_endpoint(
             name = opt.get("title") or opt.get("name") or opt.get("subjectName") or "Unknown"
             id_val = opt.get("id") or opt.get("subjectOfferingId") or "?"
             lines.append(f"{i}. {name} ({id_val})")
-            
+
+        clarification_text = "\n".join(lines)
         return ChatResponse(
-            response="\n".join(lines),
+            response=clarification_text,
             conversation_id=context.conversation_id,
             intent_executed=context.intent,
             tool_used=context.selected_tool,
             model_used=context.selected_model,
             metadata=context.metadata,
+            emotion=detect_emotion(clarification_text),
         )
 
     # Extract suggestions / actions injected by the executor
@@ -151,8 +154,9 @@ async def chat_endpoint(
     suggestions      = executor_data.get("suggestions",       [])
     actions_avail    = executor_data.get("actions_available", [])
 
+    response_text = str(context.result or "")
     return ChatResponse(
-        response=str(context.result or ""),
+        response=response_text,
         conversation_id=context.conversation_id,
         intent_executed=context.intent,
         tool_used=context.selected_tool,
@@ -160,6 +164,7 @@ async def chat_endpoint(
         metadata=context.metadata,
         suggestions=suggestions,
         actions_available=actions_avail,
+        emotion=detect_emotion(response_text),
     )
 
 
@@ -290,6 +295,7 @@ async def chat_stream_endpoint(
                 "conversation_id": context.conversation_id,
                 "suggestions": executor_data.get("suggestions", []),
                 "actions_available": executor_data.get("actions_available", []),
+                "emotion": detect_emotion(final_text),
             }
             yield f"data: {_json.dumps(meta_frame, ensure_ascii=False)}\n\n"
             yield "data: {\"type\": \"done\"}\n\n"
