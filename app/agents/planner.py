@@ -209,6 +209,14 @@ _REGULATION_KEYWORDS: frozenset[str] = frozenset({
     "ساعات اللائحة", "متطلبات التخرج", "شروط التخرج",
     "الخطة الدراسية", "خطة الدراسة",
     "دليل الطالب", "الدليل الاكاديمي",
+    # Egyptian dialect variants of اللائحة (common misspellings / colloquial forms)
+    "الاليخه", "اللايحه", "اللايحة",
+    "هذه الليحه", "هذه اللايحه", "هذه اللائحه", "هذه اللائحة",
+    "في الليحه", "في اللايحه", "في اللائحه",
+    "جوه اللايحه", "جوا اللائحه", "جوا اللايحه",
+    "اليخه", "الليحة",
+    "كم مادة في", "كم ماده في",
+    "مواد اللائحه", "مواد اللايحه", "مواد الاليخه",
     # English
     "explain the regulation", "what is in the regulation",
     "subjects in year one", "subjects in first year",
