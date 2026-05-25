@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 from app.agents.execution_context import ExecutionContext
 from app.agents.schemas import AgentInput
@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from app.agents.planner import PlannerAgent
     from app.agents.executor import PlanExecutor
     from app.agents.model_router import ModelRouter
+    from app.agents.react_agent import ReactAgent
     from app.services.tool_registry import ToolRegistry
 
 
@@ -60,11 +61,13 @@ class Agent:
         tool_registry: "ToolRegistry",
         model_router: "ModelRouter",
         executor: "PlanExecutor",
+        react_agent: Optional["ReactAgent"] = None,
     ) -> None:
         self._planner = planner
         self._tool_registry = tool_registry
         self._model_router = model_router
         self._executor = executor
+        self._react_agent = react_agent          # None → falls back to old pipeline
         self._memory_store = MemoryStore()
 
     # ──────────────────────────────────────────────────────────────────────
@@ -181,20 +184,45 @@ class Agent:
                 return context
 
         if not plan:
-            # ── Stage 1: Planning ─────────────────────────────────────────────
-            plan = await self._plan(context)
+            if self._react_agent is not None:
+                # ── ReactAgent path (smart, iterative, no keywords) ───────
+                logger.info(
+                    "[Agent] stage=react user_id=%s conversation_id=%s",
+                    context.user_id, context.conversation_id,
+                )
+                t0 = time.perf_counter()
+                try:
+                    result = await self._react_agent.run(context)
+                    context.set_result(result)
+                except Exception as exc:
+                    logger.error("[Agent] ReactAgent failed — %s", exc, exc_info=True)
+                    # fall through to old pipeline below
+                    context.set_result(None)
 
-            # ── Stage 2: Model Routing ────────────────────────────────────────
-            # NOTE: RBAC validation is enforced downstream in executor.execute()
-            # (Step 0) via app/core/rbac.py — NOT here.  This removes the stale
-            # duplicate gate that blocked new intents before reaching modules.
-            self._route_model(context)
-
-            # ── Stage 3: Tool / Module Selection ─────────────────────────────
-            module_name = self._select_module(context)
-
-        # ── Stage 4: Execution ────────────────────────────────────────────
-        await self._execute(context, plan, module_name)
+                if context.result:
+                    elapsed = round(time.perf_counter() - t0, 4)
+                    context.add_metadata("react_duration_seconds", elapsed)
+                    logger.info(
+                        "[Agent] stage=react done duration_s=%s", elapsed
+                    )
+                    # skip old pipeline stages 1-4
+                    plan = None
+                else:
+                    # ReactAgent failed — fall back to old pipeline
+                    logger.warning("[Agent] ReactAgent produced no result, falling back to planner pipeline")
+                    plan = await self._plan(context)
+                    self._route_model(context)
+                    module_name = self._select_module(context)
+                    await self._execute(context, plan, module_name)
+            else:
+                # ── Legacy pipeline (planner → keywords → modules) ────────
+                plan = await self._plan(context)
+                self._route_model(context)
+                module_name = self._select_module(context)
+                await self._execute(context, plan, module_name)
+        else:
+            # Clarification path — always uses old executor
+            await self._execute(context, plan, module_name)
 
         # ── Clarification Handling or Save Memory ────────────────────────
         if context.metadata.get("clarification_needed"):

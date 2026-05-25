@@ -105,15 +105,24 @@ async def lifespan(app: FastAPI):
         model_router=model_router,
     )
 
-    # ── 4. Agent (single instance for the lifetime of the app) ────────
+    # ── 4. ReactAgent (gpt-4o-mini function calling loop) ────────────
+    from app.agents.react_agent import ReactAgent
+    react_agent = ReactAgent(
+        openrouter_client=openai_client,
+        model_router=model_router,
+    )
+    logger.info("ReactAgent ready — flow: User → ReactAgent → tools loop → Response")
+
+    # ── 4.1 Agent (single instance for the lifetime of the app) ──────
     app.state.agent = Agent(
         planner=planner,
         tool_registry=tool_registry,
         model_router=model_router,
         executor=executor,
+        react_agent=react_agent,
     )
 
-    logger.info("Agent ready — flow: User → Agent → Planner → Module → Response")
+    logger.info("Agent ready — flow: User → ReactAgent (smart) → fallback: Planner → Module")
 
     # ── 5. RAG services (EmbeddingService + VectorStore) ─────────────
     from app.services.embedding_service import embedding_service
