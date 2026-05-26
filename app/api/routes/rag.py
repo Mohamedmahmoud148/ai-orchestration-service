@@ -28,10 +28,11 @@ router = APIRouter(prefix="/api/rag", tags=["RAG"])
 
 class IndexRequest(BaseModel):
     material_id: str = Field(..., description="Unique identifier for the material")
-    content: str = Field(..., description="Full text content of the material")
+    content: Optional[str] = Field(None, description="Full text content (provide this OR file_url)")
+    file_url: Optional[str] = Field(None, description="Public URL of the file — FastAPI will download and extract text automatically")
     metadata: Dict[str, Any] = Field(
         default_factory=dict,
-        description="Material metadata (materialTitle, offeringId, subjectName, …)",
+        description="Material metadata (materialTitle, offeringId, subjectName, contentType, …)",
     )
 
 
@@ -62,30 +63,79 @@ class SearchResponse(BaseModel):
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
+async def _extract_text_from_url(file_url: str, content_type: str = "") -> str:
+    """Download a file from URL and extract its text content."""
+    import io
+    import httpx
+
+    ct = content_type.lower()
+    async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+        resp = await client.get(file_url)
+        resp.raise_for_status()
+        data = resp.content
+
+    # PDF
+    if "pdf" in ct or file_url.lower().endswith(".pdf"):
+        try:
+            from pdfminer.high_level import extract_text
+            return extract_text(io.BytesIO(data)) or ""
+        except Exception:
+            import pypdf
+            reader = pypdf.PdfReader(io.BytesIO(data))
+            return "\n".join(p.extract_text() or "" for p in reader.pages)
+
+    # Word
+    if "wordprocessingml" in ct or file_url.lower().endswith(".docx"):
+        import docx
+        doc = docx.Document(io.BytesIO(data))
+        return "\n".join(p.text for p in doc.paragraphs)
+
+    # Plain text
+    return data.decode("utf-8", errors="ignore")
+
+
 @router.post("/index", response_model=IndexResponse, status_code=200)
 async def index_material(req: IndexRequest) -> IndexResponse:
     """
     Chunk a material, embed each chunk, and upsert into ChromaDB.
 
+    Accepts either:
+    - content: pre-extracted text
+    - file_url: public URL — FastAPI downloads and extracts text automatically
+
     Steps:
-      1. chunk_text() — split into overlapping windows
-      2. embed_batch() — one API call for all chunks
-      3. vector_store.upsert_chunks() — persist with metadata
+      1. Extract text (if file_url given)
+      2. chunk_text() — split into overlapping windows
+      3. embed_batch() — one API call for all chunks
+      4. vector_store.upsert_chunks() — persist with metadata
     """
+    # ── Resolve content ───────────────────────────────────────────────────────
+    content = req.content or ""
+    if not content and req.file_url:
+        ct = req.metadata.get("contentType", "")
+        logger.info("RAG /index: downloading file from %s", req.file_url[:80])
+        try:
+            content = await _extract_text_from_url(req.file_url, ct)
+        except Exception as exc:
+            logger.error("RAG /index: file extraction failed — %s", exc)
+            raise HTTPException(status_code=422, detail=f"Could not extract text from file: {exc}")
+
+    if not content or not content.strip():
+        raise HTTPException(status_code=422, detail="No content provided and file extraction produced empty text.")
+
     logger.info(
         "RAG /index: material_id=%s content_len=%d",
-        req.material_id, len(req.content),
+        req.material_id, len(content),
     )
 
     if not vector_store._available:
         raise HTTPException(
             status_code=503,
-            detail="Indexing unavailable: ChromaDB is not initialised. "
-                   "Install chromadb and restart the service.",
+            detail="Indexing unavailable: ChromaDB is not initialised.",
         )
 
     # 1. Chunk
-    raw_chunks = chunk_text(req.content, chunk_size=500, overlap=100)
+    raw_chunks = chunk_text(content, chunk_size=500, overlap=100)
     if not raw_chunks:
         raise HTTPException(status_code=422, detail="Content produced no chunks after splitting.")
 

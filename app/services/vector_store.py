@@ -26,7 +26,7 @@ from typing import Any, Dict, List, Optional
 from app.core.logging import logger
 
 _COLLECTION_NAME = "university_materials"
-_CHROMA_DATA_DIR = os.path.join(os.getcwd(), "chroma_data")
+_CHROMA_DATA_DIR = os.environ.get("CHROMA_DATA_DIR") or "/tmp/chroma_data"
 
 
 class VectorStore:
