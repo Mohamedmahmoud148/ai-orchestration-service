@@ -26,7 +26,7 @@ if TYPE_CHECKING:
     from app.agents.execution_context import ExecutionContext
 
 _MODEL = "openai/gpt-4o-mini"
-_MAX_ITERATIONS = 3   # was 6 — 95% of queries finish in ≤2 iterations
+_MAX_ITERATIONS = 4   # 4 allows: think → tool1 → tool2 → final answer for complex academic queries
 
 # ── Tool definitions ──────────────────────────────────────────────────────────
 
@@ -195,18 +195,23 @@ def _build_system_prompt(context: "ExecutionContext") -> str:
     role_persona = _load_role_persona(context.role or "")
     persona_section = f"\n## الشخصية والأسلوب (مطلوب الالتزام به)\n{role_persona}\n" if role_persona else ""
 
-    # ── Memory/profile context ────────────────────────────────────────────
+    # ── Memory/profile/entity context ────────────────────────────────────
     meta = context.metadata or {}
+    user_ctx = context.academic_context or {}
     memory_section = ""
     profile_section = ""
+    entity_section = ""
+    goal_section = ""
 
     memory = meta.get("memory") or {}
     if memory:
         parts = []
         if memory.get("last_intent"):
             parts.append(f"- آخر طلب: {memory['last_intent']}")
+        if memory.get("last_message"):
+            parts.append(f"- آخر رسالة: {str(memory['last_message'])[:120]}")
         if memory.get("last_result"):
-            parts.append(f"- آخر نتيجة (ملخص): {str(memory['last_result'])[:200]}")
+            parts.append(f"- آخر نتيجة (ملخص): {str(memory['last_result'])[:250]}")
         if parts:
             memory_section = "## ذاكرة المحادثة السابقة\n" + "\n".join(parts) + "\n"
 
@@ -217,11 +222,45 @@ def _build_system_prompt(context: "ExecutionContext") -> str:
     elif academic_profile:
         profile_section = f"## الملف الأكاديمي\n{academic_profile}\n"
 
-    return f"""أنت مساعد أكاديمي ذكي لنظام إدارة الجامعة. تعمل كعميل reasoning-first: تُفكّر أولاً ثم تتصرف.
+    # Conversation entities — course names, doctor names, goals mentioned earlier
+    conv_entities = meta.get("conversation_entities") or user_ctx.get("conversation_entities") or {}
+    if conv_entities:
+        try:
+            from app.core.entity_tracker import build_entity_context_block
+            block = build_entity_context_block(conv_entities)
+            if block:
+                entity_section = block + "\n"
+        except Exception:
+            pass
+
+    # User goal tracking
+    user_goal = meta.get("user_goal") or user_ctx.get("user_goal") or ""
+    if user_goal:
+        goal_labels = {
+            "graduation": "التخرج قريباً",
+            "improve_gpa": "تحسين الـ GPA",
+            "exam_prep": "التحضير للامتحانات",
+            "understand_topic": "فهم موضوع محدد",
+            "registration": "التسجيل في المواد",
+        }
+        goal_label = goal_labels.get(user_goal, user_goal)
+        goal_section = f"## هدف المستخدم الحالي\n- {goal_label}\n"
+
+    return f"""أنت مساعد أكاديمي ذكي لنظام إدارة الجامعة. تعمل كعميل reasoning-first: تُفكّر أولاً ثم تتصرف. تتذكر السياق، تحلّل العلاقات، وتعطي إجابات شخصية مبنية على بيانات حقيقية.
 {persona_section}
 ## الجلسة الحالية
 {ctx_line}
-{memory_section}{profile_section}
+{memory_section}{profile_section}{entity_section}{goal_section}
+## قرارة حل الضمائر (COREFERENCE RESOLUTION)
+إذا كانت الرسالة الحالية قصيرة أو تحتوي ضمائر ("ها"، "ه"، "فيها"، "it"، "this"):
+1. ابحث في **ذاكرة المحادثة السابقة** أو **الكيانات المذكورة** لتحديد المرجع.
+2. إذا المحادثة السابقة تذكر مادة/امتحان/موضوع → هذا هو المرجع.
+3. لا تسأل "أقصد إيه؟" إذا كان الجواب واضح من السياق.
+
+أمثلة:
+- "شرحها لي" بعد ذكر "قواعد البيانات" → اشرح قواعد البيانات
+- "هل عندي فيها درجة؟" بعد ذكر "الخوارزميات" → ابحث عن درجة الطالب في الخوارزميات
+- "كمّل" بعد خطة أكاديمية → استمر في نفس الموضوع
 ## سلسلة التفكير المطلوبة (THINK → ACT → VALIDATE → RESPOND)
 
 **خطوة 1 — THINK (فكّر قبل أي إجراء):**
@@ -347,6 +386,32 @@ class ReactAgent:
                 finish is None and not getattr(choice.message, "tool_calls", None)
             ):
                 answer = choice.message.content or ""
+
+                # Self-reflection: if answer is too short + tools were available,
+                # push one more iteration asking model to elaborate or fetch data.
+                # Only fires if we still have budget AND haven't already used tools.
+                if (
+                    len(answer.strip()) < 60
+                    and _tool_call_count == 0
+                    and iteration < _MAX_ITERATIONS
+                ):
+                    logger.info(
+                        "[ReactAgent] short answer without tool calls (len=%d) — "
+                        "triggering self-reflection iteration=%d",
+                        len(answer), iteration,
+                    )
+                    messages.append({"role": "assistant", "content": answer})
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "[تعليمات داخلية — لا تعرضها للمستخدم]: "
+                            "إجابتك قصيرة جداً. إذا كانت البيانات مطلوبة، "
+                            "استدعِ tool مناسب الآن. إذا لم تكن بيانات مطلوبة، "
+                            "وسّع الإجابة بشكل أكثر فائدة وتفصيلاً."
+                        ),
+                    })
+                    continue  # retry with self-reflection
+
                 elapsed = round(time.perf_counter() - t_start, 3)
 
                 # Response guard — log hallucination risks without blocking
@@ -562,20 +627,13 @@ def _build_messages(context: "ExecutionContext") -> List[Dict[str, Any]]:
         {"role": "system", "content": _build_system_prompt(context)}
     ]
 
-    # Inject conversation summary from memory if available
-    meta = context.metadata or {}
-    summary = (meta.get("memory") or {}).get("last_result")
-    if summary and len(str(summary)) > 20:
-        msgs.append({
-            "role": "system",
-            "content": f"[ذاكرة المحادثة السابقة — للسياق فقط]: {str(summary)[:400]}",
-        })
-
-    for turn in (context.history or [])[-8:]:
+    # Use last 10 turns (increased from 8 for better multi-turn reasoning)
+    history_window = (context.history or [])[-10:]
+    for turn in history_window:
         role = turn.get("role", "")
         content = str(turn.get("content", "")).strip()
         if role in ("user", "assistant") and content:
-            msgs.append({"role": role, "content": content[:800]})
+            msgs.append({"role": role, "content": content[:1000]})
     msgs.append({"role": "user", "content": context.message})
     return msgs
 

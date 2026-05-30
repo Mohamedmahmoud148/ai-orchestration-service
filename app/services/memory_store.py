@@ -348,6 +348,47 @@ class MemoryStore:
             "last_result": result_summary,
         })
 
+    # ── Conversation entity memory (academic entities across turns) ───────
+
+    _TTL_ENTITIES = 7_200  # 2 hours — same session window as memory
+
+    async def save_entities(self, user_id: str, entities: dict) -> None:
+        """
+        Persist extracted academic entities for cross-turn coreference.
+
+        Merges with existing entities so course names accumulate across
+        the conversation rather than being overwritten each turn.
+        """
+        if not user_id or not entities:
+            return
+        try:
+            from app.core.entity_tracker import merge_entities
+            existing = await self._get(f"user:{user_id}:entities") or {}
+            merged = merge_entities(existing, entities)
+            await self._set(f"user:{user_id}:entities", merged, self._TTL_ENTITIES)
+        except Exception as exc:
+            logger.warning("MemoryStore.save_entities: %s", exc)
+
+    async def get_entities(self, user_id: str) -> dict:
+        """Retrieve accumulated conversation entities. Returns {} if none."""
+        if not user_id:
+            return {}
+        data = await self._get(f"user:{user_id}:entities")
+        return data if isinstance(data, dict) else {}
+
+    async def save_user_goal(self, user_id: str, goal: str) -> None:
+        """Persist the inferred primary user goal (e.g. 'graduation')."""
+        if not user_id or not goal:
+            return
+        await self.save_preferences(user_id, {"current_goal": goal})
+
+    async def get_user_goal(self, user_id: str) -> str:
+        """Return the last known user goal or empty string."""
+        if not user_id:
+            return ""
+        prefs = await self.get_preferences(user_id) or {}
+        return prefs.get("current_goal", "")
+
     async def detect_and_save_language(self, user_id: str, message: str) -> None:
         """
         Detect the user's language from a message and persist it in preferences.

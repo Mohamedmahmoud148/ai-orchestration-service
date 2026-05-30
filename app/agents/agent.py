@@ -119,6 +119,16 @@ class Agent:
                 context.user_id, list(prefs.keys()),
             )
 
+        # ── Stage 0.1b: Load conversation entities + user goal ──────────
+        entities = await self._memory_store.get_entities(context.user_id)
+        if entities:
+            context.add_metadata("conversation_entities", entities)
+            context.academic_context["conversation_entities"] = entities
+        user_goal = await self._memory_store.get_user_goal(context.user_id)
+        if user_goal:
+            context.add_metadata("user_goal", user_goal)
+            context.academic_context["user_goal"] = user_goal
+
         # ── Stage 0.2: Load Academic Profile (Phase 5) ──────────────────
         academic_profile = await self._memory_store.get_academic_profile(context.user_id)
         if academic_profile:
@@ -201,6 +211,9 @@ class Agent:
         asyncio.create_task(
             self._memory_store.detect_and_save_language(context.user_id, context.message)
         )
+
+        # Extract + persist conversation entities (courses, doctors, goals…)
+        asyncio.create_task(self._extract_and_save_entities(context))
 
         if not plan:
             if self._react_agent is not None:
@@ -445,6 +458,36 @@ class Agent:
     # ──────────────────────────────────────────────────────────────────────
     #  Background summarisation (fire-and-forget)
     # ──────────────────────────────────────────────────────────────────────
+
+    async def _extract_and_save_entities(self, context: ExecutionContext) -> None:
+        """
+        Extract academic entities from the user message and save them for
+        cross-turn coreference. Background task — never blocks the response.
+        """
+        try:
+            from app.core.entity_tracker import extract_entities
+            entities = extract_entities(context.message)
+
+            # Also extract from history last turn to catch pronouns ("ها"/"it")
+            if context.history:
+                last_user = next(
+                    (t.get("content", "") for t in reversed(context.history)
+                     if t.get("role") == "user"),
+                    "",
+                )
+                if last_user:
+                    prev_entities = extract_entities(str(last_user))
+                    from app.core.entity_tracker import merge_entities
+                    entities = merge_entities(entities, prev_entities)
+
+            await self._memory_store.save_entities(context.user_id, entities)
+
+            # Persist primary user goal if detected
+            goals = entities.get("goals", [])
+            if goals:
+                await self._memory_store.save_user_goal(context.user_id, goals[0])
+        except Exception as exc:
+            logger.warning("[Agent] _extract_and_save_entities failed: %s", exc)
 
     async def _summarize_and_save(self, context: ExecutionContext) -> None:
         """
