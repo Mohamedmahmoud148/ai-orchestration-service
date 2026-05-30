@@ -24,6 +24,13 @@ class Settings(BaseSettings):
     REDIS_PUBLIC_URL: str = ""   # Railway public proxy URL (fallback)
     REDISHOST: str = ""
     REDISPORT: int = 6379
+
+    @field_validator("REDISPORT", mode="before")
+    @classmethod
+    def _coerce_redis_port(cls, v):
+        if v == "" or v is None:
+            return 6379
+        return v
     REDISUSER: str = "default"
     REDISPASSWORD: str = ""
 
