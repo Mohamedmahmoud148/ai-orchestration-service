@@ -1,16 +1,16 @@
 """
-regulation.py — Academic Regulation & Curriculum Advisor
+regulation.py — Academic Regulation & Curriculum Advisor (v2: RAG-powered)
 
-Fetches the university regulation document (دليل الطالب / اللائحة) from the backend,
-reads the PDF, and answers student/admin questions from the actual document content.
+Answers questions about the official academic regulation (دليل الطالب / اللائحة)
+using semantic search over indexed regulation chunks.
 
-This is the core academic advisor feature: students ask about curriculum, subjects
-per year, credit hours, graduation requirements — AI answers ONLY from the real document.
+Architecture:
+  Primary path  → semantic search via app.services.regulation_indexer (fast, accurate)
+  Fallback path → live PDF download + extract (slow, used when RAG is empty)
 
-Flow:
-  1. GET /api/Regulations  → get regulation list with fileUrl
-  2. Download & parse the PDF
-  3. LLM answers the user's question strictly from the document text
+The student/admin asks a question, we retrieve the top-k relevant chunks
+from ChromaDB, and the LLM answers strictly from those chunks. No re-downloading
+the entire PDF on every turn, no 10K-character truncation.
 """
 from __future__ import annotations
 
@@ -21,10 +21,29 @@ import httpx
 
 from app.agents.schemas import AgentInput, AgentOutput
 from app.core.logging import logger
+from app.prompts import load_prompt
+from app.services.regulation_indexer import (
+    index_all_active_regulations,
+    is_any_regulation_indexed,
+    search_regulation,
+)
 
 _DEFAULT_MODEL = "openai/gpt-4o-mini"
+_REGULATION_MAX_TOKENS = 2200          # allow detailed multi-paragraph answers
+_RAG_TOP_K = 8                         # diverse chunks → richer answers
+_PDF_FALLBACK_CAP = 30_000             # 3x the old cap; only hit when RAG fails
 
-_SYSTEM_PROMPT = """\
+
+def _get_system_prompt() -> str:
+    """Load from app/prompts/regulation_advisor.md; fall back to inline if missing."""
+    try:
+        return load_prompt("regulation_advisor")
+    except Exception as exc:
+        logger.warning("RegulationModule: prompt load failed — using inline fallback: %s", exc)
+        return _SYSTEM_PROMPT_FALLBACK
+
+
+_SYSTEM_PROMPT_FALLBACK = """\
 أنت "مرشد" — مرشد أكاديمي ودود وذكي في الجامعة. بتساعد الطلاب يفهموا اللائحة الأكاديمية الرسمية بسهولة، كأنك زميل أكبر بيشرحلهم.
 
 🎯 الأسلوب:
@@ -33,18 +52,21 @@ _SYSTEM_PROMPT = """\
 - استخدم 📚 أو ✅ أو 💡 emoji محسوبة لما تضيف معنى — مش في كل سطر.
 
 📋 قواعد المحتوى (صارمة):
-1. أجب فقط من محتوى اللائحة المُقدَّم — ممنوع تستخدم معرفتك العامة.
-2. لو السؤال مش في اللائحة → قول "المعلومة دي مش موجودة في اللائحة المتاحة عندي" بدل اختلاق إجابة.
-3. نظّم إجابتك: عنوان قصير، نقاط واضحة، أمثلة من النص لو متاح.
+1. أجب فقط من المقاطع المُقدَّمة من اللائحة — ممنوع تستخدم معرفتك العامة عن جامعات تانية.
+2. لو السؤال مش متغطى في المقاطع المتاحة → قول "الجزء ده مش موجود في المقاطع اللي قدرت أوصلها من اللائحة" بدل اختلاق إجابة.
+3. ردك لازم يكون مفصّل ومنظم: عنوان قصير، نقاط واضحة، أمثلة من النص لما متاحة.
 4. لو السؤال عن مواد سنة معينة → اذكر الأسماء والساعات والـ prerequisites لو موجودة.
-5. لو السؤال عام ("لخص اللائحة") → قدّم ملخص شامل ومنظم: الأقسام الرئيسية، عدد الساعات، شروط التخرج، نظام التقدير.
-6. اختم بسؤال صغير لو مناسب: "تحب أركّز على جزء معين؟" — مش كل مرة.
-7. الدقة أهم من الإطالة. ممنوع اختلاق أي بيانات.\
+5. لو السؤال عام ("لخص اللائحة") → قدّم ملخص شامل من المقاطع المتاحة: الأقسام، عدد الساعات، شروط التخرج، نظام التقدير.
+6. لو في رقم/شرط/نسبة في النص → اقتبسها حرفياً مع ذكر السطر اللي جاية منه.
+7. لما يناسب، اختم بسؤال صغير: "تحب أركّز على جزء معين؟" — مش كل مرة.
+8. الدقة أهم من الإطالة، لكن مكنش بخيل في التفاصيل لو الطالب طلب شرح كامل.\
 """
 
 
+# ── Legacy PDF fallback (used only when RAG is empty) ────────────────────────
+
+
 async def _fetch_pdf_text(file_url: str, auth_header: Optional[str] = None) -> str:
-    """Download and extract text from a PDF URL."""
     if not file_url or not file_url.startswith("http"):
         return ""
     try:
@@ -55,7 +77,6 @@ async def _fetch_pdf_text(file_url: str, auth_header: Optional[str] = None) -> s
             resp = await client.get(file_url, headers=headers)
             resp.raise_for_status()
 
-        # Try pdfminer first, pypdf as fallback
         try:
             from pdfminer.high_level import extract_text
             text = extract_text(io.BytesIO(resp.content)) or ""
@@ -68,19 +89,25 @@ async def _fetch_pdf_text(file_url: str, auth_header: Optional[str] = None) -> s
                 logger.warning("RegulationModule: PDF parse failed — %s", exc)
                 return ""
 
-        text = text.strip()
-        logger.info("RegulationModule: extracted %d chars from regulation PDF", len(text))
-        return text[:10_000]  # cap to avoid token overflow
+        return (text or "").strip()[:_PDF_FALLBACK_CAP]
 
     except Exception as exc:
-        logger.warning("RegulationModule: failed to fetch PDF %s — %s", file_url[:80], exc)
+        logger.warning("RegulationModule: PDF fetch failed %s — %s", file_url[:80], exc)
         return ""
+
+
+# ── Module ────────────────────────────────────────────────────────────────────
 
 
 class RegulationModule:
     """
-    Academic regulation advisor — fetches the official regulation PDF from the
-    backend and answers questions strictly from its content.
+    RAG-first academic regulation advisor.
+
+    Pipeline:
+      1. Ensure regulations are indexed (auto-trigger first-time index if not).
+      2. Semantic search top-k chunks for the user's question.
+      3. LLM answers from those chunks with a detailed, structured response.
+      4. If RAG returns nothing usable → fallback to the legacy live PDF read.
     """
 
     def __init__(self, model_router, backend_client) -> None:
@@ -88,90 +115,65 @@ class RegulationModule:
         self.backend_client = backend_client
 
     async def run(self, agent_input: AgentInput, plan=None) -> AgentOutput:
-        ctx        = agent_input.context or {}
-        model_id   = ctx.get("selected_model") or _DEFAULT_MODEL
-        auth       = agent_input.auth_header
+        ctx      = agent_input.context or {}
+        model_id = ctx.get("selected_model") or _DEFAULT_MODEL
+        auth     = agent_input.auth_header
 
-        logger.info("RegulationModule: fetching regulations for user=%s", agent_input.user_id)
+        logger.info(
+            "RegulationModule: user=%s message=%r",
+            agent_input.user_id, agent_input.message[:100],
+        )
 
-        # ── 1. Fetch regulation list ───────────────────────────────────────────
+        # ── 0. Auto-trigger first-time indexing if vector store has no regulations
         try:
-            regs_raw = await self.backend_client.fetch(
-                route="/api/Regulations",
-                auth_header=auth,
-                params={"page": 1, "size": 10},
+            indexed = await is_any_regulation_indexed()
+        except Exception:
+            indexed = False
+
+        if not indexed:
+            logger.info("RegulationModule: no regulations indexed yet — triggering index")
+            try:
+                await index_all_active_regulations(auth_header=auth)
+            except Exception as exc:
+                logger.warning("RegulationModule: auto-index failed (non-fatal) — %s", exc)
+
+        # ── 1. RAG semantic search ────────────────────────────────────────────
+        chunks = await search_regulation(
+            query=agent_input.message,
+            top_k=_RAG_TOP_K,
+        )
+
+        regulation_text = ""
+        source = "rag"
+        if chunks:
+            # Order by score, build a numbered passage block
+            chunks_sorted = sorted(chunks, key=lambda c: c["score"], reverse=True)
+            passage_lines: List[str] = []
+            for i, ch in enumerate(chunks_sorted, 1):
+                title = (ch.get("metadata") or {}).get("materialTitle") or "Regulation"
+                passage_lines.append(f"[مقطع {i} — {title}]\n{ch['content']}")
+            regulation_text = "\n\n".join(passage_lines)
+            logger.info(
+                "RegulationModule: RAG returned %d chunks (top score=%.3f)",
+                len(chunks), chunks_sorted[0]["score"],
             )
-        except Exception as exc:
-            logger.error("RegulationModule: backend fetch failed — %s", exc)
-            return AgentOutput(
-                status="failed",
-                response="مش قادر أجيب اللائحة دلوقتي. حاول تاني بعد ثوانٍ.",
-            )
 
-        # Unwrap ApiResponse envelope  { success, data: [...] }
-        if isinstance(regs_raw, dict):
-            regs_list: List[Any] = regs_raw.get("data") or regs_raw.get("items") or []
-        elif isinstance(regs_raw, list):
-            regs_list = regs_raw
-        else:
-            regs_list = []
+        # ── 2. Fallback: live PDF read if RAG is empty ────────────────────────
+        if not regulation_text:
+            source = "pdf_fallback"
+            logger.info("RegulationModule: RAG empty — falling back to live PDF read")
+            regulation_text = await self._fallback_live_pdf(auth)
 
-        if not regs_list:
-            return AgentOutput(
-                status="success",
-                response="مفيش لوائح أكاديمية متاحة في السيستم دلوقتي.",
-            )
-
-        # ── 2. Read each regulation's PDF ──────────────────────────────────────
-        all_text_parts: List[str] = []
-        pdf_failed_titles: List[str] = []
-
-        for reg in regs_list[:3]:
-            title   = reg.get("title") or "لائحة"
-            content = reg.get("content") or ""
-            fileurl = reg.get("fileUrl") or reg.get("filePath") or ""
-
-            if fileurl:
-                logger.info("RegulationModule: reading PDF for '%s'", title)
-                pdf_text = await _fetch_pdf_text(fileurl, auth)
-                if pdf_text:
-                    all_text_parts.append(f"=== {title} ===\n{pdf_text}")
-                    continue
-                else:
-                    pdf_failed_titles.append(title)
-                    logger.warning("RegulationModule: PDF empty/failed for '%s' — using content field", title)
-
-            # Fallback: inline content field (may be a short description, still useful)
-            if content:
-                all_text_parts.append(f"=== {title} (وصف مختصر) ===\n{content}")
-
-        if not all_text_parts:
-            # Nothing at all — tell user clearly instead of letting LLM guess
-            first_title = regs_list[0].get("title") or "غير محدد"
-            first_url   = regs_list[0].get("fileUrl") or ""
-            link_note   = f"\nرابط الملف: {first_url}" if first_url else ""
+        if not regulation_text:
             return AgentOutput(
                 status="success",
                 response=(
-                    f"📄 اللائحة '{first_title}' موجودة في السيستم بس مش قادر أقرأ محتواها دلوقتي "
-                    f"(ممكن الملف محمي أو مش قابل للاستخراج).{link_note}\n\n"
-                    "تقدر تفتح الرابط ده مباشرة أو تطلب من الإدارة إتاحة الملف."
+                    "📄 معنديش حالياً نص اللائحة الأكاديمية متاح. ممكن الملف مش مرفوع "
+                    "في السيستم أو محمي. ابعتلي رسالة تاني بعد ما الإدارة ترفع اللائحة."
                 ),
             )
 
-        regulation_text = "\n\n".join(all_text_parts)
-
-        # Warn in the prompt if only partial content is available (PDF failed)
-        pdf_warning = ""
-        if pdf_failed_titles:
-            pdf_warning = (
-                f"\n⚠️ ملاحظة: تعذّر استخراج نص PDF لـ ({', '.join(pdf_failed_titles)}). "
-                "المحتوى المتاح هو الوصف المختصر فقط — وضّح ذلك للمستخدم بصدق إذا سأل عن تفاصيل.\n"
-            )
-
-        # ── 3. LLM answers from document only ─────────────────────────────────
-        # Inject the last 4 conversation turns so vague follow-ups like
-        # "اشرحهالي / لخصها / explain it" resolve naturally against earlier context.
+        # ── 3. Build conversation-aware prompt ────────────────────────────────
         raw_history = (ctx.get("history") or [])[-4:]
         history_block = ""
         if raw_history:
@@ -191,21 +193,22 @@ class RegulationModule:
 
         user_prompt = (
             f"{history_block}"
-            f"{pdf_warning}"
             f"سؤال المستخدم الحالي: {agent_input.message}\n\n"
-            f"=== محتوى اللائحة الأكاديمية الرسمية ===\n"
+            f"=== مقاطع مأخوذة من اللائحة الأكاديمية الرسمية ===\n"
             f"{regulation_text}\n"
-            f"=== نهاية اللائحة ===\n\n"
-            "بناءً على المحتوى أعلاه، أجب على سؤال المستخدم بشكل واضح ومنظم. "
-            "لو السؤال قصير أو فيه ضمير (زي 'اشرحهالي' أو 'لخصها')، افهم المقصود من السياق السابق "
-            "وقدّم ما لديك. لو المحتوى محدود — قل ذلك بصراحة وأرشد المستخدم."
+            f"=== نهاية المقاطع ===\n\n"
+            "بناءً على المقاطع أعلاه فقط، أجب على سؤال المستخدم إجابة مفصّلة ومنظمة. "
+            "لو السؤال قصير أو فيه ضمير زي 'اشرحهالي' أو 'لخصها' افهم المقصود من السياق "
+            "السابق. لو المعلومة مش في المقاطع المتاحة، قول كده بصراحة."
         )
 
+        # ── 4. LLM call with long max_tokens ──────────────────────────────────
         try:
             answer = await self.model_router.generate(
                 prompt=user_prompt,
-                system_instruction=_SYSTEM_PROMPT,
+                system_instruction=_get_system_prompt(),
                 model_id=model_id,
+                max_tokens=_REGULATION_MAX_TOKENS,
             )
         except Exception as exc:
             logger.error("RegulationModule: LLM call failed — %s", exc)
@@ -224,9 +227,54 @@ class RegulationModule:
             status="success",
             response=answer,
             data={
-                "module":           "RegulationModule",
-                "regulations_read": len(all_text_parts),
-                "text_chars":       len(regulation_text),
-                "model_used":       model_id,
+                "module":            "RegulationModule",
+                "source":            source,
+                "chunks_returned":   len(chunks) if chunks else 0,
+                "text_chars":        len(regulation_text),
+                "model_used":        model_id,
+                "max_tokens":        _REGULATION_MAX_TOKENS,
             },
         )
+
+    # ──────────────────────────────────────────────────────────────────────
+    #  Fallback path: live PDF download (only used when RAG is empty)
+    # ──────────────────────────────────────────────────────────────────────
+
+    async def _fallback_live_pdf(self, auth: Optional[str]) -> str:
+        """Legacy path — pull regulations from .NET and read up to N PDFs."""
+        try:
+            regs_raw = await self.backend_client.fetch(
+                route="/api/Regulations",
+                auth_header=auth,
+                params={"page": 1, "size": 10},
+            )
+        except Exception as exc:
+            logger.error("RegulationModule._fallback_live_pdf: backend fetch failed — %s", exc)
+            return ""
+
+        if isinstance(regs_raw, dict):
+            regs_list: List[Any] = regs_raw.get("data") or regs_raw.get("items") or []
+        elif isinstance(regs_raw, list):
+            regs_list = regs_raw
+        else:
+            regs_list = []
+
+        if not regs_list:
+            return ""
+
+        parts: List[str] = []
+        for reg in regs_list[:3]:
+            if not isinstance(reg, dict):
+                continue
+            title    = reg.get("title") or "لائحة"
+            content  = reg.get("content") or ""
+            file_url = reg.get("fileUrl") or reg.get("filePath") or ""
+            if file_url:
+                pdf_text = await _fetch_pdf_text(file_url, auth)
+                if pdf_text:
+                    parts.append(f"=== {title} ===\n{pdf_text}")
+                    continue
+            if content:
+                parts.append(f"=== {title} (وصف مختصر) ===\n{content}")
+
+        return "\n\n".join(parts)

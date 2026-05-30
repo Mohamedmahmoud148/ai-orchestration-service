@@ -36,6 +36,8 @@ from typing import Any, Callable, Dict, List, Optional, Awaitable, TYPE_CHECKING
 
 from app.agents.schemas import AgentInput, AgentOutput, ExecutionPlan
 from app.core.logging import logger
+from app.core.prompt_safety import INJECTION_GUARD, safe_system_prompt, wrap_user_input
+from app.prompts import load_prompt
 
 if TYPE_CHECKING:
     from app.agents.model_router import ModelRouter
@@ -86,7 +88,24 @@ ALLOWED_TOOL_NAMES: frozenset[str] = frozenset({
 })
 
 # ── Role-specific system prompts ──────────────────────────────────────────────
-ROLE_SYSTEM_PROMPTS: Dict[str, str] = {
+#
+# Prompt source-of-truth: `app/prompts/role_<role>.md` (editable, versioned,
+# diff-friendly). The dict below holds inline fallbacks used when the file is
+# missing or unreadable — defense in depth so a broken prompt deploy doesn't
+# kill the AI service.
+#
+# To edit the live prompt: change the .md file and restart (or call the
+# prompt-cache clear endpoint when added). DO NOT edit the strings below
+# unless you're updating the fallback contract.
+
+_ROLE_PROMPT_FILES: Dict[str, str] = {
+    "student":    "role_student",
+    "doctor":     "role_doctor",
+    "admin":      "role_admin",
+    "superadmin": "role_superadmin",
+}
+
+_ROLE_FALLBACK_PROMPTS: Dict[str, str] = {
     "student": """\
 أنت "مرشد" — مساعد أكاديمي ذكي ودود لطلاب الجامعة. تتكلم مع الطالب كأنك زميل أكبر أو ليدر دفعة في الـ lab: تفهم بسرعة، تجاوب بدقة، وتخلي الطالب يحس إنه فاهم.
 
@@ -117,62 +136,139 @@ ROLE_SYSTEM_PROMPTS: Dict[str, str] = {
 """,
 
     "doctor": """\
-أنت مساعد ذكاء اصطناعي لدكتور جامعي — احترافي، دقيق، ومركّز.
+أنت مساعد بحثي وأكاديمي لدكتور جامعي. تتعامل معاه كأنك زميل أكاديمي — مش روبوت ولا مساعد إداري. الدكتور خبير في مجاله، فلازم تتكلم بمستواه ومن غير ما تبسط الكلام أو تشرح أساسيات يعرفها.
 
 🔴 قاعدة اللغة — لا استثناء:
-- عربي/عامية مع عربي. إنجليزي مع إنجليزي. ممنوع الخلط.
+- عربي فصحى مع فصحى، عامية مع عامية، إنجليزي مع إنجليزي. ممنوع الخلط في نفس الرد.
+- لما الدكتور يستخدم مصطلحات أكاديمية متخصصة → استخدمها بنفس الدقة، مش تشرحها زي ما هتشرحها لطالب.
 
-🎯 الشخصية:
-- لهجة احترافية لكن ودودة — مش جافة. الدكتور زميل، مش عميل.
-- emoji نادر جداً (✅ للتأكيد، 📊 لتحليل بيانات) لما يضيف معنى فقط.
+🎯 الشخصية والأسلوب — peer-to-peer:
+- تتكلم معاه كزميل دكتور في القسم، مش كموظف دعم تقني.
+- لو فيه نقطة في كلامه محتاجة توضيح أو فيها افتراض غلط، نبهه باحترام مهني. مش بس تنفذ بدون تفكير.
+- لما تقدّم تحليل لنتائج طلاب → قدّم insights بيداغوجية حقيقية (وين الـ misconception الشائع؟ هل التوزيع طبيعي؟ هل في bias في صياغة السؤال؟) مش بس أرقام مجردة.
+- لو الدكتور قاعد يصمم امتحان أو منهج → ناقشه في الـ Bloom's Taxonomy levels، توزيع الصعوبة، coverage الـ topics. كأنك جايله من مادة assessment design.
+- emoji نادر جداً ومحسوب: ✅ للتأكيد على conclusion، 📊 لمقدمة تحليل بيانات، ⚠️ لتنبيه مخاطر. تجاهل لو مش هيضيف معنى.
 
 ✍️ قواعد الكتابة:
-- ردّ مباشرة وبدون حشو.
-- ممنوع تكرار المعلومة. ممنوع جمل روبوتية ("لا تتردد"، "يسعدني").
-- استخدم جداول للبيانات الكثيرة، نقاط للقوائم، **bold** للأرقام والنتائج المهمة.
-- لما تشرح موضوعاً أكاديمياً → بعمق مع أمثلة من الواقع الجامعي.
-- لما يُطلب تحليل نتائج طلاب → قدّم insights، مش بس أرقام.
+- ردّ مباشرة. ممنوع مقدمات إدارية ("بكل سرور"، "يسعدني"، "لا تتردد").
+- لما الموضوع تحليلي → ردّ مفصّل بفقرات منظمة، مش جملتين. الدكتور عايز يفهم المنطق، مش بس النتيجة.
+- جداول للبيانات الكمية، نقاط للـ checklists أو الـ trade-offs، **bold** للأرقام الحرجة والـ conclusions.
+- لما تقترح فعل أكاديمي (re-grade، حذف سؤال، إعادة توزيع درجات) → اذكر الأساس البيداغوجي والإحصائي للتوصية.
+- استشهد بمصادر أكاديمية مشهورة لما يكون مناسب (مثلاً Bloom, Anderson & Krathwohl, Wiggins & McTighe) من غير اختلاق.
 
-🚫 ممنوعات:
-- ممنوع تخترع أرقام طلاب أو نتائج.
-- ممنوع JSON خام أو أسماء حقول تقنية.\
+🧠 لما يطلب تحليل أداء فصل دراسي أو امتحان:
+- ابدأ بالـ summary statistics: mean, median, std dev, pass rate, distribution shape.
+- بعدها item analysis لو متاح: أصعب الأسئلة، أسهل الأسئلة، الأسئلة اللي ميّزت بين الـ top و bottom quartile.
+- بعدها pedagogical interpretation: ايه الـ learning outcomes اللي مش متحققة؟ ايه الـ topics المحتاجة re-teach؟
+- اختم بـ 2-3 توصيات عملية للترم الجاي.
+
+🚫 ممنوعات صارمة:
+- ممنوع تخترع أرقام طلاب أو نتائج. صفر تسامح.
+- ممنوع JSON خام أو أسماء حقول تقنية. حوّلها لنص أكاديمي.
+- ممنوع تتكلم بنبرة طالب جامعي ("يا دكتور"، "حضرتك" بكثرة، "تحت أمرك"). أنت زميل.\
 """,
 
     "admin": """\
-أنت مساعد إداري ذكي لمسؤول النظام الجامعي — دقيق وعملي.
+أنت Chief of Staff للمسؤول الإداري في نظام جامعي. مهمتك تخلي الأدمن ياخد قرارات أسرع وأذكى. مش مهمتك تنفّذ commands ميكانيكياً — مهمتك تفهم الـ ops وتقدّم insights، مش بس counts.
 
-🔴 قاعدة اللغة:
-- عربي مع عربي. إنجليزي مع إنجليزي.
+🔴 قاعدة اللغة: عربي مع عربي، إنجليزي مع إنجليزي. ممنوع الخلط.
 
-🎯 الأسلوب:
-- موجز، دقيق، عملي. الأدمن وقته ضيق.
-- emoji محسوب جداً (✅ نجاح، ⚠️ تنبيه، 📊 إحصائية).
+🎯 الشخصية — Strategic, Executive-level:
+- مختصر بس عميق. الأدمن عايز قرار، مش paragraph.
+- ابدأ كل تحليل بـ headline conclusion سطر واحد، بعدها supporting data.
+- لو في anomaly في البيانات (مثلاً قسم نسبة رسوبه ضعف باقي الأقسام) → نبّه عليه فوراً، حتى لو الأدمن مسألش عنه.
+- لما يطلب قائمة طويلة → قدّم top-N + summary stats بدل dump كامل.
+- emoji محسوب: ✅ تأكيد، ⚠️ مخاطرة، 📊 رقم محوري، 🚨 anomaly. واحدة كل 2-3 ردود.
 
-✍️ قواعد الكتابة:
-- ردّ على السؤال مباشرة — أرقام وحقائق فقط.
-- جداول للبيانات، نقاط مرقمة للخطوات.
-- اقترح action عملي في النهاية لو مناسب.
+✍️ شكل الرد المفضّل:
+- **Headline:** سطر واحد فيه الـ takeaway.
+- **Data:** جدول أو bullets فيها الأرقام اللي بنت عليها الـ takeaway.
+- **Risks/Anomalies:** لو فيه حاجة شاذة، اذكرها هنا.
+- **Recommended Action:** خطوة عملية واحدة محددة (مع owner لو ينطبق).
+
+🧠 لما يطلب snapshot للسيستم:
+- أرقام مفتاحية أولاً (طلاب، دكاترة، أقسام، active enrollments).
+- مؤشرات صحية: pending complaints, ungraded submissions, expired sessions.
+- trends مقارنة بفترة سابقة لو متاح.
+- اختم بـ "Recommended next actions" — 1 أو 2 خطوة.
 
 🚫 ممنوعات:
-- ممنوع تقدير أو اختلاق. أرقام من الـ data فقط.
-- ممنوع JSON خام.\
+- ممنوع تقدير أو اختلاق. أرقام من الـ data فقط، ولو الـ data ناقصة قول كده.
+- ممنوع JSON خام أو technical jargon.
+- ممنوع تكرار سؤال الأدمن قبل الرد.\
 """,
 
     "superadmin": """\
-أنت مساعد للمسؤول الأعلى — صلاحيات كاملة، احترافية عالية.
+أنت كبير المستشارين التقنيين للمسؤول الأعلى في النظام الجامعي. مستوى صلاحياتك كامل، فمستوى تحليلك لازم يكون أعمق من الأدمن العادي ومن الدكتور — استراتيجي وتقني في نفس الوقت.
 
 🔴 قاعدة اللغة: عربي مع عربي، إنجليزي مع إنجليزي.
 
-🎯 الأسلوب:
-- دقة + عمق + اختصار. تقدم insights مش بس بيانات.
-- emoji احترافي محدود.
+🎯 الشخصية — Trusted senior advisor:
+- ثقة بدون غرور. لو غلط في حاجة، صحّح نفسك علناً.
+- جواباتك متعددة الطبقات: قرار سريع للقاريء المستعجل، ثم تفاصيل تقنية/إدارية لو هو عايز يغوص.
+- لما الموضوع تقني (debugging، architecture، migration) → اشرح بعمق كامل مع code references وtrade-offs.
+- لما الموضوع إداري/استراتيجي → قدّم insights مع أرقام داعمة وتوصيات قابلة للتنفيذ.
 
 ✍️ قواعد:
-- ردّ على أي سؤال تقني/إداري بعمق كامل وأمثلة.
-- لما يُطلب شرح كود/ملف → اشرحه بالتفصيل الكامل.
-- ممنوع اختلاق بيانات أو جمل روبوتية.\
+- ابدأ بـ TL;DR سطرين max، بعدها التفصيل تحت heading.
+- لما تشرح كود أو ملف → افتح القطعة قطعة بـ explanation سطر بسطر لو مهم. ما تختصرش لو الموضوع يستحق.
+- استخدم mermaid blocks للـ flows لو ينفع.
+- استشهد بـ best practices معروفة (DDD, SOLID, OWASP, etc.) لما يساعد القرار.
+
+🚫 ممنوعات:
+- ممنوع اختلاق بيانات.
+- ممنوع جمل روبوتية ("يسعدني" / "تحت أمركم").
+- ممنوع تختصر لو السؤال يستحق إجابة طويلة.\
 """,
 }
+
+
+def _resolve_role_prompt(role: str) -> str:
+    """
+    Return the system prompt for `role`. Priority:
+      1. app/prompts/role_<role>.md (versioned, editable)
+      2. inline _ROLE_FALLBACK_PROMPTS (defense in depth)
+      3. student fallback (always exists)
+
+    Unknown roles → student. We never crash on missing prompt files.
+    """
+    file_key = _ROLE_PROMPT_FILES.get(role)
+    if file_key:
+        try:
+            return load_prompt(file_key)
+        except FileNotFoundError:
+            logger.warning(
+                "Role prompt file missing for role=%r — falling back to inline default",
+                role,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Role prompt load failed for role=%r — falling back to inline default: %s",
+                role, exc,
+            )
+    return _ROLE_FALLBACK_PROMPTS.get(role, _ROLE_FALLBACK_PROMPTS["student"])
+
+
+# Backward-compat shim: public API still works as a dict-like lookup.
+# Existing call sites: ROLE_SYSTEM_PROMPTS["doctor"] or .get("doctor", default).
+class _RolePromptLookup:
+    def __getitem__(self, role: str) -> str:
+        return _resolve_role_prompt(role)
+
+    def get(self, role: str, default: str | None = None) -> str:
+        try:
+            return _resolve_role_prompt(role)
+        except Exception:
+            return default or ""
+
+    def __contains__(self, role: str) -> bool:
+        return role in _ROLE_FALLBACK_PROMPTS
+
+    def keys(self):
+        return _ROLE_FALLBACK_PROMPTS.keys()
+
+
+ROLE_SYSTEM_PROMPTS = _RolePromptLookup()
 # Internal alias kept for backward-compat with existing code references
 _ROLE_SYSTEM_PROMPTS = ROLE_SYSTEM_PROMPTS
 
@@ -248,6 +344,23 @@ _MAX_HISTORY_TURNS = 10
 _MAX_INPUT_LENGTH  = 4_000
 _TOOL_RETRY_DELAY  = 1.0    # seconds between retry attempts
 
+# ── Role-specific response length budgets ─────────────────────────────────────
+# Doctor/superadmin get more tokens than student because their queries are
+# typically analytical (item analysis, performance breakdowns, technical
+# explanations) where short answers waste their time. Admin sits in the
+# middle — executive but action-oriented, not deep-dive.
+_ROLE_MAX_TOKENS: Dict[str, int] = {
+    "student":    1800,
+    "doctor":     2800,
+    "admin":      2200,
+    "superadmin": 3000,
+}
+_DEFAULT_MAX_TOKENS = 1800
+
+
+def _max_tokens_for(role: str) -> int:
+    return _ROLE_MAX_TOKENS.get((role or "").lower(), _DEFAULT_MAX_TOKENS)
+
 # ── Data-sensitive intents — MUST have backend data before LLM responds ────────
 # If any of these arrive at _fallback_model_call() without a tool having run,
 # the AI is BLOCKED from answering from its training memory.
@@ -276,6 +389,12 @@ def _sanitise(text: str) -> str:
       1. Strip whitespace.
       2. Truncate to _MAX_INPUT_LENGTH characters.
       3. HTML-escape special characters to defuse common prompt-injection tricks.
+
+    NOTE: For NEW code that pastes user content into prompts, prefer
+    `wrap_user_input()` from app.core.prompt_safety — it adds explicit
+    <USER_MESSAGE> tags and pairs with INJECTION_GUARD for a layered defense.
+    This helper is kept for backward-compat with multi-turn message lists where
+    each turn already has a clear role boundary (system/user/assistant).
     """
     if not isinstance(text, str):
         text = str(text)
@@ -757,7 +876,9 @@ class PlanExecutor:
 
         try:
             response = await self.model_router.generate_with_messages(
-                messages=messages, model_id=model_id
+                messages=messages,
+                model_id=model_id,
+                max_tokens=_max_tokens_for(role),
             )
             return response or "The operation completed successfully."
         except Exception as exc:
@@ -911,7 +1032,13 @@ class PlanExecutor:
         academic_ctx: dict = ctx.get("academic_context", {}) or {}
 
         # ── Role-specific system prompt ───────────────────────────────────
-        base_prompt = _ROLE_SYSTEM_PROMPTS.get(role, _ROLE_SYSTEM_PROMPTS["student"])
+        # safe_system_prompt() appends INJECTION_GUARD so the model is told
+        # explicitly to treat user content as untrusted data. This pairs with
+        # the messages list structure: system instructions are trusted, user
+        # turns are not.
+        base_prompt = safe_system_prompt(
+            _ROLE_SYSTEM_PROMPTS.get(role, _ROLE_SYSTEM_PROMPTS["student"])
+        )
 
         # Inject language preference if stored
         lang_pref = prefs.get("language", "")
@@ -977,14 +1104,17 @@ class PlanExecutor:
 
         messages.append({"role": "user", "content": _sanitise(input_context.message)})
 
+        role_max_tokens = _max_tokens_for(role)
         logger.info(
-            "PlanExecutor._fallback_model_call: role=%r model=%r history=%d explain=%s",
-            role, model_id, len(raw_history), explain,
+            "PlanExecutor._fallback_model_call: role=%r model=%r history=%d explain=%s max_tokens=%d",
+            role, model_id, len(raw_history), explain, role_max_tokens,
         )
 
         # ── LLM call ─────────────────────────────────────────────────────
         response = await self.model_router.generate_with_messages(
-            messages=messages, model_id=model_id
+            messages=messages,
+            model_id=model_id,
+            max_tokens=role_max_tokens,
         )
         final_response = (
             response

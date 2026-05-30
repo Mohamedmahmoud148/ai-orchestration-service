@@ -30,6 +30,7 @@ from app.agents.schemas import (
     PreExecutionStep,
 )
 from app.core.logging import logger
+from app.prompts import render_prompt
 
 # ── Valid intent catalogue ────────────────────────────────────────────────────
 VALID_INTENTS = {
@@ -281,7 +282,17 @@ _AVAILABLE_TOOLS = [
 ]
 
 # ── System prompt ─────────────────────────────────────────────────────────────
-_SYSTEM_PROMPT = """\
+
+def _get_system_prompt() -> str:
+    """Load planner system prompt from app/prompts/planner_system.md; fall back to inline."""
+    try:
+        return render_prompt("planner_system", tools=", ".join(_AVAILABLE_TOOLS))
+    except Exception as exc:
+        logger.warning("PlannerAgent: prompt load failed — using inline fallback: %s", exc)
+        return _SYSTEM_PROMPT_FALLBACK.format(tools=", ".join(_AVAILABLE_TOOLS))
+
+
+_SYSTEM_PROMPT_FALLBACK = """\
 You are an AI Planning Agent for a university management system.
 
 ⚠️ CRITICAL LANGUAGE RULE — apply before everything else:
@@ -568,7 +579,7 @@ Example F — When NOT to assume coreference:
       "input_payload": {{"gradeData": "{{{{step_1.output}}}}"}}, "depends_on": [1]}}
   ]
 }}
-""".format(tools=", ".join(_AVAILABLE_TOOLS))
+"""
 
 
 class MemoryStore(Protocol):
@@ -751,7 +762,7 @@ class PlannerAgent(BaseAgent):
         (generate_structured_json is a single-turn helper with no history support).
         """
         messages = [
-            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "system", "content": _get_system_prompt()},
             *history_turns,
             {"role": "user", "content": user_content},
         ]

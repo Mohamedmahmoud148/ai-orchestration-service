@@ -19,13 +19,15 @@ the existing chat route.
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from typing import TYPE_CHECKING, Optional
 
 from app.agents.execution_context import ExecutionContext
-from app.agents.schemas import AgentInput
+from app.agents.pipeline import _PipelineStageError
+from app.agents.schemas import AgentInput, ExamParams, ExecutionPlan
 from app.core.logging import logger
-from app.services.memory_store import MemoryStore
+from app.services.memory_store import MemoryStore, get_memory_store
 
 if TYPE_CHECKING:
     from app.agents.planner import PlannerAgent
@@ -33,6 +35,16 @@ if TYPE_CHECKING:
     from app.agents.model_router import ModelRouter
     from app.agents.react_agent import ReactAgent
     from app.services.tool_registry import ToolRegistry
+
+
+# Compile the file-URL detection regex once at import time instead of on
+# every response. Bounded character class + bounded path segment length
+# protects against catastrophic backtracking on hostile inputs (M2).
+_FILE_URL_PATTERN = re.compile(
+    r"https?://[A-Za-z0-9._~:/?#@!$&'()*+,;=%\-]{1,1024}?"
+    r"\.(?:pdf|xlsx|xls|docx|csv|png|jpg)",
+    re.IGNORECASE,
+)
 
 
 # ── RBAC Note ─────────────────────────────────────────────────────────────────
@@ -68,7 +80,10 @@ class Agent:
         self._model_router = model_router
         self._executor = executor
         self._react_agent = react_agent          # None → falls back to old pipeline
-        self._memory_store = MemoryStore()
+        # Use the shared singleton — main.py already ran ping() against it.
+        # If main.py hasn't constructed it yet (e.g. in a test), get_memory_store()
+        # builds it lazily and the next ping() (or no-op fallback) handles it.
+        self._memory_store = get_memory_store()
 
     # ──────────────────────────────────────────────────────────────────────
     #  Public entry-point
@@ -162,7 +177,6 @@ class Agent:
                 if exam_params:
                     exam_params["subjectOfferingId"] = offering_id
 
-                from app.agents.schemas import ExecutionPlan, ExamParams
                 intent = clarification.get("original_intent", "unknown")
                 plan = ExecutionPlan(
                     goal_summary="Clarification resolved execution.",
@@ -208,18 +222,12 @@ class Agent:
                     # skip old pipeline stages 1-4
                     plan = None
                 else:
-                    # ReactAgent failed — fall back to old pipeline
-                    logger.warning("[Agent] ReactAgent produced no result, falling back to planner pipeline")
-                    plan = await self._plan(context)
-                    self._route_model(context)
-                    module_name = self._select_module(context)
-                    await self._execute(context, plan, module_name)
-            else:
-                # ── Legacy pipeline (planner → keywords → modules) ────────
-                plan = await self._plan(context)
-                self._route_model(context)
-                module_name = self._select_module(context)
-                await self._execute(context, plan, module_name)
+                    # ReactAgent returned no result — respond gracefully
+                    logger.error("[Agent] ReactAgent produced no result for user_id=%s", context.user_id)
+                    context.set_result(
+                        "عذراً، تعذّر معالجة طلبك في الوقت الحالي. حاول مرة أخرى."
+                        "\n(Request could not be processed — please try again.)"
+                    )
         else:
             # Clarification path — always uses old executor
             await self._execute(context, plan, module_name)
@@ -250,9 +258,11 @@ class Agent:
             await self._memory_store.save_conversation(memory_key, memory_data)
 
             # ── Extract and persist any file URL found in the response ───
-            result_text = str(context.result or "")
-            import re
-            urls_found = re.findall(r'https?://[^\s\)\]"\']+\.(?:pdf|xlsx|xls|docx|csv|png|jpg)', result_text, re.IGNORECASE)
+            # Bounded regex compiled at module load (see _FILE_URL_PATTERN).
+            # Cap the search input length defensively so a 10MB response can't
+            # turn into a regex-engine DoS even though the pattern is bounded.
+            result_text = str(context.result or "")[:200_000]
+            urls_found = _FILE_URL_PATTERN.findall(result_text)
             if urls_found:
                 best_url = urls_found[0]
                 # extract filename from URL
@@ -304,8 +314,6 @@ class Agent:
                 "academic_context": context.academic_context,
             },
         )
-
-        from app.agents.pipeline import _PipelineStageError   # keep same error sentinel
 
         planner_output = await self._planner.run(agent_input)
 
@@ -373,9 +381,6 @@ class Agent:
         self, context: ExecutionContext, plan, module_name: str
     ) -> None:
         """Stage 4 — delegate execution to PlanExecutor (module dispatcher)."""
-        from app.agents.pipeline import _PipelineStageError
-        from app.agents.schemas import AgentInput
-
         logger.info(
             "[Agent] stage=executor module=%r model=%r",
             module_name,

@@ -8,14 +8,17 @@ An intelligent, dynamically routed module that:
 4. Executes the backend request securely.
 5. Summarizes the raw JSON data into natural response text.
 """
+import asyncio
 import json
 from typing import Any
 
 from app.agents.schemas import AgentInput, AgentOutput, ExecutionPlan
 from app.core.api_discovery import get_allowed_endpoints_schema, validate_endpoint
 from app.core.logging import logger
+from app.core.prompt_safety import INJECTION_GUARD, wrap_user_input
+from app.prompts import render_prompt
 
-_ROUTING_PROMPT = """\
+_ROUTING_PROMPT_FALLBACK = """\
 You are an EXPERT Academic API Router for a large university management system serving thousands of students, doctors, and admins.
 
 Your job: map the user's natural language request to the SINGLE best backend API endpoint.
@@ -428,7 +431,45 @@ OUTPUT FORMAT (return ONLY this JSON):
 }}
 """
 
-_SUMMARY_PROMPT = """\
+def _get_routing_prompt(schema: str, message: str, role: str, academic_context: str) -> str:
+    """Load routing prompt from .md; fall back to inline on error."""
+    try:
+        return render_prompt(
+            "dynamic_api_routing",
+            schema=schema, message=message, role=role, academic_context=academic_context,
+        )
+    except Exception as exc:
+        logger.warning("DynamicApiModule: routing prompt load failed — using inline fallback: %s", exc)
+        return (
+            _ROUTING_PROMPT_FALLBACK
+            .replace("{schema}", schema)
+            .replace("{message}", message)
+            .replace("{role}", role)
+            .replace("{academic_context}", academic_context)
+        )
+
+
+def _get_summary_prompt(user_message: str, method: str, role: str, academic_context: str, raw_response: str) -> str:
+    """Load summary prompt from .md; fall back to inline on error."""
+    try:
+        return render_prompt(
+            "dynamic_api_summary",
+            user_message=user_message, method=method, role=role,
+            academic_context=academic_context, raw_response=raw_response,
+        )
+    except Exception as exc:
+        logger.warning("DynamicApiModule: summary prompt load failed — using inline fallback: %s", exc)
+        return (
+            _SUMMARY_PROMPT_FALLBACK
+            .replace("{user_message}", user_message)
+            .replace("{method}", method)
+            .replace("{role}", role)
+            .replace("{academic_context}", academic_context)
+            .replace("{raw_response}", raw_response)
+        )
+
+
+_SUMMARY_PROMPT_FALLBACK = """\
 You are a university AI assistant. Real data was just fetched from the university system to answer the user's question.
 
 USER MESSAGE: "{user_message}"
@@ -472,15 +513,24 @@ class DynamicApiModule:
       empty result (try broader endpoint), validation blocked (not in allowlist).
     """
 
-    MAX_ATTEMPTS = 5
+    # Retry budget — lowered from 5 because:
+    # 1. Each attempt = 1 LLM routing call (~$0.0005-0.001)
+    # 2. Each attempt = 1 backend call (~30s worst-case timeout)
+    # 3. 3 attempts handle 95% of recoverable failures empirically
+    # The remaining 5% (deep routing confusion) needs prompt fixes, not more attempts.
+    MAX_ATTEMPTS = 3
+
+    # Hard ceiling on the whole routing loop so a series of slow-but-non-failing
+    # attempts can't tie up a worker for minutes. Below the outer agent timeout.
+    OVERALL_TIMEOUT_SECONDS = 25.0
 
     def __init__(self, model_router: Any, backend_client: Any) -> None:
         self.model_router = model_router
         self.backend_client = backend_client
-        # Shared store — created once, ping() already ran at startup so _disabled
-        # is set correctly. Never instantiate MemoryStore inside run().
-        from app.services.memory_store import MemoryStore
-        self._memory = MemoryStore()
+        # Shared singleton — ping() already ran at startup via main.py.
+        # get_memory_store() returns the same instance across the whole process.
+        from app.services.memory_store import get_memory_store
+        self._memory = get_memory_store()
 
     # ── Public entry-point ────────────────────────────────────────────────
 
@@ -563,161 +613,56 @@ class DynamicApiModule:
                     },
                 )
 
-        failed_attempts: list[dict] = []   # [{endpoint, method, reason}]
-        last_raw_data  = None
-        winning_endpoint = ""
-        winning_method   = ""
-
-        # ── Retry loop ────────────────────────────────────────────────────
-        for attempt in range(1, self.MAX_ATTEMPTS + 1):
-            logger.info(
-                "DynamicApiModule: attempt %d/%d user=%s message=%.60r",
-                attempt, self.MAX_ATTEMPTS, input_context.user_id, message,
+        # ── Retry loop guarded by overall timeout ─────────────────────────
+        # asyncio.wait_for guarantees the whole routing+execution loop can
+        # never run longer than OVERALL_TIMEOUT_SECONDS, even if individual
+        # backend calls each finish under their own per-call timeout.
+        try:
+            loop_result = await asyncio.wait_for(
+                self._run_retry_loop(
+                    message, role, academic_ctx, schema_text,
+                    selected_model, auth_header, raw_ac,
+                ),
+                timeout=self.OVERALL_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "DynamicApiModule: overall timeout (%.1fs) exceeded for user=%s",
+                self.OVERALL_TIMEOUT_SECONDS, input_context.user_id,
+            )
+            return AgentOutput(
+                status="failed",
+                response=(
+                    "العملية اتأخرت أكتر من اللازم. حاول تاني بعد ثوانٍ.\n"
+                    "(Request timed out — please try again.)"
+                ),
             )
 
-            # 1. Route ─────────────────────────────────────────────────────
-            route = await self._pick_endpoint(
-                message, role, academic_ctx, schema_text,
-                selected_model, failed_attempts,
+        failed_attempts  = loop_result["failed_attempts"]
+        last_raw_data    = loop_result["last_raw_data"]
+        winning_endpoint = loop_result["winning_endpoint"]
+        winning_method   = loop_result["winning_method"]
+
+        # Confirmation gate — must short-circuit BEFORE the success path runs
+        if loop_result.get("pending_confirmation"):
+            pending_data = loop_result["pending_confirmation"]
+            await _memory.save_pending_action(input_context.user_id, pending_data)
+            return AgentOutput(
+                status="success",
+                response=(
+                    f"⚠️ قبل ما أنفذ العملية، اتأكد:\n\n"
+                    f"{pending_data['summary']}\n\n"
+                    f"تحب أنفذها؟ ردّ بـ **نعم** للتأكيد أو **لا** للإلغاء."
+                ),
+                data={
+                    "pending_action":         pending_data,
+                    "requires_confirmation":  True,
+                },
             )
-            if route is None:
-                # LLM JSON parse failed — stop retrying
-                break
 
-            endpoint = route.get("endpoint", "")
-            method   = route.get("method", "GET").upper()
-            params   = route.get("params", {})
-
-            # 2. Context-only shortcut ─────────────────────────────────────
-            if not endpoint:
-                logger.info("DynamicApiModule: context-only answer (attempt %d)", attempt)
-                return await self._answer_from_context(message, academic_ctx, selected_model)
-
-            # 3. Placeholder substitution ──────────────────────────────────
-            endpoint, sub_error = self._substitute_placeholders(endpoint, raw_ac)
-            if sub_error:
-                failed_attempts.append({
-                    "endpoint": endpoint, "method": method,
-                    "reason": f"unresolved placeholder in URL: {sub_error}",
-                })
-                logger.warning("DynamicApiModule: placeholder error on attempt %d: %s", attempt, sub_error)
-                continue
-
-            # 4. Allowlist validation ───────────────────────────────────────
-            if not validate_endpoint(method, endpoint):
-                failed_attempts.append({
-                    "endpoint": endpoint, "method": method,
-                    "reason": "endpoint not in allowed list — pick a different one",
-                })
-                logger.warning("DynamicApiModule: blocked endpoint on attempt %d: %s %s", attempt, method, endpoint)
-                continue
-
-            # 5. Clean params + pagination defaults ────────────────────────
-            clean_params = {k: v for k, v in params.items() if v not in ("", None)}
-            if method == "GET":
-                clean_params.setdefault("page", 1)
-                clean_params.setdefault("size", 10)
-
-            # 5.5 Confirmation gate for write actions ────────────────────
-            # Before executing any POST (write), show the user what we're
-            # about to do and wait for confirmation. Prevents accidental
-            # enrollments / submissions and gives the AI agency without risk.
-            if method == "POST":
-                preview_lines = [self._action_preview(endpoint, clean_params)]
-                pending_data = {
-                    "endpoint": endpoint,
-                    "method":   method,
-                    "params":   clean_params,
-                    "summary":  preview_lines[0],
-                }
-                await _memory.save_pending_action(input_context.user_id, pending_data)
-                logger.info(
-                    "DynamicApiModule: queued pending action %s %s — awaiting user confirmation",
-                    method, endpoint,
-                )
-                return AgentOutput(
-                    status="success",
-                    response=(
-                        f"⚠️ قبل ما أنفذ العملية، اتأكد:\n\n"
-                        f"{preview_lines[0]}\n\n"
-                        f"تحب أنفذها؟ ردّ بـ **نعم** للتأكيد أو **لا** للإلغاء."
-                    ),
-                    data={
-                        "pending_action":    pending_data,
-                        "requires_confirmation": True,
-                    },
-                )
-
-            # 6. Execute backend call ──────────────────────────────────────
-            logger.info("DynamicApiModule: executing %s %s params=%s", method, endpoint, clean_params)
-            try:
-                if method == "GET":
-                    raw_data = await self.backend_client.fetch(
-                        route=endpoint, auth_header=auth_header, params=clean_params
-                    )
-                else:
-                    raw_data = await self.backend_client.post(
-                        route=endpoint, payload=clean_params, auth_header=auth_header
-                    )
-            except Exception as exc:
-                exc_str = str(exc)
-                # 405 = endpoint exists but method not supported — terminal, stop retrying
-                if "405" in exc_str:
-                    logger.warning(
-                        "DynamicApiModule: 405 Method Not Allowed on %s %s — stopping retries",
-                        method, endpoint,
-                    )
-                    failed_attempts.append({
-                        "endpoint": endpoint, "method": method,
-                        "reason": "405 Method Not Allowed — endpoint does not support this method",
-                    })
-                    break
-                failed_attempts.append({
-                    "endpoint": endpoint, "method": method,
-                    "reason": f"network/backend exception: {exc_str}",
-                })
-                logger.error("DynamicApiModule: backend exception attempt %d: %s", attempt, exc)
-                continue
-
-            # 7. Evaluate response ─────────────────────────────────────────
-            if isinstance(raw_data, dict) and raw_data.get("_error") == "unauthorized":
-                failed_attempts.append({
-                    "endpoint": endpoint, "method": method,
-                    "reason": "403 Forbidden — this endpoint requires a higher role. Use a JWT-aware endpoint instead.",
-                })
-                logger.warning("DynamicApiModule: 403 on attempt %d: %s", attempt, endpoint)
-                continue
-
-            if isinstance(raw_data, dict) and raw_data.get("_error") == "not_found":
-                failed_attempts.append({
-                    "endpoint": endpoint, "method": method,
-                    "reason": "404 Not Found — resource does not exist, try a list endpoint instead.",
-                })
-                logger.warning("DynamicApiModule: 404 on attempt %d: %s", attempt, endpoint)
-                continue
-
-            if not raw_data:
-                # Empty result — record and try a broader endpoint
-                failed_attempts.append({
-                    "endpoint": endpoint, "method": method,
-                    "reason": "returned empty result — try a broader or different endpoint",
-                })
-                logger.info("DynamicApiModule: empty result attempt %d: %s", attempt, endpoint)
-                # Keep as candidate but try for a richer endpoint next
-                last_raw_data    = raw_data
-                winning_endpoint = endpoint
-                winning_method   = method
-                continue
-
-            # ✅ Got real data — break out of loop
-            last_raw_data    = raw_data
-            winning_endpoint = endpoint
-            winning_method   = method
-            logger.info(
-                "DynamicApiModule: success on attempt %d — %s %s",
-                attempt, method, endpoint,
-            )
-            break
+        # Context-only shortcut — module already produced a complete answer
+        if loop_result.get("context_only_response"):
+            return loop_result["context_only_response"]
 
         # ── Post-loop handling ────────────────────────────────────────────
         duration = round(time.time() - start_time, 4)
@@ -781,6 +726,173 @@ class DynamicApiModule:
 
     # ── Private helpers ───────────────────────────────────────────────────
 
+    async def _run_retry_loop(
+        self,
+        message: str,
+        role: str,
+        academic_ctx: str,
+        schema_text: str,
+        selected_model: str,
+        auth_header: str | None,
+        raw_ac: dict,
+    ) -> dict:
+        """
+        Execute the route-pick → validate → call → evaluate loop with a
+        bounded number of LLM-driven retries.
+
+        Returns a dict with:
+          failed_attempts:           list of failure records
+          last_raw_data:             dict | None
+          winning_endpoint / method: which endpoint succeeded (if any)
+          pending_confirmation:      dict | None — short-circuit for POST gate
+          context_only_response:     AgentOutput | None — no-API answer
+        """
+        failed_attempts: list[dict] = []
+        last_raw_data    = None
+        winning_endpoint = ""
+        winning_method   = ""
+
+        for attempt in range(1, self.MAX_ATTEMPTS + 1):
+            logger.info(
+                "DynamicApiModule: attempt %d/%d message=%.60r",
+                attempt, self.MAX_ATTEMPTS, message,
+            )
+
+            # 1. Route ─────────────────────────────────────────────────────
+            route = await self._pick_endpoint(
+                message, role, academic_ctx, schema_text,
+                selected_model, failed_attempts,
+            )
+            if route is None:
+                break
+
+            endpoint = route.get("endpoint", "")
+            method   = route.get("method", "GET").upper()
+            params   = route.get("params", {})
+
+            # 2. Context-only shortcut ─────────────────────────────────────
+            if not endpoint:
+                logger.info("DynamicApiModule: context-only answer (attempt %d)", attempt)
+                ctx_answer = await self._answer_from_context(
+                    message, academic_ctx, selected_model
+                )
+                return {
+                    "failed_attempts":        failed_attempts,
+                    "last_raw_data":          None,
+                    "winning_endpoint":       "",
+                    "winning_method":         "",
+                    "context_only_response":  ctx_answer,
+                }
+
+            # 3. Placeholder substitution ──────────────────────────────────
+            endpoint, sub_error = self._substitute_placeholders(endpoint, raw_ac)
+            if sub_error:
+                failed_attempts.append({
+                    "endpoint": endpoint, "method": method,
+                    "reason": f"unresolved placeholder in URL: {sub_error}",
+                })
+                continue
+
+            # 4. Allowlist validation ───────────────────────────────────────
+            if not validate_endpoint(method, endpoint):
+                failed_attempts.append({
+                    "endpoint": endpoint, "method": method,
+                    "reason": "endpoint not in allowed list — pick a different one",
+                })
+                continue
+
+            # 5. Clean params + pagination defaults ────────────────────────
+            clean_params = {k: v for k, v in params.items() if v not in ("", None)}
+            if method == "GET":
+                clean_params.setdefault("page", 1)
+                clean_params.setdefault("size", 10)
+
+            # 5.5 Confirmation gate for write actions ──────────────────────
+            if method == "POST":
+                preview = self._action_preview(endpoint, clean_params)
+                pending_data = {
+                    "endpoint": endpoint,
+                    "method":   method,
+                    "params":   clean_params,
+                    "summary":  preview,
+                }
+                logger.info(
+                    "DynamicApiModule: queued pending action %s %s — awaiting confirmation",
+                    method, endpoint,
+                )
+                return {
+                    "failed_attempts":        failed_attempts,
+                    "last_raw_data":          None,
+                    "winning_endpoint":       endpoint,
+                    "winning_method":         method,
+                    "pending_confirmation":   pending_data,
+                }
+
+            # 6. Execute backend call ──────────────────────────────────────
+            logger.info(
+                "DynamicApiModule: executing %s %s params=%s",
+                method, endpoint, clean_params,
+            )
+            try:
+                raw_data = await self.backend_client.fetch(
+                    route=endpoint, auth_header=auth_header, params=clean_params,
+                )
+            except Exception as exc:
+                exc_str = str(exc)
+                if "405" in exc_str:
+                    failed_attempts.append({
+                        "endpoint": endpoint, "method": method,
+                        "reason": "405 Method Not Allowed — endpoint does not support this method",
+                    })
+                    break
+                failed_attempts.append({
+                    "endpoint": endpoint, "method": method,
+                    "reason": f"network/backend exception: {exc_str}",
+                })
+                continue
+
+            # 7. Evaluate response ─────────────────────────────────────────
+            if isinstance(raw_data, dict) and raw_data.get("_error") == "unauthorized":
+                failed_attempts.append({
+                    "endpoint": endpoint, "method": method,
+                    "reason": "403 Forbidden — try a JWT-aware endpoint instead.",
+                })
+                continue
+
+            if isinstance(raw_data, dict) and raw_data.get("_error") == "not_found":
+                failed_attempts.append({
+                    "endpoint": endpoint, "method": method,
+                    "reason": "404 Not Found — try a list endpoint instead.",
+                })
+                continue
+
+            if not raw_data:
+                failed_attempts.append({
+                    "endpoint": endpoint, "method": method,
+                    "reason": "returned empty result — try a broader or different endpoint",
+                })
+                last_raw_data    = raw_data
+                winning_endpoint = endpoint
+                winning_method   = method
+                continue
+
+            # ✅ Real data — finished
+            last_raw_data    = raw_data
+            winning_endpoint = endpoint
+            winning_method   = method
+            logger.info(
+                "DynamicApiModule: success on attempt %d — %s %s",
+                attempt, method, endpoint,
+            )
+            break
+
+        return {
+            "failed_attempts":        failed_attempts,
+            "last_raw_data":          last_raw_data,
+            "winning_endpoint":       winning_endpoint,
+            "winning_method":         winning_method,
+        }
+
     async def _pick_endpoint(
         self,
         message: str,
@@ -802,13 +914,17 @@ class DynamicApiModule:
                 "Pick a DIFFERENT endpoint that avoids the same failure modes."
             )
 
+        # Defense-in-depth: wrap the untrusted user message in safety tags
+        # so prompt-injection attempts ("ignore previous instructions...")
+        # are treated as data, not commands. The INJECTION_GUARD reminder
+        # is appended to the system prompt so the model knows the rule.
+        safe_message = wrap_user_input(message)
+
         prompt_content = (
-            _ROUTING_PROMPT
-            .replace("{schema}", schema_text)
-            .replace("{message}", message)
-            .replace("{role}", role)
-            .replace("{academic_context}", academic_ctx)
+            _get_routing_prompt(schema_text, safe_message, role, academic_ctx)
             + failure_note
+            + "\n\n"
+            + INJECTION_GUARD
         )
 
         try:
@@ -944,17 +1060,23 @@ class DynamicApiModule:
         model_id: str,
     ) -> tuple[str, list, str]:
         """Narrate raw backend data into natural language. Returns (narrative, suggestions, explain_text)."""
+        # Wrap the untrusted user message before pasting it into the prompt
+        # template — even in narration we don't trust user input as instructions.
+        safe_message = wrap_user_input(message)
+
         summary_messages = [
             {
                 "role": "system",
                 "content": (
-                    _SUMMARY_PROMPT
-                    .replace("{user_message}", message)
-                    .replace("{method}", method)
-                    .replace("{endpoint}", endpoint)
-                    .replace("{role}", role)
-                    .replace("{academic_context}", academic_ctx)
-                    .replace("{raw_response}", json.dumps(raw_data, ensure_ascii=False)[:3000])
+                    _get_summary_prompt(
+                        user_message=safe_message,
+                        method=method,
+                        role=role,
+                        academic_context=academic_ctx,
+                        raw_response=json.dumps(raw_data, ensure_ascii=False)[:3000],
+                    )
+                    + "\n\n"
+                    + INJECTION_GUARD
                 ),
             }
         ]

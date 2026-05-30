@@ -7,6 +7,28 @@ from app.core.config import settings
 from app.core.logging import logger
 
 
+# ── Module-level singleton ───────────────────────────────────────────────────
+# Multiple callers (Agent, DynamicApiModule, etc.) used to instantiate
+# MemoryStore independently. Each instance opened a fresh Redis connection
+# pool and ran its own ping(), producing duplicate auth logs and wasting
+# sockets. `get_memory_store()` returns a single shared instance.
+_singleton: Optional["MemoryStore"] = None
+
+
+def get_memory_store() -> "MemoryStore":
+    """
+    Return the process-wide MemoryStore singleton.
+
+    First call constructs it. Note: callers SHOULD `await store.ping()` once
+    at startup before relying on Redis (main.py does this). Subsequent
+    callers from agents/modules can just import and use it.
+    """
+    global _singleton
+    if _singleton is None:
+        _singleton = MemoryStore()
+    return _singleton
+
+
 class MemoryStore:
     """
     Redis-based memory store for the AI Agent.

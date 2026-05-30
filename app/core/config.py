@@ -33,6 +33,18 @@ class Settings(BaseSettings):
     # Request timeout — seconds to wait for Agent.run() before 504
     REQUEST_TIMEOUT_SECONDS: int = 60
 
+    # OpenRouter per-call timeout — seconds before we abandon a single LLM call.
+    # Must be < REQUEST_TIMEOUT_SECONDS to leave room for fallback chain.
+    OPENROUTER_TIMEOUT_SECONDS: float = 45.0
+
+    # Backend (.NET) HTTP call timeout — per request
+    BACKEND_TIMEOUT_SECONDS: float = 30.0
+
+    # Backend circuit breaker — opens after this many consecutive failures,
+    # stays open for BACKEND_BREAKER_RESET_SECONDS, then half-open trial.
+    BACKEND_BREAKER_FAIL_THRESHOLD: int = 5
+    BACKEND_BREAKER_RESET_SECONDS: float = 30.0
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

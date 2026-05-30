@@ -87,13 +87,17 @@ class ModelRouter:
         self,
         model_id: str,
         messages: List[dict],
+        max_tokens: Optional[int] = None,
     ) -> dict | None:
         """Call OpenRouter for a strict JSON response."""
-        response = await self.openai_client.chat.completions.create(
-            model=model_id,
-            messages=messages,
-            response_format={"type": "json_object"},
-        )
+        kwargs: dict = {
+            "model": model_id,
+            "messages": messages,
+            "response_format": {"type": "json_object"},
+        }
+        if max_tokens:
+            kwargs["max_tokens"] = max_tokens
+        response = await self.openai_client.chat.completions.create(**kwargs)
         content = response.choices[0].message.content
         if content:
             return json.loads(content)
@@ -103,12 +107,13 @@ class ModelRouter:
         self,
         model_id: str,
         messages: List[dict],
+        max_tokens: Optional[int] = None,
     ) -> str | None:
         """Call OpenRouter for a plain-text response."""
-        response = await self.openai_client.chat.completions.create(
-            model=model_id,
-            messages=messages,
-        )
+        kwargs: dict = {"model": model_id, "messages": messages}
+        if max_tokens:
+            kwargs["max_tokens"] = max_tokens
+        response = await self.openai_client.chat.completions.create(**kwargs)
         return response.choices[0].message.content
 
     async def stream_with_messages(
@@ -231,6 +236,7 @@ class ModelRouter:
         messages: List[dict],
         model_id: str = DEFAULT_MODEL,
         response_format: Optional[dict] = None,
+        max_tokens: Optional[int] = None,
     ) -> str | None:
         """
         Multi-turn generation using a pre-built messages list.
@@ -289,7 +295,7 @@ class ModelRouter:
                 non_sys = [m for m in messages if m["role"] != "system"]
                 response = await self.anthropic_client.messages.create(
                     model=model_id,
-                    max_tokens=4096,
+                    max_tokens=max_tokens or 4096,
                     system=sys_msg,
                     messages=non_sys,
                 )
@@ -299,10 +305,14 @@ class ModelRouter:
             if self.openai_client:
                 if response_format and response_format.get("type") == "json_object":
                     # JSON mode: call openrouter_json and return as string
-                    result = await self._call_with_fallback_json(model_id, messages)
+                    result = await self._call_with_fallback_json(
+                        model_id, messages, max_tokens=max_tokens
+                    )
                     import json as _json
                     return _json.dumps(result, ensure_ascii=False) if result else None
-                return await self._call_with_fallback_text(model_id, messages)
+                return await self._call_with_fallback_text(
+                    model_id, messages, max_tokens=max_tokens
+                )
 
             logger.error(
                 "ModelRouter.generate_with_messages: no client for model_id=%s", model_id
@@ -324,13 +334,16 @@ class ModelRouter:
         prompt: str,
         system_instruction: str = "",
         model_id: str = DEFAULT_MODEL,
+        max_tokens: Optional[int] = None,
     ) -> str | None:
         """Single-turn text generation — thin wrapper around generate_with_messages."""
         messages: List[dict] = []
         if system_instruction:
             messages.append({"role": "system", "content": system_instruction})
         messages.append({"role": "user", "content": prompt})
-        return await self.generate_with_messages(messages, model_id=model_id)
+        return await self.generate_with_messages(
+            messages, model_id=model_id, max_tokens=max_tokens
+        )
 
     # ─────────────────────────────────────────────────────────────────────────
     #  Public: summarize
@@ -403,6 +416,7 @@ class ModelRouter:
         self,
         primary: str,
         messages: List[dict],
+        max_tokens: Optional[int] = None,
     ) -> dict | None:
         """
         Try primary model → fallback_1 → fallback_2 for JSON responses.
@@ -412,7 +426,7 @@ class ModelRouter:
         for model in candidates:
             try:
                 logger.debug("OpenRouter JSON attempt: model=%s", model)
-                result = await self._openrouter_json(model, messages)
+                result = await self._openrouter_json(model, messages, max_tokens=max_tokens)
                 if result is not None:
                     return result
                 logger.warning("OpenRouter: empty JSON from %s — trying next", model)
@@ -425,6 +439,7 @@ class ModelRouter:
         self,
         primary: str,
         messages: List[dict],
+        max_tokens: Optional[int] = None,
     ) -> str | None:
         """
         Try primary model → fallback_1 → fallback_2 for text responses.
@@ -434,7 +449,7 @@ class ModelRouter:
         for model in candidates:
             try:
                 logger.debug("OpenRouter text attempt: model=%s", model)
-                result = await self._openrouter_text(model, messages)
+                result = await self._openrouter_text(model, messages, max_tokens=max_tokens)
                 if result is not None:
                     return result
                 logger.warning("OpenRouter: empty text from %s — trying next", model)

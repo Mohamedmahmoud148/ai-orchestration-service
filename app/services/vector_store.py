@@ -20,6 +20,7 @@ Public API:
 """
 from __future__ import annotations
 
+import asyncio
 import os
 from typing import Any, Dict, List, Optional
 
@@ -108,7 +109,8 @@ class VectorStore:
         metadatas = [_sanitise_metadata(m) for m in metadatas]
 
         try:
-            self._collection.upsert(
+            await asyncio.to_thread(
+                self._collection.upsert,
                 ids=ids,
                 embeddings=embeddings,
                 documents=documents,
@@ -148,15 +150,19 @@ class VectorStore:
         )
 
         try:
-            kwargs: Dict[str, Any] = {
-                "query_embeddings": [query_embedding],
-                "n_results": min(top_k, max(1, self._collection.count())),
-                "include": ["documents", "metadatas", "distances"],
-            }
-            if where:
-                kwargs["where"] = where
+            # count() and query() are both sync — run together in a thread
+            # so the event loop never blocks on either.
+            def _run_query() -> Dict[str, Any]:
+                kwargs: Dict[str, Any] = {
+                    "query_embeddings": [query_embedding],
+                    "n_results": min(top_k, max(1, self._collection.count())),
+                    "include": ["documents", "metadatas", "distances"],
+                }
+                if where:
+                    kwargs["where"] = where
+                return self._collection.query(**kwargs)
 
-            result = self._collection.query(**kwargs)
+            result = await asyncio.to_thread(_run_query)
 
             hits = []
             ids        = result.get("ids", [[]])[0]
@@ -187,8 +193,9 @@ class VectorStore:
             logger.warning("VectorStore.delete_material: store unavailable — skipping.")
             return
         try:
-            self._collection.delete(
-                where={"materialId": material_id}
+            await asyncio.to_thread(
+                self._collection.delete,
+                where={"materialId": material_id},
             )
             logger.info("VectorStore: deleted chunks for material_id=%s.", material_id)
         except Exception as exc:
@@ -204,7 +211,7 @@ class VectorStore:
                 "message": "ChromaDB is unavailable.",
             }
         try:
-            count = self._collection.count()
+            count = await asyncio.to_thread(self._collection.count)
             return {
                 "available": True,
                 "collection": _COLLECTION_NAME,
@@ -214,6 +221,55 @@ class VectorStore:
         except Exception as exc:
             logger.error("VectorStore.get_collection_stats error: %s", exc)
             return {"available": False, "error": str(exc)}
+
+    # ──────────────────────────────────────────────────────────────────────
+    #  Async-safe escape hatches for callers that need raw collection ops
+    #  (regulation_indexer uses these for `where`-filter `get()` and
+    #  filtered queries). Always wrap sync chroma calls — never call
+    #  self._collection.{get,query,count,...} directly from async code.
+    # ──────────────────────────────────────────────────────────────────────
+
+    async def collection_get(
+        self,
+        where: Optional[Dict[str, Any]] = None,
+        limit: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Async-safe wrapper for `_collection.get(where=..., limit=...)`."""
+        if not self._available or self._collection is None:
+            return {}
+        try:
+            return await asyncio.to_thread(
+                self._collection.get,
+                where=where or {},
+                limit=limit,
+            )
+        except Exception as exc:
+            logger.warning("VectorStore.collection_get: failed — %s", exc)
+            return {}
+
+    async def collection_query(
+        self,
+        query_embedding: List[float],
+        where: Optional[Dict[str, Any]] = None,
+        top_k: int = 5,
+    ) -> Dict[str, Any]:
+        """Async-safe wrapper for `_collection.query(...)` with optional where filter."""
+        if not self._available or self._collection is None:
+            return {}
+        try:
+            def _run() -> Dict[str, Any]:
+                kwargs: Dict[str, Any] = {
+                    "query_embeddings": [query_embedding],
+                    "n_results": min(top_k, max(1, self._collection.count())),
+                    "include": ["documents", "metadatas", "distances"],
+                }
+                if where:
+                    kwargs["where"] = where
+                return self._collection.query(**kwargs)
+            return await asyncio.to_thread(_run)
+        except Exception as exc:
+            logger.warning("VectorStore.collection_query: failed — %s", exc)
+            return {}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

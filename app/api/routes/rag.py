@@ -19,6 +19,11 @@ from pydantic import BaseModel, Field
 from app.core.logging import logger
 from app.services.chunker import chunk_text
 from app.services.embedding_service import embedding_service
+from app.services.regulation_indexer import (
+    index_all_active_regulations,
+    is_any_regulation_indexed,
+    reindex_regulation,
+)
 from app.services.vector_store import vector_store
 
 router = APIRouter(prefix="/api/rag", tags=["RAG"])
@@ -239,6 +244,62 @@ async def delete_material(material_id: str) -> Dict[str, str]:
 async def get_stats() -> Dict[str, Any]:
     """Return ChromaDB collection statistics."""
     return await vector_store.get_collection_stats()
+
+
+# ── Regulation indexing endpoints (Academic Advisor v2 foundation) ────────────
+
+
+class IndexRegulationsRequest(BaseModel):
+    auth_header: Optional[str] = Field(
+        None,
+        description=(
+            "Optional bearer token forwarded to .NET when downloading "
+            "regulation PDFs that require authentication. Public R2 URLs do not need it."
+        ),
+    )
+
+
+class ReindexRegulationRequest(BaseModel):
+    regulation_id: str
+    file_url: str = ""
+    title: str = "Regulation"
+    inline_content: Optional[str] = None
+    auth_header: Optional[str] = None
+
+
+@router.post("/index-regulations", status_code=200)
+async def index_regulations_endpoint(
+    req: Optional[IndexRegulationsRequest] = None,
+) -> Dict[str, Any]:
+    """
+    Pull every regulation from /api/Regulations, download their PDFs,
+    chunk + embed them, and store them as RAG chunks.
+
+    Safe to re-run — upserts replace existing chunks.
+    """
+    auth = req.auth_header if req else None
+    return await index_all_active_regulations(auth_header=auth)
+
+
+@router.post("/reindex-regulation", status_code=200)
+async def reindex_regulation_endpoint(
+    req: ReindexRegulationRequest,
+) -> Dict[str, Any]:
+    """Reindex a single regulation by id (used when admin uploads a new PDF)."""
+    return await reindex_regulation(
+        regulation_id=req.regulation_id,
+        file_url=req.file_url,
+        title=req.title,
+        auth_header=req.auth_header,
+        inline_content=req.inline_content,
+    )
+
+
+@router.get("/regulation-status", status_code=200)
+async def regulation_status_endpoint() -> Dict[str, Any]:
+    """Quick check whether any regulation is currently indexed."""
+    indexed = await is_any_regulation_indexed()
+    return {"any_regulation_indexed": indexed}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

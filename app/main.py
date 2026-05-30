@@ -25,7 +25,7 @@ from app.core.logging import logger, setup_logging
 from app.core.middleware import CorrelationIDMiddleware, RequestTimingMiddleware
 from app.core.rate_limiter import RateLimiter
 from app.services.backend_client import tool_execution_client
-from app.services.memory_store import MemoryStore
+from app.services.memory_store import get_memory_store
 from app.services.model_service import local_model_service
 from app.services.tool_registry import tool_registry
 
@@ -59,11 +59,13 @@ async def lifespan(app: FastAPI):
         )
     logger.info("OpenRouter API key: configured.")
 
-    # Confirm BackendClient singleton initialised correctly.
+    # Confirm BackendClient singleton initialised correctly + open httpx pool.
     # (ToolExecutionClient.__init__ raises RuntimeError if URL is missing;
     #  this is a belt-and-suspenders log confirming it is alive.)
+    await tool_execution_client.start()
     logger.info(
-        "ToolExecutionClient ready (base_url=%s).", tool_execution_client.base_url
+        "ToolExecutionClient ready (base_url=%s, pool=open, breaker=closed).",
+        tool_execution_client.base_url,
     )
 
     # ── 1.5 Fetch and Cache Dynamic API Schema ────────────────────────
@@ -72,13 +74,23 @@ async def lifespan(app: FastAPI):
     await api_discovery.fetch_and_filter_schema()
 
     # ── 2. OpenRouter LLM client (OpenAI-compatible) ──────────────────
+    # `timeout=` here is the SDK-level cap per request; OpenRouter sometimes
+    # hangs on overloaded models. Without it, a single bad request would tie
+    # up a worker indefinitely. Keep it under REQUEST_TIMEOUT_SECONDS so the
+    # outer agent timeout can still fire and return a useful error.
     openai_client = AsyncOpenAI(
         api_key=settings.OPENROUTER_API_KEY,
         base_url="https://openrouter.ai/api/v1",
+        timeout=settings.OPENROUTER_TIMEOUT_SECONDS,
+        max_retries=0,   # we own the retry loop via model_router fallback chain
         default_headers={
             "HTTP-Referer": "University AI System",
             "X-Title": "University AI Agent",
         },
+    )
+    logger.info(
+        "OpenRouter client: timeout=%.1fs max_retries=0 (fallback chain owns retries)",
+        settings.OPENROUTER_TIMEOUT_SECONDS,
     )
     app.state.openrouter_client = openai_client
     logger.info("OpenRouter client initialised (base_url=https://openrouter.ai/api/v1).")
@@ -89,7 +101,7 @@ async def lifespan(app: FastAPI):
         local_model_service=local_model_service,
     )
 
-    memory_store = MemoryStore()
+    memory_store = get_memory_store()  # process-wide singleton
     await memory_store.ping()          # disable permanently if auth fails
     app.state.memory_store = memory_store
     app.state.rate_limiter = RateLimiter()
@@ -135,11 +147,45 @@ async def lifespan(app: FastAPI):
         vector_store._available,
     )
 
+    # ── 6. Auto-index academic regulations on first boot ─────────────
+    # Non-blocking: scheduled as a background task so a slow .NET backend
+    # or large PDF doesn't delay app startup. The AcademicAdvisor v2 and
+    # RegulationModule both have on-demand fallbacks if this hasn't finished.
+    if vector_store._available:
+        import asyncio
+        from app.services.regulation_indexer import (
+            index_all_active_regulations,
+            is_any_regulation_indexed,
+        )
+
+        async def _bootstrap_regulation_index() -> None:
+            try:
+                if await is_any_regulation_indexed():
+                    logger.info("Regulation auto-index: already indexed — skipping.")
+                    return
+                logger.info("Regulation auto-index: starting background reindex.")
+                result = await index_all_active_regulations(auth_header=None)
+                logger.info(
+                    "Regulation auto-index: done — status=%s total_chunks=%d",
+                    result.get("status"), result.get("total_chunks", 0),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Regulation auto-index failed (non-fatal) — modules will fall back: %s",
+                    exc,
+                )
+
+        asyncio.create_task(_bootstrap_regulation_index())
+
     yield
 
     # ── Shutdown ───────────────────────────────────────────────────────
     logger.info("Shutting down AI Orchestration Service.")
     app.state.agent = None
+    try:
+        await tool_execution_client.aclose()
+    except Exception as exc:
+        logger.warning("Shutdown: tool_execution_client.aclose failed — %s", exc)
 
 
 # ─────────────────────────────────────────────────────────────

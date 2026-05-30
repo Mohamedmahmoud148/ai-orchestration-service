@@ -218,75 +218,96 @@ async def chat_stream_endpoint(
         metadata={"auth_header": auth_header, "explain": request.explain, "stream": True},
     )
 
+    # Grab the ReactAgent instance if available (assembled at startup)
+    react_agent = getattr(agent, "_react_agent", None)
+
     async def event_generator():
+        import asyncio as _asyncio
+
         try:
-            # Run the full pipeline first — planner, RBAC, modules, narration —
-            # then stream the FINAL text token-by-token. The pipeline itself
-            # isn't token-streamable because it involves multiple LLM hops and
-            # backend tool calls; what the user sees as "streaming" is the
-            # final narration replayed at typing speed.
-            try:
-                await agent.run(context)
-            except _PipelineStageError as exc:
-                yield f"data: {_json.dumps({'type': 'error', 'message': exc.detail})}\n\n"
-                yield "data: {\"type\": \"done\"}\n\n"
-                return
+            # ── Phase 1: Signal immediately that work has started ─────────
+            yield f"data: {_json.dumps({'type': 'thinking'})}\n\n"
 
-            final_text = str(context.result or "")
-            executor_data = (context.metadata or {}).get("executor_data", {}) or {}
+            # ── Phase 2: Decide streaming strategy ────────────────────────
+            # ReactAgent path: run memory/context loading via agent (Stage 0),
+            # then stream the final answer via ReactAgent.stream_run().
+            # This gives true token-level streaming for the final LLM call
+            # while keeping all the memory/RBAC/rate-limit logic intact.
+            use_react_stream = react_agent is not None
 
-            # If the model_router is available AND the response came from a
-            # general_chat / narrator path, re-issue the call in streaming mode
-            # for a true ChatGPT-like effect. Otherwise we stream the cached
-            # text in word-sized chunks (still feels live, no extra LLM cost).
-            stream_via_llm = (
-                model_router is not None
-                and context.intent in ("general_chat", None, "")
-                and len(final_text) < 4000  # safety cap
-            )
+            if use_react_stream:
+                # Stage 0 only: load memory + academic profile into context.
+                # We replicate the non-LLM setup stages from agent.run() so
+                # memory is available but we drive the LLM ourselves below.
+                memory_store = getattr(agent, "_memory_store", None)
+                if memory_store:
+                    try:
+                        memory_key = (
+                            f"{context.user_id}:{context.conversation_id}"
+                            if context.conversation_id else context.user_id
+                        )
+                        memory = await memory_store.get_conversation(memory_key)
+                        if memory:
+                            context.add_metadata("memory", memory)
+                        prefs = await memory_store.get_preferences(context.user_id)
+                        if prefs:
+                            context.add_metadata("preferences", prefs)
+                        academic_profile = await memory_store.get_academic_profile(context.user_id)
+                        if academic_profile:
+                            context.add_metadata("academic_profile", academic_profile)
+                    except Exception as mem_exc:
+                        logger.warning("chat/stream: memory load failed — %s", mem_exc)
 
-            if stream_via_llm:
-                # Re-stream from the model so the user sees token-level output.
-                # Use the same system + history we'd use for fallback.
-                from app.agents.executor import ROLE_SYSTEM_PROMPTS
-                role = context.role or "student"
-                sys_prompt = ROLE_SYSTEM_PROMPTS.get(role, ROLE_SYSTEM_PROMPTS["student"])
-                messages = [{"role": "system", "content": sys_prompt}]
-                for turn in (context.history or [])[-10:]:
-                    tr = turn.get("role")
-                    tc = turn.get("content", "")
-                    if tr in ("user", "assistant") and tc:
-                        messages.append({"role": tr, "content": str(tc)})
-                messages.append({"role": "user", "content": context.message})
-
-                full = []
+                # Stream via ReactAgent — tool calls run in parallel internally,
+                # final answer is streamed token-by-token.
+                collected: list[str] = []
                 try:
-                    async for chunk in model_router.stream_with_messages(
-                        messages=messages,
-                        model_id=context.selected_model or "openai/gpt-4o-mini",
-                    ):
-                        full.append(chunk)
-                        yield f"data: {_json.dumps({'type': 'token', 'content': chunk})}\n\n"
-                    final_text = "".join(full) or final_text
+                    async for token in react_agent.stream_run(context):
+                        collected.append(token)
+                        yield f"data: {_json.dumps({'type': 'token', 'content': token})}\n\n"
+                    final_text = "".join(collected)
+                    context.set_result(final_text)
                 except Exception as exc:
-                    logger.warning("chat/stream: LLM stream failed (%s) — falling back to chunked replay", exc)
-                    # Fall back to chunked replay below
-                    stream_via_llm = False
+                    logger.error("chat/stream: ReactAgent.stream_run failed — %s", exc, exc_info=True)
+                    # Fall back to full pipeline
+                    use_react_stream = False
 
-            if not stream_via_llm:
-                # Replay the already-computed text in small chunks so the UI
-                # still feels alive even for tool-result narrations.
-                import asyncio
-                words = final_text.split(" ")
-                buf = []
-                for i, w in enumerate(words):
-                    buf.append(w)
-                    if len(buf) >= 3 or i == len(words) - 1:
-                        chunk = (" " if i >= 3 else "") + " ".join(buf)
-                        yield f"data: {_json.dumps({'type': 'token', 'content': chunk})}\n\n"
-                        buf = []
-                        await asyncio.sleep(0.02)
+                # Save memory after streaming
+                if use_react_stream and memory_store:
+                    try:
+                        memory_key = (
+                            f"{context.user_id}:{context.conversation_id}"
+                            if context.conversation_id else context.user_id
+                        )
+                        await memory_store.save_conversation(memory_key, {
+                            "last_intent": context.intent,
+                            "last_result": context.result,
+                            "entities": {},
+                        })
+                    except Exception:
+                        pass
 
+            if not use_react_stream:
+                # ── Fallback: run full pipeline then replay result ─────────
+                try:
+                    await agent.run(context)
+                except _PipelineStageError as exc:
+                    yield f"data: {_json.dumps({'type': 'error', 'message': exc.detail})}\n\n"
+                    yield "data: {\"type\": \"done\"}\n\n"
+                    return
+
+                final_text = str(context.result or "")
+
+                # Replay the computed text in 3-word chunks at typing speed.
+                # Only replay if we haven't already streamed it above.
+                words = final_text.split()
+                for i in range(0, len(words), 3):
+                    chunk = " ".join(words[i:i + 3]) + " "
+                    yield f"data: {_json.dumps({'type': 'token', 'content': chunk})}\n\n"
+                    await _asyncio.sleep(0.018)
+
+            # ── Phase 3: Send metadata frame ──────────────────────────────
+            executor_data = (context.metadata or {}).get("executor_data", {}) or {}
             meta_frame = {
                 "type": "meta",
                 "intent": context.intent or "unknown",
@@ -295,7 +316,7 @@ async def chat_stream_endpoint(
                 "conversation_id": context.conversation_id,
                 "suggestions": executor_data.get("suggestions", []),
                 "actions_available": executor_data.get("actions_available", []),
-                "emotion": detect_emotion(final_text),
+                "emotion": detect_emotion(final_text if "final_text" in dir() else ""),
             }
             yield f"data: {_json.dumps(meta_frame, ensure_ascii=False)}\n\n"
             yield "data: {\"type\": \"done\"}\n\n"
