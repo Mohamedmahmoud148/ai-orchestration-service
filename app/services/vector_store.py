@@ -66,15 +66,32 @@ class VectorStore:
             import chromadb  # type: ignore
 
             os.makedirs(_CHROMA_DATA_DIR, exist_ok=True)
+
+            # Verify the directory is writable before creating the client
+            _test_file = os.path.join(_CHROMA_DATA_DIR, ".write_test")
+            try:
+                with open(_test_file, "w") as f:
+                    f.write("ok")
+                os.remove(_test_file)
+            except OSError as err:
+                logger.error(
+                    "VectorStore: ChromaDB data dir %s is NOT writable — "
+                    "RAG persistence will fail. Mount a writable volume. Error: %s",
+                    _CHROMA_DATA_DIR, err,
+                )
+                # Continue anyway; ChromaDB may still work in-memory
+
             client = chromadb.PersistentClient(path=_CHROMA_DATA_DIR)
             self._collection = client.get_or_create_collection(
                 name=_COLLECTION_NAME,
                 metadata={"hnsw:space": "cosine"},
             )
+            count = self._collection.count()
             self._available = True
             logger.info(
-                "VectorStore: ChromaDB initialised (path=%s, collection=%s).",
-                _CHROMA_DATA_DIR, _COLLECTION_NAME,
+                "VectorStore: ChromaDB initialised — path=%s collection=%s "
+                "existing_chunks=%d writable=True",
+                _CHROMA_DATA_DIR, _COLLECTION_NAME, count,
             )
         except ImportError:
             logger.warning(
@@ -235,19 +252,59 @@ class VectorStore:
                 "available": False,
                 "collection": _COLLECTION_NAME,
                 "total_chunks": 0,
+                "data_dir": _CHROMA_DATA_DIR,
                 "message": "ChromaDB is unavailable.",
             }
         try:
             count = await asyncio.to_thread(self._collection.count)
+            writable = os.access(_CHROMA_DATA_DIR, os.W_OK)
             return {
                 "available": True,
                 "collection": _COLLECTION_NAME,
                 "total_chunks": count,
-                "chroma_data_dir": _CHROMA_DATA_DIR,
+                "data_dir": _CHROMA_DATA_DIR,
+                "data_dir_writable": writable,
+                "min_score_threshold": _MIN_SCORE,
             }
         except Exception as exc:
             logger.error("VectorStore.get_collection_stats error: %s", exc)
             return {"available": False, "error": str(exc)}
+
+    async def probe(self) -> Dict[str, Any]:
+        """
+        Quick write + read probe — verifies end-to-end ChromaDB functionality.
+        Used by the /health/rag endpoint.
+        """
+        if not self._available or self._collection is None:
+            return {"ok": False, "reason": "ChromaDB not initialised"}
+        try:
+            test_id = "__health_probe__"
+            test_vec = [0.1] * 384 + [0.0] * (self._collection_dim() - 384)
+
+            # Try a lightweight upsert + get + delete cycle
+            def _run_probe():
+                self._collection.upsert(
+                    ids=[test_id],
+                    embeddings=[[0.01] * max(1, self._collection_dim())],
+                    documents=["health probe"],
+                    metadatas=[{"type": "probe"}],
+                )
+                result = self._collection.get(ids=[test_id])
+                self._collection.delete(ids=[test_id])
+                return len(result.get("ids", [])) == 1
+
+            ok = await asyncio.to_thread(_run_probe)
+            return {"ok": ok, "data_dir": _CHROMA_DATA_DIR}
+        except Exception as exc:
+            return {"ok": False, "reason": str(exc)}
+
+    def _collection_dim(self) -> int:
+        """Infer embedding dimension from existing collection metadata (best-effort)."""
+        try:
+            meta = self._collection.metadata or {}
+            return int(meta.get("embedding_dim", 384))
+        except Exception:
+            return 384
 
     # ──────────────────────────────────────────────────────────────────────
     #  Async-safe escape hatches for callers that need raw collection ops

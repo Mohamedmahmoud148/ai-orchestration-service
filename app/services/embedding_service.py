@@ -3,158 +3,268 @@ app/services/embedding_service.py
 
 Embedding service for the RAG pipeline.
 
-Uses the OpenAI text-embedding-3-small model via the official AsyncOpenAI
-client.  Falls back to TF-IDF-style keyword overlap similarity when no
-OPENAI_API_KEY is configured.
+Provider priority (first available wins):
+  1. OpenAI-compatible API — any provider that implements POST /embeddings.
+     Configured via:
+       OPENAI_API_KEY     — direct OpenAI key (most common)
+       EMBEDDING_BASE_URL — base URL (default: https://api.openai.com/v1)
+       EMBEDDING_MODEL    — model name (default: text-embedding-3-small)
+     This covers: OpenAI directly, Azure OpenAI, Together AI, Voyage AI,
+     any local server (LM Studio, Ollama, etc.).
+
+  2. sentence-transformers — lightweight multilingual local embeddings.
+     Used automatically if the `sentence-transformers` package is installed
+     AND no API key is configured.
+     Recommended model: paraphrase-multilingual-MiniLM-L12-v2 (420 MB).
+     Covers Arabic text well.
+
+  3. Keyword-overlap fallback — hash-bucket TF-IDF pseudo-embeddings.
+     Deterministic, reproducible, zero deps, but semantically weak.
+     Used when neither option above is available.
 
 Environment variables:
-  OPENAI_API_KEY  — OpenAI API key (direct, not via OpenRouter).
-                    OpenRouter does not support the Embeddings endpoint,
-                    so we always call api.openai.com directly.
+  OPENAI_API_KEY     — required for provider 1
+  EMBEDDING_BASE_URL — default: https://api.openai.com/v1
+  EMBEDDING_MODEL    — default: text-embedding-3-small
 
 Public API:
-  embed_text(text)           → list[float]
-  embed_batch(texts)         → list[list[float]]
-  cosine_similarity(a, b)    → float
+  embed_text(text)              → list[float]
+  embed_batch(texts)            → list[list[float]]
+  cosine_similarity(a, b)       → float
+  is_using_real_embeddings()    → bool
+  get_mode()                    → str   ("openai_api" | "sentence_transformers" | "keyword_fallback")
 """
 from __future__ import annotations
 
 import math
-import os
 import re
 from typing import List, Optional
 
 from app.core.logging import logger
 
-_OPENAI_EMBEDDING_MODEL = "text-embedding-3-small"
-_EMBEDDING_DIM = 1536  # text-embedding-3-small output dimension
+# Import settings lazily to avoid circular imports at module load time
+def _get_settings():
+    from app.core.config import settings
+    return settings
 
 
-def _zeros(dim: int = _EMBEDDING_DIM) -> List[float]:
-    return [0.0] * dim
+# ── SentenceTransformer local model name ─────────────────────────────────────
+# Multilingual, ~420 MB, works well for Arabic + English.
+# Smaller alternative: paraphrase-multilingual-MiniLM-L12-v2 (same name).
+_ST_MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
+_ST_EMBEDDING_DIM = 384       # output dimension of the ST model above
 
 
 class EmbeddingService:
     """
-    Async embedding service.
+    Multi-provider embedding service.
 
-    Instantiation is lightweight — the OpenAI client is lazily created on
-    first use so that the service can be imported without side-effects even
-    when OPENAI_API_KEY is absent.
+    Mode is determined at construction time based on environment variables
+    and available packages. The mode is logged at startup so you can always
+    tell which provider is active.
     """
 
     def __init__(self) -> None:
-        self._client: Optional[object] = None   # AsyncOpenAI or None
-        self._fallback_mode = False
-        self._api_key: Optional[str] = os.getenv("OPENAI_API_KEY")
-        if not self._api_key:
-            logger.warning(
-                "EmbeddingService: OPENAI_API_KEY not set — "
-                "falling back to keyword-overlap similarity (no real embeddings)."
+        s = _get_settings()
+        self._api_key: str = s.OPENAI_API_KEY or ""
+        self._base_url: str = (s.EMBEDDING_BASE_URL or "https://api.openai.com/v1").rstrip("/")
+        self._model: str   = s.EMBEDDING_MODEL or "text-embedding-3-small"
+        self._embedding_dim: int = 1536  # default for text-embedding-3-small
+
+        self._openai_client = None     # AsyncOpenAI — lazy
+        self._st_model = None          # SentenceTransformer — lazy
+
+        # Determine mode
+        if self._api_key:
+            self._mode = "openai_api"
+            logger.info(
+                "EmbeddingService: mode=openai_api base=%s model=%s",
+                self._base_url, self._model,
             )
-            self._fallback_mode = True
+        elif self._try_load_sentence_transformers():
+            self._mode = "sentence_transformers"
+            logger.info(
+                "EmbeddingService: mode=sentence_transformers model=%s dim=%d",
+                _ST_MODEL_NAME, _ST_EMBEDDING_DIM,
+            )
+            self._embedding_dim = _ST_EMBEDDING_DIM
+        else:
+            self._mode = "keyword_fallback"
+            logger.warning(
+                "EmbeddingService: mode=keyword_fallback — RAG semantic quality is DEGRADED. "
+                "Set OPENAI_API_KEY (or install sentence-transformers) for real embeddings."
+            )
 
-    # ──────────────────────────────────────────────────────────────────────
-    #  Client initialisation (lazy)
-    # ──────────────────────────────────────────────────────────────────────
+    # ── Mode detection helpers ────────────────────────────────────────────────
 
-    def _get_client(self):
-        if self._client is None and not self._fallback_mode:
+    def _try_load_sentence_transformers(self) -> bool:
+        """
+        Try to load the SentenceTransformer model.
+        Returns True if successful. Silent on failure.
+        """
+        try:
+            from sentence_transformers import SentenceTransformer  # type: ignore
+            self._st_model = SentenceTransformer(_ST_MODEL_NAME)
+            return True
+        except ImportError:
+            return False
+        except Exception as exc:
+            logger.warning("EmbeddingService: sentence-transformers load failed — %s", exc)
+            return False
+
+    def _get_openai_client(self):
+        if self._openai_client is None and self._api_key:
             try:
                 from openai import AsyncOpenAI  # type: ignore
-                self._client = AsyncOpenAI(
+                self._openai_client = AsyncOpenAI(
                     api_key=self._api_key,
-                    # Explicitly target OpenAI — not OpenRouter
-                    base_url="https://api.openai.com/v1",
+                    base_url=self._base_url,
                 )
                 logger.info(
-                    "EmbeddingService: AsyncOpenAI client initialised "
-                    "(model=%s).", _OPENAI_EMBEDDING_MODEL
+                    "EmbeddingService: AsyncOpenAI client ready (base=%s, model=%s)",
+                    self._base_url, self._model,
                 )
             except ImportError:
-                logger.error(
-                    "EmbeddingService: 'openai' package not installed — "
-                    "switching to fallback mode."
-                )
-                self._fallback_mode = True
-        return self._client
+                logger.error("EmbeddingService: 'openai' package not installed.")
+                self._mode = "keyword_fallback"
+        return self._openai_client
 
-    # ──────────────────────────────────────────────────────────────────────
-    #  Public API
-    # ──────────────────────────────────────────────────────────────────────
+    # ── Public status ─────────────────────────────────────────────────────────
+
+    def is_using_real_embeddings(self) -> bool:
+        """True if the service produces real semantic embeddings (not keyword-based)."""
+        return self._mode in ("openai_api", "sentence_transformers")
+
+    def get_mode(self) -> str:
+        """Return the active embedding mode string."""
+        return self._mode
+
+    @property
+    def embedding_dim(self) -> int:
+        return self._embedding_dim
+
+    # ── Public API ────────────────────────────────────────────────────────────
 
     async def embed_text(self, text: str) -> List[float]:
         """Return the embedding vector for a single text string."""
         if not text or not text.strip():
-            return _zeros()
+            return [0.0] * self._embedding_dim
 
-        if self._fallback_mode:
-            return self._keyword_vector(text)
-
-        client = self._get_client()
-        if client is None:
-            return self._keyword_vector(text)
-
-        try:
-            response = await client.embeddings.create(
-                model=_OPENAI_EMBEDDING_MODEL,
-                input=text,
-            )
-            return response.data[0].embedding
-        except Exception as exc:
-            logger.error("EmbeddingService.embed_text error: %s", exc)
-            return self._keyword_vector(text)
+        if self._mode == "openai_api":
+            return await self._openai_embed_single(text)
+        if self._mode == "sentence_transformers":
+            return await self._st_embed_single(text)
+        return self._keyword_vector(text)
 
     async def embed_batch(self, texts: List[str]) -> List[List[float]]:
-        """Return embedding vectors for a list of texts (one API call)."""
+        """Return embedding vectors for a list of texts."""
         if not texts:
             return []
 
-        # Filter empty strings; preserve order via index mapping
         non_empty = [(i, t) for i, t in enumerate(texts) if t and t.strip()]
-        results: List[List[float]] = [_zeros() for _ in texts]
+        results: List[List[float]] = [[0.0] * self._embedding_dim for _ in texts]
 
         if not non_empty:
             return results
 
-        if self._fallback_mode:
-            for i, t in non_empty:
-                results[i] = self._keyword_vector(t)
-            return results
+        if self._mode == "openai_api":
+            return await self._openai_embed_batch(texts, non_empty, results)
+        if self._mode == "sentence_transformers":
+            return await self._st_embed_batch(texts, non_empty, results)
+        for i, t in non_empty:
+            results[i] = self._keyword_vector(t)
+        return results
 
-        client = self._get_client()
+    # ── OpenAI-compatible provider ────────────────────────────────────────────
+
+    async def _openai_embed_single(self, text: str) -> List[float]:
+        client = self._get_openai_client()
+        if client is None:
+            return self._keyword_vector(text)
+        try:
+            response = await client.embeddings.create(
+                model=self._model,
+                input=text,
+            )
+            emb = response.data[0].embedding
+            # Update dim from actual response if needed
+            if len(emb) != self._embedding_dim:
+                self._embedding_dim = len(emb)
+            return emb
+        except Exception as exc:
+            logger.error("EmbeddingService._openai_embed_single error: %s", exc)
+            return self._keyword_vector(text)
+
+    async def _openai_embed_batch(
+        self,
+        texts: List[str],
+        non_empty: list,
+        results: List[List[float]],
+    ) -> List[List[float]]:
+        client = self._get_openai_client()
         if client is None:
             for i, t in non_empty:
                 results[i] = self._keyword_vector(t)
             return results
-
         try:
             indices, batch_texts = zip(*non_empty)
             response = await client.embeddings.create(
-                model=_OPENAI_EMBEDDING_MODEL,
+                model=self._model,
                 input=list(batch_texts),
             )
             for order, item in enumerate(response.data):
-                results[indices[order]] = item.embedding
+                emb = item.embedding
+                if len(emb) != self._embedding_dim:
+                    self._embedding_dim = len(emb)
+                results[indices[order]] = emb
             return results
         except Exception as exc:
-            logger.error("EmbeddingService.embed_batch error: %s", exc)
+            logger.error("EmbeddingService._openai_embed_batch error: %s", exc)
             for i, t in non_empty:
                 results[i] = self._keyword_vector(t)
             return results
 
-    # ──────────────────────────────────────────────────────────────────────
-    #  Similarity
-    # ──────────────────────────────────────────────────────────────────────
+    # ── SentenceTransformers local model ──────────────────────────────────────
+
+    async def _st_embed_single(self, text: str) -> List[float]:
+        if self._st_model is None:
+            return self._keyword_vector(text)
+        try:
+            import asyncio
+            emb = await asyncio.to_thread(self._st_model.encode, text)
+            return emb.tolist()
+        except Exception as exc:
+            logger.error("EmbeddingService._st_embed_single error: %s", exc)
+            return self._keyword_vector(text)
+
+    async def _st_embed_batch(
+        self,
+        texts: List[str],
+        non_empty: list,
+        results: List[List[float]],
+    ) -> List[List[float]]:
+        if self._st_model is None:
+            for i, t in non_empty:
+                results[i] = self._keyword_vector(t)
+            return results
+        try:
+            import asyncio
+            batch_texts = [t for _, t in non_empty]
+            embeddings = await asyncio.to_thread(self._st_model.encode, batch_texts)
+            for idx, (i, _) in enumerate(non_empty):
+                results[i] = embeddings[idx].tolist()
+            return results
+        except Exception as exc:
+            logger.error("EmbeddingService._st_embed_batch error: %s", exc)
+            for i, t in non_empty:
+                results[i] = self._keyword_vector(t)
+            return results
+
+    # ── Cosine similarity ─────────────────────────────────────────────────────
 
     @staticmethod
     def cosine_similarity(a: List[float], b: List[float]) -> float:
-        """
-        Compute cosine similarity between two embedding vectors.
-
-        Returns a value in [-1, 1] (typically [0, 1] for text embeddings).
-        Returns 0.0 if either vector is zero.
-        """
+        """Cosine similarity between two embedding vectors. Returns 0.0 if zero."""
         if len(a) != len(b):
             return 0.0
         dot = sum(x * y for x, y in zip(a, b))
@@ -164,37 +274,30 @@ class EmbeddingService:
             return 0.0
         return dot / (mag_a * mag_b)
 
-    # ──────────────────────────────────────────────────────────────────────
-    #  Fallback: keyword-overlap TF-IDF-style vector
-    # ──────────────────────────────────────────────────────────────────────
+    # ── Keyword-overlap fallback ──────────────────────────────────────────────
 
     @staticmethod
-    def _keyword_vector(text: str) -> List[float]:
+    def _keyword_vector(text: str, dim: int = 1536) -> List[float]:
         """
-        Very lightweight keyword-frequency vector used when the OpenAI API
-        is unavailable.
-
-        Produces a fixed-size (_EMBEDDING_DIM) float vector by hashing each
-        token to a bucket and accumulating normalised term frequencies.
+        Hash-bucket TF-IDF pseudo-embeddings. Used only when no real embedding
+        provider is available. Semantically weak but deterministic and fast.
         """
         tokens = re.findall(r"\b\w+\b", text.lower())
         if not tokens:
-            return _zeros()
+            return [0.0] * dim
 
-        vec = [0.0] * _EMBEDDING_DIM
+        vec = [0.0] * dim
         freq: dict[str, int] = {}
         for tok in tokens:
             freq[tok] = freq.get(tok, 0) + 1
 
         for tok, count in freq.items():
-            bucket = hash(tok) % _EMBEDDING_DIM
-            vec[bucket] += count / len(tokens)  # normalised TF
+            bucket = hash(tok) % dim
+            vec[bucket] += count / len(tokens)
 
-        # L2-normalise so cosine_similarity still makes sense
         magnitude = math.sqrt(sum(v * v for v in vec))
         if magnitude > 0:
             vec = [v / magnitude for v in vec]
-
         return vec
 
 

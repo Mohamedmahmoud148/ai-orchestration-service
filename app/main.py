@@ -142,10 +142,18 @@ async def lifespan(app: FastAPI):
     app.state.embedding_service = embedding_service
     app.state.vector_store = vector_store
     logger.info(
-        "RAG services ready — embedding_fallback=%s, vector_store_available=%s.",
-        embedding_service._fallback_mode,
+        "RAG services ready — embedding_mode=%s, real_embeddings=%s, "
+        "vector_store_available=%s.",
+        embedding_service.get_mode(),
+        embedding_service.is_using_real_embeddings(),
         vector_store._available,
     )
+    if not embedding_service.is_using_real_embeddings():
+        logger.warning(
+            "⚠️  EMBEDDING QUALITY DEGRADED: mode=%s. "
+            "Set OPENAI_API_KEY to enable real semantic embeddings for RAG.",
+            embedding_service.get_mode(),
+        )
 
     # ── 6. Auto-index academic regulations on first boot ─────────────
     # Non-blocking: scheduled as a background task so a slow .NET backend

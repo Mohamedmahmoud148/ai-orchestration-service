@@ -31,7 +31,10 @@ def get_memory_store() -> "MemoryStore":
 
 class MemoryStore:
     """
-    Redis-based memory store for the AI Agent.
+    Redis-backed memory store for the AI Agent.
+
+    Falls back to DiskStore (JSON file persistence) when Redis is unavailable,
+    so memory survives process restarts even without Redis.
 
     Keys and TTLs
     -------------
@@ -39,6 +42,7 @@ class MemoryStore:
     user:{id}:clarification   5 min    — pending disambiguation options
     user:{id}:preferences     7 days   — language, interests, UI prefs
     user:{id}:summary         24 hours — compressed conversation summary
+    user:{id}:entities        2 hours  — conversation entity tracking
     """
 
     # TTLs (seconds)
@@ -50,6 +54,7 @@ class MemoryStore:
     def __init__(self):
         self.redis_client = None
         self._disabled = False
+        self._disk_store = None       # fallback when Redis is absent
         self.redis_url = self._resolve_url()
 
         if self.redis_url:
@@ -59,7 +64,18 @@ class MemoryStore:
             self.redis_client = redis.Redis(connection_pool=self.pool)
         else:
             self._disabled = True
-            logger.warning("MemoryStore: no valid Redis URL found — running as no-op.")
+            logger.warning(
+                "MemoryStore: no valid Redis URL found — switching to disk fallback."
+            )
+            try:
+                from app.services.disk_store import DiskStore
+                self._disk_store = DiskStore()
+                if self._disk_store._available:
+                    logger.info("MemoryStore: disk fallback active (data persists across restarts).")
+                else:
+                    logger.warning("MemoryStore: disk fallback unavailable — running as no-op (RAM-only).")
+            except Exception as exc:
+                logger.warning("MemoryStore: disk store init failed — no-op: %s", exc)
 
     def _resolve_url(self) -> str | None:
         """
@@ -137,45 +153,74 @@ class MemoryStore:
         return any(s in str(exc) for s in self._AUTH_ERRORS)
 
     async def _get(self, key: str) -> Optional[Any]:
-        if not self.redis_client or self._disabled:
-            return None
-        try:
-            raw = await self.redis_client.get(key)
-            return json.loads(raw) if raw else None
-        except Exception as exc:
-            if self._is_auth_error(exc):
-                logger.warning("MemoryStore: auth error — disabling permanently (%s)", exc)
-                self.redis_client = None
-                self._disabled = True
-            else:
-                logger.error("MemoryStore._get key=%s error=%s", key, exc)
-            return None
+        # Redis path
+        if self.redis_client and not self._disabled:
+            try:
+                raw = await self.redis_client.get(key)
+                return json.loads(raw) if raw else None
+            except Exception as exc:
+                if self._is_auth_error(exc):
+                    logger.warning("MemoryStore: auth error — disabling permanently (%s)", exc)
+                    self.redis_client = None
+                    self._disabled = True
+                else:
+                    logger.error("MemoryStore._get key=%s error=%s", key, exc)
+                return None
+
+        # Disk fallback path
+        if self._disk_store and self._disk_store._available:
+            import asyncio
+            return await asyncio.to_thread(self._disk_store.get, key)
+
+        return None
 
     async def _set(self, key: str, value: Any, ttl: int) -> None:
-        if not self.redis_client or self._disabled:
-            return
-        try:
-            await self.redis_client.setex(key, ttl, json.dumps(value, ensure_ascii=False))
-        except Exception as exc:
-            if self._is_auth_error(exc):
-                logger.warning("MemoryStore: auth error — disabling permanently (%s)", exc)
-                self.redis_client = None
-                self._disabled = True
-            else:
-                logger.error("MemoryStore._set key=%s error=%s", key, exc)
+        # Redis path
+        if self.redis_client and not self._disabled:
+            try:
+                await self.redis_client.setex(key, ttl, json.dumps(value, ensure_ascii=False))
+                return
+            except Exception as exc:
+                if self._is_auth_error(exc):
+                    logger.warning("MemoryStore: auth error — disabling permanently (%s)", exc)
+                    self.redis_client = None
+                    self._disabled = True
+                else:
+                    logger.error("MemoryStore._set key=%s error=%s", key, exc)
+                return
+
+        # Disk fallback path
+        if self._disk_store and self._disk_store._available:
+            import asyncio
+            await asyncio.to_thread(self._disk_store.set, key, value, ttl)
 
     async def _delete(self, key: str) -> None:
-        if not self.redis_client or self._disabled:
-            return
-        try:
-            await self.redis_client.delete(key)
-        except Exception as exc:
-            if self._is_auth_error(exc):
-                logger.warning("MemoryStore: auth error — disabling permanently (%s)", exc)
-                self.redis_client = None
-                self._disabled = True
-            else:
-                logger.error("MemoryStore._delete key=%s error=%s", key, exc)
+        # Redis path
+        if self.redis_client and not self._disabled:
+            try:
+                await self.redis_client.delete(key)
+                return
+            except Exception as exc:
+                if self._is_auth_error(exc):
+                    logger.warning("MemoryStore: auth error — disabling permanently (%s)", exc)
+                    self.redis_client = None
+                    self._disabled = True
+                else:
+                    logger.error("MemoryStore._delete key=%s error=%s", key, exc)
+                return
+
+        # Disk fallback path
+        if self._disk_store and self._disk_store._available:
+            import asyncio
+            await asyncio.to_thread(self._disk_store.delete, key)
+
+    def get_storage_mode(self) -> str:
+        """Return the active storage mode string for health reporting."""
+        if self.redis_client and not self._disabled:
+            return "redis"
+        if self._disk_store and self._disk_store._available:
+            return "disk"
+        return "none"
 
     # ── Conversation memory ───────────────────────────────────────────────
 

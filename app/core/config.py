@@ -12,6 +12,15 @@ class Settings(BaseSettings):
     OPENROUTER_FALLBACK_MODEL_1: str = "openai/gpt-4o-mini"
     OPENROUTER_FALLBACK_MODEL_2: str = ""  # e.g. "mistralai/mistral-7b-instruct"
 
+    # Embeddings — for RAG pipeline.
+    # OPENAI_API_KEY: direct OpenAI key for text-embedding-3-small.
+    # EMBEDDING_BASE_URL: override to point at any OpenAI-compatible provider.
+    # EMBEDDING_MODEL: override to use a different embedding model.
+    # If none are set the service falls back to keyword-overlap (no real vectors).
+    OPENAI_API_KEY: str = ""
+    EMBEDDING_BASE_URL: str = "https://api.openai.com/v1"
+    EMBEDDING_MODEL: str = "text-embedding-3-small"
+
     # CORS — comma-separated allowed origins (leave empty to default to BACKEND_BASE_URL)
     # Example: "https://app.example.com,http://localhost:3000"
     ALLOWED_ORIGINS: str = ""
