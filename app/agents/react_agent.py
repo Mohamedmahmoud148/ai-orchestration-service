@@ -19,6 +19,7 @@ from typing import Any, AsyncGenerator, Dict, List, Optional, TYPE_CHECKING
 
 from app.core.api_discovery import get_allowed_endpoints_schema, validate_endpoint
 from app.core.logging import logger
+from app.core.response_guard import validate as guard_response, check_user_input
 from app.prompts import load_prompt
 
 if TYPE_CHECKING:
@@ -194,10 +195,59 @@ def _build_system_prompt(context: "ExecutionContext") -> str:
     role_persona = _load_role_persona(context.role or "")
     persona_section = f"\n## الشخصية والأسلوب (مطلوب الالتزام به)\n{role_persona}\n" if role_persona else ""
 
-    return f"""أنت مساعد ذكي ومتخصص لنظام إدارة الجامعة. مهمتك تجيب بدقة تامة بناءً على البيانات الحقيقية.
+    # ── Memory/profile context ────────────────────────────────────────────
+    meta = context.metadata or {}
+    memory_section = ""
+    profile_section = ""
+
+    memory = meta.get("memory") or {}
+    if memory:
+        parts = []
+        if memory.get("last_intent"):
+            parts.append(f"- آخر طلب: {memory['last_intent']}")
+        if memory.get("last_result"):
+            parts.append(f"- آخر نتيجة (ملخص): {str(memory['last_result'])[:200]}")
+        if parts:
+            memory_section = "## ذاكرة المحادثة السابقة\n" + "\n".join(parts) + "\n"
+
+    academic_profile = meta.get("academic_profile") or {}
+    personalized = meta.get("personalized_context") or ""
+    if personalized:
+        profile_section = f"## الملف الأكاديمي للمستخدم\n{personalized}\n"
+    elif academic_profile:
+        profile_section = f"## الملف الأكاديمي\n{academic_profile}\n"
+
+    return f"""أنت مساعد أكاديمي ذكي لنظام إدارة الجامعة. تعمل كعميل reasoning-first: تُفكّر أولاً ثم تتصرف.
 {persona_section}
 ## الجلسة الحالية
 {ctx_line}
+{memory_section}{profile_section}
+## سلسلة التفكير المطلوبة (THINK → ACT → VALIDATE → RESPOND)
+
+**خطوة 1 — THINK (فكّر قبل أي إجراء):**
+- ماذا يريد المستخدم بالضبط؟
+- هل الإجابة موجودة في السياق الحالي (ctx_line أعلاه) أم تحتاج API call؟
+- ما هو الـ endpoint الأنسب بناءً على قاموس المصطلحات؟
+
+**خطوة 2 — ACT (نفّذ الأدوات):**
+- استدعِ الأداة المناسبة. يمكنك استدعاء أكثر من أداة في نفس الوقت.
+- إذا أخفق endpoint → جرّب بديلاً ذا صلة فوراً، لا تستسلم.
+
+**خطوة 3 — VALIDATE (تحقّق من النتيجة):**
+- هل البيانات التي عدت بها تجيب على السؤال فعلاً؟
+- إذا كانت البيانات فارغة (0 نتائج) → اشرح السبب ولا تخترع أرقاماً.
+- إذا جاء خطأ من الـ API → أخبر المستخدم بوضوح ما الذي جرى.
+
+**خطوة 4 — RESPOND (أجب):**
+- اكتب إجابة بناءً على البيانات الحقيقية فقط.
+- لا تذكر أي رقم أو حقيقة لم تأتِ من نتائج الأدوات.
+
+## 🔴 قواعد منع الاختلاق (ZERO-HALLUCINATION)
+- **ممنوع منعاً باتاً** ذكر أي رقم (عدد طلاب، درجات، نسب...) لم يأتِ من tool call.
+- إذا أعادت الأداة بيانات فارغة → قل "لا توجد بيانات" ولا تخمّن.
+- إذا لم تتمكن من الوصول للبيانات → اشرح ما جرّبت واقترح بديلاً.
+- لا تقل "على ما أعلم" أو "ربما" أو "تقريباً" عن أي رقم من بيانات الجامعة.
+- الكلمات المحظورة لوصف بيانات حقيقية: "أعتقد"، "ربما"، "I think"، "I believe"، "approximately".
 
 ## قاموس المصطلحات (مهم جداً — لا تخلط بينها)
 | ما يقوله المستخدم | المقصود | الـ endpoint الصحيح |
@@ -212,14 +262,14 @@ def _build_system_prompt(context: "ExecutionContext") -> str:
 | قسم / أقسام | الأقسام الأكاديمية | /api/Departments/* |
 | كلية / كليات | الكليات | /api/Colleges/* |
 
-## قواعد العمل (صارمة)
+## قواعد العمل
 1. **لا تخمّن أبداً** — إذا احتجت بيانات، استخدم call_backend_api فوراً.
-2. **ابحث بذكاء ومثابرة** — إذا أخفق endpoint ما أو رجع 405/404، جرّب endpoint آخر ذا صلة فوراً.
-3. **يمكنك استدعاء الأدوات عدة مرات** — جمّع كل البيانات اللازمة قبل الإجابة.
-4. **حلّل النتائج** — لا تكتفِ بعرض البيانات الخام، قدّم تحليلاً واضحاً ومفيداً.
-5. **اللغة** — استخدم نفس لغة المستخدم بالضبط (عربي بعربي، إنجليزي بإنجليزي).
-6. **للوثائق الأكاديمية** — أي سؤال عن محتوى اللائحة/دليل الطالب/المناهج/المواد الدراسية → استخدم read_regulation_pdf.
-7. **لا تقل "لا أستطيع"** — إذا لم تجد بيانات، اشرح بالضبط ماذا حاولت وما البديل.
+2. **ابحث بمثابرة** — إذا أخفق endpoint، جرّب آخر ذا صلة.
+3. **استدعِ الأدوات بالتوازي** لو احتجت بيانات من مصادر متعددة.
+4. **حلّل ولا تكتفِ بالعرض** — قدّم insights حقيقية بعد جمع البيانات.
+5. **اللغة** — نفس لغة المستخدم بالضبط (عربي بعربي، إنجليزي بإنجليزي).
+6. **للوثائق الأكاديمية** — أي سؤال عن اللائحة/دليل الطالب → استخدم read_regulation_pdf.
+7. **لا تقل "لا أستطيع"** — اشرح ما جرّبت وقترح بديلاً.
 8. **الأمان** — لا تستدعِ إلا الـ endpoints الموجودة في القائمة أدناه.
 
 ## نقاط النهاية المتاحة في الباكيند
@@ -247,6 +297,18 @@ class ReactAgent:
         context.set_model(_MODEL)
         context.set_tool("react_agent")
 
+        # Input guard — truncate suspiciously long messages / injection attempts
+        input_check = check_user_input(context.message)
+        if not input_check.passed:
+            logger.warning(
+                "[ReactAgent] input guard: risk=%s warnings=%s user_id=%s",
+                input_check.risk_level, input_check.warnings, context.user_id,
+            )
+            if input_check.risk_level == "high":
+                return "لم نتمكن من معالجة هذا الطلب. يرجى إعادة الصياغة."
+            # Use sanitized (truncated) version
+            context.message = input_check.sanitized_text
+
         # Fast-path: answer identity questions without any LLM call
         fast = _try_answer_from_context(context)
         if fast:
@@ -254,12 +316,14 @@ class ReactAgent:
             return fast
 
         messages = _build_messages(context)
+        self._collected_results: list = []   # accumulate tool outputs for guard
 
         logger.info(
             "[ReactAgent] START user_id=%s role=%s message=%.100r",
             context.user_id, context.role, context.message,
         )
         t_start = time.perf_counter()
+        _tool_call_count = 0
 
         for iteration in range(1, _MAX_ITERATIONS + 1):
             try:
@@ -284,10 +348,25 @@ class ReactAgent:
             ):
                 answer = choice.message.content or ""
                 elapsed = round(time.perf_counter() - t_start, 3)
+
+                # Response guard — log hallucination risks without blocking
+                guard = guard_response(answer, self._collected_results, context.message)
+                if not guard.passed:
+                    logger.warning(
+                        "[ReactAgent] response guard: risk=%s warnings=%s user_id=%s",
+                        guard.risk_level, guard.warnings, context.user_id,
+                    )
+
                 logger.info(
-                    "[ReactAgent] END iterations=%d duration_s=%s len=%d",
-                    iteration, elapsed, len(answer),
+                    "[ReactAgent] END iterations=%d tool_calls=%d duration_s=%s "
+                    "len=%d guard=%s user_id=%s",
+                    iteration, _tool_call_count, elapsed,
+                    len(answer), guard.risk_level, context.user_id,
                 )
+                # Store metrics on context for upstream observability
+                context.add_metadata("react_iterations", iteration)
+                context.add_metadata("react_tool_calls", _tool_call_count)
+                context.add_metadata("react_guard_risk", guard.risk_level)
                 return answer
 
             # ── Parallel tool calls ───────────────────────────────────────
@@ -295,6 +374,7 @@ class ReactAgent:
                 messages.append(_serialize_msg(choice.message))
 
                 tool_calls = choice.message.tool_calls
+                _tool_call_count += len(tool_calls)
                 logger.info(
                     "[ReactAgent] iteration=%d dispatching %d tool(s) in parallel",
                     iteration, len(tool_calls),
@@ -308,8 +388,10 @@ class ReactAgent:
                 for tc, result in zip(tool_calls, results):
                     if isinstance(result, Exception):
                         logger.warning("[ReactAgent] tool %s raised: %s", tc.function.name, result)
-                        result = {"error": str(result)}
-                    result_str = json.dumps(result, ensure_ascii=False, default=str)[:6000]
+                        result = {"error": str(result), "tool": tc.function.name}
+                    # Collect for response guard
+                    self._collected_results.append(result)
+                    result_str = _format_tool_result(tc.function.name, result)
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tc.id,
@@ -425,8 +507,8 @@ class ReactAgent:
             )
             for tc, result in zip(tool_calls, results):
                 if isinstance(result, Exception):
-                    result = {"error": str(result)}
-                result_str = json.dumps(result, ensure_ascii=False, default=str)[:6000]
+                    result = {"error": str(result), "tool": tc.function.name}
+                result_str = _format_tool_result(tc.function.name, result)
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
@@ -436,12 +518,59 @@ class ReactAgent:
         yield "تعذّر إتمام الطلب بعد عدة محاولات."
 
 
+# ── Tool result formatter ─────────────────────────────────────────────────────
+
+def _format_tool_result(tool_name: str, result: Any) -> str:
+    """
+    Format a tool result into a structured observation string for the LLM.
+
+    Raw JSON blobs are hard for the model to reason about. This function
+    produces a short, labelled observation that includes the key data
+    while staying within token budget.
+    """
+    if isinstance(result, dict) and result.get("error"):
+        return f"[{tool_name}] ❌ خطأ: {result['error']}"
+
+    try:
+        raw = json.dumps(result, ensure_ascii=False, default=str)
+    except Exception:
+        raw = str(result)
+
+    # Truncate very long results, keeping the beginning (most important data)
+    if len(raw) > 5_000:
+        raw = raw[:5_000] + "\n... [truncated]"
+
+    # For API responses, try to extract a useful summary line
+    if isinstance(result, dict):
+        data = result.get("data") or result
+        total = None
+        if isinstance(data, dict):
+            total = data.get("total") or data.get("count")
+        elif isinstance(data, list):
+            total = len(data)
+
+        if total is not None:
+            return f"[{tool_name}] ✅ النتيجة: {total} سجل\n{raw}"
+
+    return f"[{tool_name}] ✅\n{raw}"
+
+
 # ── Message builder ───────────────────────────────────────────────────────────
 
 def _build_messages(context: "ExecutionContext") -> List[Dict[str, Any]]:
     msgs: List[Dict[str, Any]] = [
         {"role": "system", "content": _build_system_prompt(context)}
     ]
+
+    # Inject conversation summary from memory if available
+    meta = context.metadata or {}
+    summary = (meta.get("memory") or {}).get("last_result")
+    if summary and len(str(summary)) > 20:
+        msgs.append({
+            "role": "system",
+            "content": f"[ذاكرة المحادثة السابقة — للسياق فقط]: {str(summary)[:400]}",
+        })
+
     for turn in (context.history or [])[-8:]:
         role = turn.get("role", "")
         content = str(turn.get("content", "")).strip()

@@ -27,7 +27,20 @@ from typing import Any, Dict, List, Optional
 from app.core.logging import logger
 
 _COLLECTION_NAME = "university_materials"
-_CHROMA_DATA_DIR = os.environ.get("CHROMA_DATA_DIR") or "/tmp/chroma_data"
+
+# Default to a named directory next to the service root so data survives
+# container restarts on Railway (Railway mounts /app persistently when a
+# volume is attached).  Override via CHROMA_DATA_DIR env var.
+_DEFAULT_CHROMA_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+    "chroma_data",
+)
+_CHROMA_DATA_DIR = os.environ.get("CHROMA_DATA_DIR") or _DEFAULT_CHROMA_DIR
+
+# Minimum cosine similarity to include a chunk in search results.
+# Chunks scoring below this are considered semantically irrelevant.
+# Range: 0.0–1.0. Lower = more permissive. 0.25 is a conservative baseline.
+_MIN_SCORE = float(os.environ.get("RAG_MIN_SCORE", "0.25"))
 
 
 class VectorStore:
@@ -129,6 +142,7 @@ class VectorStore:
         filter_material_id: Optional[str] = None,
         filter_offering_id: Optional[str] = None,
         top_k: int = 5,
+        min_score: float = _MIN_SCORE,
     ) -> List[Dict[str, Any]]:
         """
         Search for the top-k chunks closest to query_embedding.
@@ -153,9 +167,12 @@ class VectorStore:
             # count() and query() are both sync — run together in a thread
             # so the event loop never blocks on either.
             def _run_query() -> Dict[str, Any]:
+                count = self._collection.count()
+                if count == 0:
+                    return {"ids": [[]], "documents": [[]], "metadatas": [[]], "distances": [[]]}
                 kwargs: Dict[str, Any] = {
                     "query_embeddings": [query_embedding],
-                    "n_results": min(top_k, max(1, self._collection.count())),
+                    "n_results": min(top_k, count),
                     "include": ["documents", "metadatas", "distances"],
                 }
                 if where:
@@ -170,9 +187,13 @@ class VectorStore:
             metadatas  = result.get("metadatas", [[]])[0]
             distances  = result.get("distances", [[]])[0]
 
+            filtered_out = 0
             for chunk_id, doc, meta, dist in zip(ids, documents, metadatas, distances):
                 # ChromaDB cosine distance → similarity score [0, 1]
                 score = max(0.0, 1.0 - dist)
+                if score < min_score:
+                    filtered_out += 1
+                    continue
                 hits.append(
                     {
                         "chunk_id": chunk_id,
@@ -180,6 +201,12 @@ class VectorStore:
                         "score":    round(score, 4),
                         "metadata": meta or {},
                     }
+                )
+
+            if filtered_out:
+                logger.debug(
+                    "VectorStore.search: filtered %d low-score chunks (min_score=%.2f)",
+                    filtered_out, min_score,
                 )
             return hits
 

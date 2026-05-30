@@ -197,6 +197,11 @@ class Agent:
                 context.set_result("عذراً، هذا الاختيار غير صحيح.")
                 return context
 
+        # Detect + persist user language early (fire-and-forget, never blocks)
+        asyncio.create_task(
+            self._memory_store.detect_and_save_language(context.user_id, context.message)
+        )
+
         if not plan:
             if self._react_agent is not None:
                 # ── ReactAgent path (smart, iterative, no keywords) ───────
@@ -250,10 +255,14 @@ class Agent:
             if plan and getattr(plan, "exam_params", None):
                 entities = plan.exam_params.model_dump(exclude_none=True)
 
+            # Build richer memory: include intent, result summary, role, and message topic
+            result_text = str(context.result or "")
             memory_data = {
-                "last_intent": context.intent,
-                "last_result": context.result,
-                "entities":    entities,
+                "last_intent":  context.intent or "general_chat",
+                "last_result":  result_text[:400] if result_text else "",
+                "last_message": context.message[:120],
+                "role":         context.role or "student",
+                "entities":     entities,
             }
             await self._memory_store.save_conversation(memory_key, memory_data)
 
@@ -443,7 +452,7 @@ class Agent:
         persist it in Redis with a 24-hour TTL.
 
         Called as an asyncio background task — never blocks the response.
-        Uses the local HuggingFace BART model (free, no OpenAI cost).
+        Uses gpt-4o-mini for Arabic-capable summarization.
         """
         try:
             history_text = "\n".join(
@@ -453,10 +462,24 @@ class Agent:
             if not history_text.strip():
                 return
 
-            summary = await self._model_router.summarize(
-                text=history_text,
-                model_id="hf/facebook/bart-large-cnn",
+            # Use gpt-4o-mini via model_router for Arabic-capable summarization
+            summary_prompt = (
+                "Summarize this conversation in 2-3 sentences, preserving key topics, "
+                "entities (names, course IDs, departments), and unresolved requests. "
+                "Reply in the same language as the conversation.\n\n"
+                f"{history_text[:3000]}"
             )
+            try:
+                summary = await self._model_router.generate(
+                    prompt=summary_prompt,
+                    model_id="openai/gpt-4o-mini",
+                )
+            except Exception:
+                # Fallback: BART if gpt-4o-mini call fails
+                summary = await self._model_router.summarize(
+                    text=history_text,
+                    model_id="hf/facebook/bart-large-cnn",
+                )
 
             if summary:
                 await self._memory_store.save_summary(context.user_id, summary)

@@ -348,6 +348,31 @@ class MemoryStore:
             "last_result": result_summary,
         })
 
+    async def detect_and_save_language(self, user_id: str, message: str) -> None:
+        """
+        Detect the user's language from a message and persist it in preferences.
+
+        Only fires if language has not been saved before for this user, or if
+        the detected language differs from the stored one — cheap heuristic,
+        no LLM required.
+        """
+        if not user_id or not message:
+            return
+        try:
+            # Simple heuristic: if message contains Arabic Unicode block chars → Arabic
+            arabic_chars = sum(1 for c in message if "؀" <= c <= "ۿ")
+            detected = "ar" if arabic_chars / max(len(message), 1) > 0.2 else "en"
+
+            prefs = await self.get_preferences(user_id) or {}
+            if prefs.get("language") != detected:
+                await self.save_preferences(user_id, {"language": detected})
+                logger.debug(
+                    "MemoryStore: language detected=%s saved for user_id=%s",
+                    detected, user_id,
+                )
+        except Exception as exc:
+            logger.warning("MemoryStore.detect_and_save_language: %s", exc)
+
     async def update_context(self, user_id: str, updates: Dict[str, Any]) -> None:
         """Merge updates into existing conversation memory."""
         if not user_id:
