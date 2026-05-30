@@ -19,6 +19,7 @@ from typing import Any, AsyncGenerator, Dict, List, Optional, TYPE_CHECKING
 
 from app.core.api_discovery import get_allowed_endpoints_schema, validate_endpoint
 from app.core.logging import logger
+from app.prompts import load_prompt
 
 if TYPE_CHECKING:
     from app.agents.execution_context import ExecutionContext
@@ -164,6 +165,17 @@ def _try_answer_from_context(context: "ExecutionContext") -> Optional[str]:
 
 # ── System prompt builder ─────────────────────────────────────────────────────
 
+def _load_role_persona(role: str) -> str:
+    """Load role-specific personality from prompts/role_{role}.md. Silent fallback."""
+    role_clean = (role or "").lower().strip()
+    known = {"student", "doctor", "admin", "superadmin"}
+    name = f"role_{role_clean}" if role_clean in known else "role_student"
+    try:
+        return load_prompt(name)
+    except Exception:
+        return ""
+
+
 def _build_system_prompt(context: "ExecutionContext") -> str:
     schema = get_allowed_endpoints_schema()
 
@@ -173,14 +185,17 @@ def _build_system_prompt(context: "ExecutionContext") -> str:
         ctx_parts.append(f"userId={context.user_id}")
     if context.role:
         ctx_parts.append(f"role={context.role}")
-    for key in ("batchId", "departmentId", "collegeId", "studentId", "batchCode"):
+    for key in ("batchId", "departmentId", "collegeId", "studentId", "batchCode", "fullName", "studentName"):
         if val := user_ctx.get(key):
             ctx_parts.append(f"{key}={val}")
 
     ctx_line = " | ".join(ctx_parts)
 
-    return f"""أنت مساعد ذكي ومتخصص لنظام إدارة الجامعة. مهمتك تجيب بدقة تامة بناءً على البيانات الحقيقية.
+    role_persona = _load_role_persona(context.role or "")
+    persona_section = f"\n## الشخصية والأسلوب (مطلوب الالتزام به)\n{role_persona}\n" if role_persona else ""
 
+    return f"""أنت مساعد ذكي ومتخصص لنظام إدارة الجامعة. مهمتك تجيب بدقة تامة بناءً على البيانات الحقيقية.
+{persona_section}
 ## الجلسة الحالية
 {ctx_line}
 

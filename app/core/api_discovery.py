@@ -71,10 +71,16 @@ _SAFE_POST_PATHS = (
     "/api/studentfiles/upload",
     "/api/materials/upload",
 
-    # Students bulk
-    "/api/students/bulk-upload-direct",
-    "/api/students/bulk-upload-ai",
-    "/api/students/import-excel",
+    # Students — single create via JSON (bulk file-upload endpoints excluded)
+    "/api/students",
+
+    # Doctors — single create via JSON
+    "/api/doctors",
+
+    # Colleges / Departments / Batches
+    "/api/colleges",
+    "/api/departments",
+    "/api/batches",
 )
 
 
