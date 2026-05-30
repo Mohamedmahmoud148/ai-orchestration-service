@@ -27,3 +27,4 @@ redis>=5.0.0
 # RAG pipeline
 chromadb>=0.4.0
 numpy>=1.26.0
+sentence-transformers>=2.6.0      # multilingual semantic embeddings (free, no API key needed)
