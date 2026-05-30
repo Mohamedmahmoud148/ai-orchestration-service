@@ -52,6 +52,8 @@ def chunk_text(
     paragraphs: List[str] = re.split(r"\n\s*\n", text.strip())
 
     # ── Sentence splitting (fallback inside a large paragraph) ────────────────
+    # Handles Arabic (؟ ، .) and English (. ! ?) sentence boundaries.
+    # The Arabic comma ، is NOT a sentence boundary, but ؟ and . are.
     _sentence_re = re.compile(r"(?<=[.!?؟])\s+")
 
     def _split_paragraph(para: str) -> List[str]:

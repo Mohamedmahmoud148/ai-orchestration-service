@@ -38,25 +38,28 @@ from app.core.logging import logger
 # ── Entity extraction patterns ────────────────────────────────────────────────
 
 # Arabic academic subject keywords (the word before a course name)
+# Greedy capture of Arabic/Latin words, stopping at Arabic punctuation or end of line.
 _COURSE_TRIGGER_AR = re.compile(
-    r"(?:مادة|ماده|مادده|كورس|مادة|المادة|موضوع|محاضرة|مادتي|كورسي)\s+"
-    r"([ا-يA-Za-z0-9\s]{3,40}?)(?:\s+|$|،|,|\.|؟|\?)",
+    r"(?:مادة|ماده|مادده|كورس|المادة|موضوع|محاضرة|مادتي|كورسي)\s+"
+    r"([ا-يA-Za-z][ا-يA-Za-z0-9 ]{2,40})(?=[،,\.\?؟\n]|$)",
     re.UNICODE,
 )
 
-# English course triggers
+# English course triggers — greedy up to punctuation
 _COURSE_TRIGGER_EN = re.compile(
     r"(?:course|subject|module|class|lecture)\s+"
-    r"([A-Za-z0-9\s]{3,40}?)(?:\s+|$|,|\.|\?)",
+    r"([A-Za-z][A-Za-z0-9 ]{2,40}?)(?=[,\.\?\n]|$|(?:\s+\w+\s+)|(?:\s+please))",
     re.IGNORECASE,
 )
 
 # GPA values
 _GPA_PATTERN = re.compile(r"\b(?:gpa|معدل|معدلي)\s*(?:is|=|:|\s)\s*([0-4]\.\d{1,2})\b", re.IGNORECASE)
 
-# Doctor name patterns
+# Doctor name patterns — use full Arabic Unicode block [؀-ۿ] so
+# variants like أ (U+0623) and إ (U+0625) are captured (both < ا U+0627).
 _DOCTOR_PATTERN_AR = re.compile(
-    r"(?:دكتور|دكتوره|الدكتور|أستاذ|أستاذة|د\.)\s+([ا-ي\s]{3,30}?)(?:\s+|$|،|,)",
+    r"(?:دكتور|دكتوره|الدكتور|أستاذ|أستاذة|د\.)\s+"
+    r"([؀-ۿ]{2,15}(?:\s+[؀-ۿ]{2,15}){0,2})",
     re.UNICODE,
 )
 _DOCTOR_PATTERN_EN = re.compile(

@@ -135,7 +135,48 @@ _TOOL_GENERATE_EXAM: dict = {
     },
 }
 
-_ALL_TOOLS = [_TOOL_CALL_API, _TOOL_REGULATION, _TOOL_GENERATE_EXAM]
+_TOOL_ACADEMIC_ANALYSIS: dict = {
+    "type": "function",
+    "function": {
+        "name": "analyze_academic_profile",
+        "description": (
+            "Deep academic advisor analysis for a student. "
+            "Use this when: student asks about GPA, academic risk, graduation plan, "
+            "failed subjects, credit hours progress, recommended next subjects, "
+            "or asks 'وضعي الأكاديمي إيه؟', 'هل هتخرج؟', 'أنا في خطر؟', "
+            "'ايه المواد الباقية؟', 'كيف أحسن معدلي؟'. "
+            "Fetches roadmap + grades + regulation passages and returns a deep analysis."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "focus": {
+                    "type": "string",
+                    "description": (
+                        "What the student specifically wants to know. "
+                        "E.g.: 'graduation_readiness', 'gpa_improvement', "
+                        "'failed_subjects', 'next_semester_plan', 'general'"
+                    ),
+                    "enum": [
+                        "graduation_readiness",
+                        "gpa_improvement",
+                        "failed_subjects",
+                        "next_semester_plan",
+                        "academic_risk",
+                        "general",
+                    ],
+                },
+                "question": {
+                    "type": "string",
+                    "description": "The student's specific question to focus the analysis on.",
+                },
+            },
+            "required": ["focus"],
+        },
+    },
+}
+
+_ALL_TOOLS = [_TOOL_CALL_API, _TOOL_REGULATION, _TOOL_GENERATE_EXAM, _TOOL_ACADEMIC_ANALYSIS]
 
 
 # ── Context fast-path ─────────────────────────────────────────────────────────
@@ -596,6 +637,14 @@ def _format_tool_result(tool_name: str, result: Any) -> str:
     if isinstance(result, dict) and result.get("error"):
         return f"[{tool_name}] ❌ خطأ: {result['error']}"
 
+    # Academic analysis: return the full analysis text directly — it's already formatted
+    if isinstance(result, dict) and result.get("academic_analysis"):
+        return f"[{tool_name}] ✅ التحليل الأكاديمي:\n{result['academic_analysis']}"
+
+    # Regulation answer: return directly
+    if isinstance(result, dict) and result.get("regulation_answer"):
+        return f"[{tool_name}] ✅ من اللائحة:\n{result['regulation_answer']}"
+
     try:
         raw = json.dumps(result, ensure_ascii=False, default=str)
     except Exception:
@@ -655,6 +704,8 @@ async def _dispatch_tool(tool_call: Any, context: "ExecutionContext", model_rout
         return await _tool_regulation(args, context, model_router)
     elif fn == "generate_exam":
         return await _tool_generate_exam(args, context, model_router)
+    elif fn == "analyze_academic_profile":
+        return await _tool_academic_analysis(args, context, model_router)
     else:
         return {"error": f"unknown tool: {fn}"}
 
@@ -773,6 +824,72 @@ async def _tool_generate_exam(args: dict, context: "ExecutionContext", model_rou
 
     except Exception as exc:
         logger.error("[ReactAgent] generate_exam failed — %s", exc)
+        return {"error": str(exc)}
+
+
+# ── Tool: analyze_academic_profile ───────────────────────────────────────────
+
+async def _tool_academic_analysis(
+    args: dict, context: "ExecutionContext", model_router: Any
+) -> Any:
+    """
+    Deep academic analysis tool — calls AcademicAdvisorModule internally.
+
+    Fetches: roadmap + student overview + regulation RAG passages.
+    Returns a structured analysis string the ReactAgent presents to the user.
+    """
+    if context.role not in ("student",):
+        # Admins/doctors use different analysis flows
+        return {"error": "analyze_academic_profile is only available for students."}
+
+    try:
+        from app.agents.schemas import AgentInput
+        from app.modules.academic_advisor import AcademicAdvisorModule
+
+        auth    = (context.metadata or {}).get("auth_header") or ""
+        focus   = args.get("focus", "general")
+        question = args.get("question") or context.message
+
+        # Build a focused question that combines focus + original question
+        focus_prompts = {
+            "graduation_readiness": "هل أنا مؤهل للتخرج؟ ما الشروط المتبقية؟",
+            "gpa_improvement":      "كيف أحسّن معدلي الأكاديمي؟ ما المواد الحرجة؟",
+            "failed_subjects":      "ما المواد اللي رسبت فيها ومحتاج أعيدها؟",
+            "next_semester_plan":   "ما المواد المقترحة للترم الجاي؟",
+            "academic_risk":        "هل أنا في خطر أكاديمي؟ ما حدود الإنذار؟",
+            "general":              question,
+        }
+        focused_question = focus_prompts.get(focus, question)
+        if question and question != context.message:
+            focused_question = f"{question} ({focused_question})"
+
+        module = AcademicAdvisorModule(
+            model_router=model_router,
+            backend_client=__import__(
+                "app.services.backend_client", fromlist=["tool_execution_client"]
+            ).tool_execution_client,
+        )
+        agent_input = AgentInput(
+            user_id=context.user_id or "",
+            message=focused_question,
+            auth_header=auth,
+            context={
+                "selected_model": "openai/gpt-4o-mini",
+                "academic_context": context.academic_context or {},
+                "history": context.history or [],
+            },
+        )
+        output = await module.run(agent_input)
+        if output.status == "success":
+            return {
+                "academic_analysis": output.response,
+                "focus": focus,
+                "data": output.data or {},
+            }
+        return {"error": output.response or "Academic analysis failed."}
+
+    except Exception as exc:
+        logger.error("[ReactAgent] analyze_academic_profile failed — %s", exc, exc_info=True)
         return {"error": str(exc)}
 
 

@@ -146,12 +146,20 @@ class RegulationModule:
         regulation_text = ""
         source = "rag"
         if chunks:
-            # Order by score, build a numbered passage block
+            # Order by score, build a numbered passage block with citation metadata
             chunks_sorted = sorted(chunks, key=lambda c: c["score"], reverse=True)
             passage_lines: List[str] = []
             for i, ch in enumerate(chunks_sorted, 1):
-                title = (ch.get("metadata") or {}).get("materialTitle") or "Regulation"
-                passage_lines.append(f"[مقطع {i} — {title}]\n{ch['content']}")
+                meta  = ch.get("metadata") or {}
+                title = meta.get("materialTitle") or "اللائحة الأكاديمية"
+                score = ch.get("score", 0)
+                chunk_idx = meta.get("chunkIndex", "")
+                # Include citation reference so LLM can cite it accurately
+                citation = f"[مقطع {i} — المصدر: {title}"
+                if chunk_idx != "":
+                    citation += f", الفقرة {chunk_idx}"
+                citation += f" (صلة: {score:.2f})]"
+                passage_lines.append(f"{citation}\n{ch['content']}")
             regulation_text = "\n\n".join(passage_lines)
             logger.info(
                 "RegulationModule: RAG returned %d chunks (top score=%.3f)",
@@ -197,9 +205,12 @@ class RegulationModule:
             f"=== مقاطع مأخوذة من اللائحة الأكاديمية الرسمية ===\n"
             f"{regulation_text}\n"
             f"=== نهاية المقاطع ===\n\n"
-            "بناءً على المقاطع أعلاه فقط، أجب على سؤال المستخدم إجابة مفصّلة ومنظمة. "
-            "لو السؤال قصير أو فيه ضمير زي 'اشرحهالي' أو 'لخصها' افهم المقصود من السياق "
-            "السابق. لو المعلومة مش في المقاطع المتاحة، قول كده بصراحة."
+            "تعليمات الإجابة:\n"
+            "1. أجب فقط مما هو مكتوب في المقاطع أعلاه.\n"
+            "2. لكل رقم أو شرط تذكره، اذكر مصدره: 'وفقاً لـ [اسم المصدر من تعريف المقطع]'.\n"
+            "3. لو السؤال يحتوي ضمير ('اشرحها'، 'لخصها') → افهم المقصود من السياق السابق.\n"
+            "4. لو المعلومة غير موجودة في المقاطع → قل ذلك بصراحة ولا تخمّن.\n"
+            "5. الإجابة المنظمة: عنوان قصير → نقاط → خلاصة.\n"
         )
 
         # ── 4. LLM call with long max_tokens ──────────────────────────────────
