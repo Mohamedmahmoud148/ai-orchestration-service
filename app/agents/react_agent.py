@@ -176,7 +176,44 @@ _TOOL_ACADEMIC_ANALYSIS: dict = {
     },
 }
 
-_ALL_TOOLS = [_TOOL_CALL_API, _TOOL_REGULATION, _TOOL_GENERATE_EXAM, _TOOL_ACADEMIC_ANALYSIS]
+_TOOL_READ_MATERIAL: dict = {
+    "type": "function",
+    "function": {
+        "name": "read_material_pdf",
+        "description": (
+            "Read, summarize, or extract content from a lecture/course material PDF file. "
+            "Use this when the user asks to: summarize a file, read a lecture, explain material contents, "
+            "list headings/topics in a file, or asks about lecture content. "
+            "DO NOT use this for academic regulations or student handbook — use read_regulation_pdf for that. "
+            "Provide the file_url if available, or the offering_id to fetch materials automatically."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": "What to do with the file: 'summarize', 'list_headings', 'explain', 'read'",
+                    "enum": ["summarize", "list_headings", "explain", "read"],
+                },
+                "file_url": {
+                    "type": "string",
+                    "description": "Direct URL of the PDF/file to read. Use if already known from previous API calls or user message.",
+                },
+                "offering_id": {
+                    "type": "string",
+                    "description": "SubjectOffering ID to fetch materials from backend automatically.",
+                },
+                "question": {
+                    "type": "string",
+                    "description": "Optional specific question to answer from the material.",
+                },
+            },
+            "required": ["task"],
+        },
+    },
+}
+
+_ALL_TOOLS = [_TOOL_CALL_API, _TOOL_REGULATION, _TOOL_READ_MATERIAL, _TOOL_GENERATE_EXAM, _TOOL_ACADEMIC_ANALYSIS]
 
 
 # ── Context fast-path ─────────────────────────────────────────────────────────
@@ -348,9 +385,10 @@ def _build_system_prompt(context: "ExecutionContext") -> str:
 3. **استدعِ الأدوات بالتوازي** لو احتجت بيانات من مصادر متعددة.
 4. **حلّل ولا تكتفِ بالعرض** — قدّم insights حقيقية بعد جمع البيانات.
 5. **اللغة** — نفس لغة المستخدم بالضبط (عربي بعربي، إنجليزي بإنجليزي).
-6. **للوثائق الأكاديمية** — أي سؤال عن اللائحة/دليل الطالب → استخدم read_regulation_pdf.
-7. **لا تقل "لا أستطيع"** — اشرح ما جرّبت وقترح بديلاً.
-8. **الأمان** — لا تستدعِ إلا الـ endpoints الموجودة في القائمة أدناه.
+6. **للائحة الأكاديمية / دليل الطالب** → استخدم `read_regulation_pdf` فقط.
+7. **لتلخيص أو قراءة ملف محاضرة / ماتريال** → استخدم `read_material_pdf` (مش read_regulation_pdf). مرر `file_url` لو معروف، أو `offering_id`.
+8. **لا تقل "لا أستطيع"** — اشرح ما جرّبت وقترح بديلاً.
+9. **الأمان** — لا تستدعِ إلا الـ endpoints الموجودة في القائمة أدناه.
 
 ## نقاط النهاية المتاحة في الباكيند
 {schema}"""
@@ -702,6 +740,8 @@ async def _dispatch_tool(tool_call: Any, context: "ExecutionContext", model_rout
         return await _tool_call_api(args, context)
     elif fn == "read_regulation_pdf":
         return await _tool_regulation(args, context, model_router)
+    elif fn == "read_material_pdf":
+        return await _tool_read_material(args, context, model_router)
     elif fn == "generate_exam":
         return await _tool_generate_exam(args, context, model_router)
     elif fn == "analyze_academic_profile":
@@ -772,6 +812,95 @@ async def _tool_regulation(args: dict, context: "ExecutionContext", model_router
 
     except Exception as exc:
         logger.error("[ReactAgent] read_regulation_pdf failed — %s", exc)
+        return {"error": str(exc)}
+
+
+# ── Tool: read_material_pdf ───────────────────────────────────────────────────
+
+async def _tool_read_material(args: dict, context: "ExecutionContext", model_router: Any) -> Any:
+    """Download and summarize/read a lecture material PDF."""
+    import httpx
+    import io
+
+    task       = args.get("task", "summarize")
+    file_url   = args.get("file_url") or ""
+    offering_id = args.get("offering_id") or ""
+    question   = args.get("question") or ""
+    auth       = (context.metadata or {}).get("auth_header") or ""
+
+    # 1. Resolve file URL — from args, context memory, or backend fetch
+    if not file_url:
+        # Check memory for last saved file URL
+        mem = context.metadata or {}
+        file_url = mem.get("last_file_url") or ""
+
+    if not file_url and offering_id:
+        # Fetch from backend
+        try:
+            from app.services.backend_client import tool_execution_client as client
+            result = await client.fetch(
+                route=f"/api/Materials/by-offering/{offering_id}",
+                auth_header=auth,
+            )
+            items = result.get("items", []) if isinstance(result, dict) else []
+            if items:
+                file_url = items[0].get("fileUrl") or items[0].get("url") or ""
+        except Exception as exc:
+            logger.warning("[read_material_pdf] backend fetch failed — %s", exc)
+
+    if not file_url:
+        return {"error": "No file URL available. Please provide the file URL or ask about materials first."}
+
+    # 2. Download PDF
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as http:
+            resp = await http.get(file_url)
+            resp.raise_for_status()
+            raw = resp.content
+    except Exception as exc:
+        logger.error("[read_material_pdf] download failed url=%s — %s", file_url, exc)
+        return {"error": f"Could not download the file: {exc}"}
+
+    # 3. Extract text
+    try:
+        from pdfminer.high_level import extract_text as pdfminer_extract
+        text = pdfminer_extract(io.BytesIO(raw)) or ""
+    except Exception:
+        try:
+            text = raw.decode("utf-8", errors="ignore")
+        except Exception:
+            text = ""
+
+    if not text.strip():
+        return {"error": "Could not extract text from the file."}
+
+    text = text[:6000]  # cap for LLM context
+
+    # 4. Build task-specific prompt
+    if task == "list_headings":
+        user_prompt = f"List all main headings and topics found in this document:\n\n{text}"
+    elif task == "explain":
+        focus = f" Focus on: {question}" if question else ""
+        user_prompt = f"Explain the content of this document in simple terms.{focus}\n\n{text}"
+    elif task == "read":
+        user_prompt = f"Read and present the key information from this document:\n\n{text}"
+    else:  # summarize
+        focus = f" The user specifically wants to know: {question}" if question else ""
+        user_prompt = f"Summarize this document in clear bullet points.{focus}\n\n{text}"
+
+    # 5. LLM narration
+    try:
+        result = await model_router.generate_with_messages(
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant that reads and analyzes academic documents. Respond in the same language as the user's request."},
+                {"role": "user", "content": user_prompt},
+            ],
+            model_id=_MODEL,
+            max_tokens=1500,
+        )
+        return {"material_content": result, "chars_processed": len(text)}
+    except Exception as exc:
+        logger.error("[read_material_pdf] LLM failed — %s", exc)
         return {"error": str(exc)}
 
 
