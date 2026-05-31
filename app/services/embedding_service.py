@@ -154,7 +154,8 @@ class EmbeddingService:
             return await self._openai_embed_single(text)
         if self._mode == "sentence_transformers":
             return await self._st_embed_single(text)
-        return self._keyword_vector(text)
+        # Use instance dim so keyword vectors are consistent with the collection
+        return self._keyword_vector(text, self._embedding_dim)
 
     async def embed_batch(self, texts: List[str]) -> List[List[float]]:
         """Return embedding vectors for a list of texts."""
@@ -162,7 +163,8 @@ class EmbeddingService:
             return []
 
         non_empty = [(i, t) for i, t in enumerate(texts) if t and t.strip()]
-        results: List[List[float]] = [[0.0] * self._embedding_dim for _ in texts]
+        dim = self._embedding_dim
+        results: List[List[float]] = [[0.0] * dim for _ in texts]
 
         if not non_empty:
             return results
@@ -172,7 +174,7 @@ class EmbeddingService:
         if self._mode == "sentence_transformers":
             return await self._st_embed_batch(texts, non_empty, results)
         for i, t in non_empty:
-            results[i] = self._keyword_vector(t)
+            results[i] = self._keyword_vector(t, self._embedding_dim)
         return results
 
     # ── OpenAI-compatible provider ────────────────────────────────────────────

@@ -38,9 +38,11 @@ _DEFAULT_CHROMA_DIR = os.path.join(
 _CHROMA_DATA_DIR = os.environ.get("CHROMA_DATA_DIR") or _DEFAULT_CHROMA_DIR
 
 # Minimum cosine similarity to include a chunk in search results.
-# Chunks scoring below this are considered semantically irrelevant.
-# Range: 0.0–1.0. Lower = more permissive. 0.25 is a conservative baseline.
-_MIN_SCORE = float(os.environ.get("RAG_MIN_SCORE", "0.25"))
+# Range: 0.0–1.0. Lower = more permissive.
+# Default 0.0 = no filtering (safe for keyword_fallback and first-time setups).
+# Set RAG_MIN_SCORE=0.25 in production when using real semantic embeddings
+# (OpenAI or sentence-transformers) to filter out irrelevant chunks.
+_MIN_SCORE = float(os.environ.get("RAG_MIN_SCORE", "0.0"))
 
 
 class VectorStore:
@@ -272,39 +274,31 @@ class VectorStore:
 
     async def probe(self) -> Dict[str, Any]:
         """
-        Quick write + read probe — verifies end-to-end ChromaDB functionality.
-        Used by the /health/rag endpoint.
+        Lightweight ChromaDB probe — verifies the data directory is writable
+        and the collection object is accessible.
+
+        Does NOT insert test vectors — inserting would lock the collection to
+        a specific embedding dimension and break subsequent indexing if the
+        embedding provider changes.
         """
         if not self._available or self._collection is None:
             return {"ok": False, "reason": "ChromaDB not initialised"}
         try:
-            test_id = "__health_probe__"
-            test_vec = [0.1] * 384 + [0.0] * (self._collection_dim() - 384)
-
-            # Try a lightweight upsert + get + delete cycle
             def _run_probe():
-                self._collection.upsert(
-                    ids=[test_id],
-                    embeddings=[[0.01] * max(1, self._collection_dim())],
-                    documents=["health probe"],
-                    metadatas=[{"type": "probe"}],
-                )
-                result = self._collection.get(ids=[test_id])
-                self._collection.delete(ids=[test_id])
-                return len(result.get("ids", [])) == 1
+                # Just verify we can call count() and check writability
+                count = self._collection.count()
+                writable = os.access(_CHROMA_DATA_DIR, os.W_OK)
+                return {"count": count, "writable": writable}
 
-            ok = await asyncio.to_thread(_run_probe)
-            return {"ok": ok, "data_dir": _CHROMA_DATA_DIR}
+            info = await asyncio.to_thread(_run_probe)
+            return {
+                "ok": info["writable"],
+                "data_dir": _CHROMA_DATA_DIR,
+                "total_chunks": info["count"],
+                "data_dir_writable": info["writable"],
+            }
         except Exception as exc:
             return {"ok": False, "reason": str(exc)}
-
-    def _collection_dim(self) -> int:
-        """Infer embedding dimension from existing collection metadata (best-effort)."""
-        try:
-            meta = self._collection.metadata or {}
-            return int(meta.get("embedding_dim", 384))
-        except Exception:
-            return 384
 
     # ──────────────────────────────────────────────────────────────────────
     #  Async-safe escape hatches for callers that need raw collection ops
