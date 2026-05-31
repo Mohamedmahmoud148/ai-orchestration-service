@@ -102,6 +102,12 @@ async def health_rag() -> Dict[str, Any]:
     if not vs.get("available"):
         report["status"] = "unavailable"
         report["status_reason"] = "ChromaDB not available"
+    elif vs.get("backend") == "memory":
+        report["status"] = "degraded"
+        report["status_reason"] = (
+            "ChromaDB unavailable; using in-memory vector store. "
+            "RAG works until the service restarts."
+        )
     elif not report.get("real_embeddings"):
         report["status"] = "degraded"
         report["status_reason"] = (

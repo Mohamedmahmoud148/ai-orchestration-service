@@ -97,34 +97,28 @@ def chunk_text(
             segments.extend(_split_paragraph(para))
 
     # ── Build overlapping chunks ───────────────────────────────────────────────
-    chunks: List[dict] = []
-    overlap_tokens: List[str] = []   # tail of the previous chunk (for overlap)
-    chunk_index = 0
-
+    all_tokens: List[str] = []
     for seg in segments:
-        seg_tokens = _tokenise(seg)
-        combined = overlap_tokens + seg_tokens
+        all_tokens.extend(_tokenise(seg))
 
-        # Slide through the combined token window
-        start = 0
-        while start < len(combined):
-            end = min(start + chunk_size, len(combined))
-            window = combined[start:end]
-            content = " ".join(window).strip()
-            if content:
-                chunks.append(
-                    {
-                        "chunk_index": chunk_index,
-                        "content": content,
-                        "token_count": len(window),
-                    }
-                )
-                chunk_index += 1
-            if end >= len(combined):
-                break
-            start += chunk_size - overlap  # slide with overlap
+    if not all_tokens:
+        return []
 
-        # Carry-forward overlap = last *overlap* tokens of this segment
-        overlap_tokens = seg_tokens[-overlap:] if len(seg_tokens) >= overlap else seg_tokens
+    chunks: List[dict] = []
+    step = max(1, chunk_size - max(0, overlap))
+
+    for chunk_index, start in enumerate(range(0, len(all_tokens), step)):
+        window = all_tokens[start : start + chunk_size]
+        content = " ".join(window).strip()
+        if content:
+            chunks.append(
+                {
+                    "chunk_index": chunk_index,
+                    "content": content,
+                    "token_count": len(window),
+                }
+            )
+        if start + chunk_size >= len(all_tokens):
+            break
 
     return chunks

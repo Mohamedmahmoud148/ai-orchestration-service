@@ -143,10 +143,11 @@ async def lifespan(app: FastAPI):
     app.state.vector_store = vector_store
     logger.info(
         "RAG services ready — embedding_mode=%s, real_embeddings=%s, "
-        "vector_store_available=%s.",
+        "vector_store_available=%s, vector_store_backend=%s.",
         embedding_service.get_mode(),
         embedding_service.is_using_real_embeddings(),
         vector_store._available,
+        vector_store.backend,
     )
     if not embedding_service.is_using_real_embeddings():
         logger.warning(

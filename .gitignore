@@ -81,3 +81,6 @@ Thumbs.db
 
 # Docker
 # (Do not ignore Dockerfile, docker-compose.yml or .dockerignore)
+
+# Local ChromaDB persistence
+chroma_data/

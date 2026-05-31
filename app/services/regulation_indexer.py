@@ -63,6 +63,15 @@ async def _download_pdf_text(file_url: str, auth_header: Optional[str] = None) -
     url_low = file_url.lower()
     if "pdf" in url_low or url_low.endswith(".pdf"):
         try:
+            import pypdf
+            reader = pypdf.PdfReader(io.BytesIO(data))
+            text = "\n".join((p.extract_text() or "") for p in reader.pages).strip()
+            if text:
+                return text
+        except Exception as exc:
+            logger.warning("regulation_indexer: pypdf parse failed - %s", exc)
+
+        try:
             from pdfminer.high_level import extract_text
             return (extract_text(io.BytesIO(data)) or "").strip()
         except Exception:
@@ -292,7 +301,7 @@ async def index_all_active_regulations(
 
 async def is_any_regulation_indexed() -> bool:
     """Cheap check used at startup to decide whether to auto-index."""
-    if not vector_store._available or vector_store._collection is None:
+    if not vector_store._available:
         return False
     result = await vector_store.collection_get(
         where={"type": "regulation"},
@@ -313,7 +322,7 @@ async def search_regulation(
     If regulation_id is supplied, restricts to that single regulation.
     Otherwise searches across ALL indexed regulations.
     """
-    if not vector_store._available or vector_store._collection is None:
+    if not vector_store._available:
         return []
 
     try:

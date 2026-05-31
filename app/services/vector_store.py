@@ -21,6 +21,7 @@ Public API:
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 from typing import Any, Dict, List, Optional
 
@@ -56,7 +57,10 @@ class VectorStore:
 
     def __init__(self) -> None:
         self._collection: Optional[Any] = None
+        self._backend = "unavailable"
         self._available = False
+        self._init_error: Optional[str] = None
+        self._memory_chunks: Dict[str, Dict[str, Any]] = {}
         self._init_chroma()
 
     # ──────────────────────────────────────────────────────────────────────
@@ -90,21 +94,126 @@ class VectorStore:
             )
             count = self._collection.count()
             self._available = True
+            self._backend = "chroma"
             logger.info(
                 "VectorStore: ChromaDB initialised — path=%s collection=%s "
                 "existing_chunks=%d writable=True",
                 _CHROMA_DATA_DIR, _COLLECTION_NAME, count,
             )
-        except ImportError:
-            logger.warning(
-                "VectorStore: 'chromadb' package not installed — "
-                "RAG indexing is unavailable. Install with: pip install chromadb"
+        except ImportError as exc:
+            self._enable_memory_fallback(
+                "'chromadb' package not installed. Install with: pip install chromadb",
+                exc,
             )
         except Exception as exc:
-            logger.warning(
-                "VectorStore: ChromaDB init failed — RAG indexing is unavailable. "
-                "Error: %s", exc,
+            self._enable_memory_fallback("ChromaDB init failed", exc)
+
+    def _enable_memory_fallback(self, reason: str, exc: Exception) -> None:
+        self._collection = None
+        self._backend = "memory"
+        self._available = True
+        self._init_error = f"{reason}: {exc}"
+        logger.warning(
+            "VectorStore: %s. Falling back to in-memory vector store; "
+            "RAG works until process restart. Error: %s",
+            reason,
+            exc,
+        )
+
+    @property
+    def backend(self) -> str:
+        return self._backend
+
+    @property
+    def init_error(self) -> Optional[str]:
+        return self._init_error
+
+    @staticmethod
+    def _cosine_similarity(a: List[float], b: List[float]) -> float:
+        if len(a) != len(b):
+            return 0.0
+        dot = sum(x * y for x, y in zip(a, b))
+        mag_a = math.sqrt(sum(x * x for x in a))
+        mag_b = math.sqrt(sum(y * y for y in b))
+        if mag_a == 0.0 or mag_b == 0.0:
+            return 0.0
+        return dot / (mag_a * mag_b)
+
+    @staticmethod
+    def _matches_where(meta: Dict[str, Any], where: Optional[Dict[str, Any]]) -> bool:
+        if not where:
+            return True
+        if "$and" in where:
+            return all(VectorStore._matches_where(meta, clause) for clause in where["$and"])
+        for key, expected in where.items():
+            actual = meta.get(key)
+            if isinstance(expected, dict) and "$eq" in expected:
+                expected = expected["$eq"]
+            if actual != expected:
+                return False
+        return True
+
+    def _memory_query(
+        self,
+        query_embedding: List[float],
+        where: Optional[Dict[str, Any]] = None,
+        top_k: int = 5,
+    ) -> Dict[str, Any]:
+        rows = []
+        for chunk_id, chunk in self._memory_chunks.items():
+            meta = chunk.get("metadata", {})
+            if not self._matches_where(meta, where):
+                continue
+            similarity = self._cosine_similarity(query_embedding, chunk.get("embedding", []))
+            rows.append((chunk_id, chunk, 1.0 - similarity))
+
+        rows.sort(key=lambda row: row[2])
+        rows = rows[: max(0, top_k)]
+        return {
+            "ids": [[row[0] for row in rows]],
+            "documents": [[row[1].get("content", "") for row in rows]],
+            "metadatas": [[row[1].get("metadata", {}) for row in rows]],
+            "distances": [[row[2] for row in rows]],
+        }
+
+    def _memory_get(
+        self,
+        where: Optional[Dict[str, Any]] = None,
+        limit: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        rows = []
+        for chunk_id, chunk in self._memory_chunks.items():
+            if self._matches_where(chunk.get("metadata", {}), where):
+                rows.append((chunk_id, chunk))
+            if limit is not None and len(rows) >= limit:
+                break
+        return {
+            "ids": [row[0] for row in rows],
+            "documents": [row[1].get("content", "") for row in rows],
+            "metadatas": [row[1].get("metadata", {}) for row in rows],
+        }
+
+    @staticmethod
+    def _hits_from_result(result: Dict[str, Any], min_score: float) -> List[Dict[str, Any]]:
+        hits = []
+        ids = result.get("ids", [[]])[0]
+        documents = result.get("documents", [[]])[0]
+        metadatas = result.get("metadatas", [[]])[0]
+        distances = result.get("distances", [[]])[0]
+
+        for chunk_id, doc, meta, dist in zip(ids, documents, metadatas, distances):
+            score = max(0.0, 1.0 - dist)
+            if score < min_score:
+                continue
+            hits.append(
+                {
+                    "chunk_id": chunk_id,
+                    "content": doc,
+                    "score": round(score, 4),
+                    "metadata": meta or {},
+                }
             )
+        return hits
 
     # ──────────────────────────────────────────────────────────────────────
     #  Public API
@@ -126,10 +235,27 @@ class VectorStore:
             metadata:  {materialId, chunkIndex, materialTitle, offeringId, ...}
           }
         """
-        if not self._available or self._collection is None:
+        if not self._available:
             logger.warning("VectorStore.upsert_chunks: store unavailable — skipping.")
             return
         if not chunks:
+            return
+
+        if self._backend == "memory":
+            for chunk in chunks:
+                self._memory_chunks[chunk["chunk_id"]] = {
+                    "content": chunk["content"],
+                    "embedding": chunk["embedding"],
+                    "metadata": _sanitise_metadata(chunk.get("metadata", {})),
+                }
+            logger.info(
+                "VectorStore(memory): upserted %d chunks for material_id=%s.",
+                len(chunks), material_id,
+            )
+            return
+
+        if self._collection is None:
+            logger.warning("VectorStore.upsert_chunks: Chroma collection missing - skipping.")
             return
 
         ids        = [c["chunk_id"] for c in chunks]
@@ -173,7 +299,7 @@ class VectorStore:
         Returns list of:
           {chunk_id, content, score, metadata}
         """
-        if not self._available or self._collection is None:
+        if not self._available:
             logger.warning("VectorStore.search: store unavailable — returning empty.")
             return []
 
@@ -181,6 +307,10 @@ class VectorStore:
         where: Optional[Dict[str, Any]] = _build_where(
             filter_material_id, filter_offering_id
         )
+
+        if self._backend == "memory":
+            result = self._memory_query(query_embedding, where=where, top_k=top_k)
+            return self._hits_from_result(result, min_score)
 
         try:
             # count() and query() are both sync — run together in a thread
@@ -235,8 +365,24 @@ class VectorStore:
 
     async def delete_material(self, material_id: str) -> None:
         """Delete all chunks belonging to material_id."""
-        if not self._available or self._collection is None:
+        if not self._available:
             logger.warning("VectorStore.delete_material: store unavailable — skipping.")
+            return
+        if self._backend == "memory":
+            before = len(self._memory_chunks)
+            self._memory_chunks = {
+                chunk_id: chunk
+                for chunk_id, chunk in self._memory_chunks.items()
+                if chunk.get("metadata", {}).get("materialId") != material_id
+            }
+            logger.info(
+                "VectorStore(memory): deleted %d chunks for material_id=%s.",
+                before - len(self._memory_chunks),
+                material_id,
+            )
+            return
+        if self._collection is None:
+            logger.warning("VectorStore.delete_material: Chroma collection missing - skipping.")
             return
         try:
             await asyncio.to_thread(
@@ -249,19 +395,45 @@ class VectorStore:
 
     async def get_collection_stats(self) -> Dict[str, Any]:
         """Return basic stats about the collection."""
-        if not self._available or self._collection is None:
+        if not self._available:
             return {
                 "available": False,
+                "backend": self._backend,
                 "collection": _COLLECTION_NAME,
                 "total_chunks": 0,
                 "data_dir": _CHROMA_DATA_DIR,
                 "message": "ChromaDB is unavailable.",
+                "init_error": self._init_error,
+            }
+        if self._backend == "memory":
+            return {
+                "available": True,
+                "backend": "memory",
+                "collection": _COLLECTION_NAME,
+                "total_chunks": len(self._memory_chunks),
+                "data_dir": _CHROMA_DATA_DIR,
+                "data_dir_writable": os.access(_CHROMA_DATA_DIR, os.W_OK),
+                "min_score_threshold": _MIN_SCORE,
+                "persistent": False,
+                "message": "Using in-memory vector store because ChromaDB is unavailable.",
+                "init_error": self._init_error,
+            }
+        if self._collection is None:
+            return {
+                "available": False,
+                "backend": self._backend,
+                "collection": _COLLECTION_NAME,
+                "total_chunks": 0,
+                "data_dir": _CHROMA_DATA_DIR,
+                "message": "ChromaDB collection is unavailable.",
+                "init_error": self._init_error,
             }
         try:
             count = await asyncio.to_thread(self._collection.count)
             writable = os.access(_CHROMA_DATA_DIR, os.W_OK)
             return {
                 "available": True,
+                "backend": "chroma",
                 "collection": _COLLECTION_NAME,
                 "total_chunks": count,
                 "data_dir": _CHROMA_DATA_DIR,
@@ -281,8 +453,19 @@ class VectorStore:
         a specific embedding dimension and break subsequent indexing if the
         embedding provider changes.
         """
-        if not self._available or self._collection is None:
+        if not self._available:
             return {"ok": False, "reason": "ChromaDB not initialised"}
+        if self._backend == "memory":
+            return {
+                "ok": True,
+                "backend": "memory",
+                "total_chunks": len(self._memory_chunks),
+                "persistent": False,
+                "reason": "ChromaDB unavailable; memory fallback active",
+                "init_error": self._init_error,
+            }
+        if self._collection is None:
+            return {"ok": False, "reason": "ChromaDB collection missing"}
         try:
             def _run_probe():
                 # Just verify we can call count() and check writability
@@ -313,7 +496,11 @@ class VectorStore:
         limit: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Async-safe wrapper for `_collection.get(where=..., limit=...)`."""
-        if not self._available or self._collection is None:
+        if not self._available:
+            return {}
+        if self._backend == "memory":
+            return self._memory_get(where=where, limit=limit)
+        if self._collection is None:
             return {}
         try:
             return await asyncio.to_thread(
@@ -332,7 +519,11 @@ class VectorStore:
         top_k: int = 5,
     ) -> Dict[str, Any]:
         """Async-safe wrapper for `_collection.query(...)` with optional where filter."""
-        if not self._available or self._collection is None:
+        if not self._available:
+            return {}
+        if self._backend == "memory":
+            return self._memory_query(query_embedding, where=where, top_k=top_k)
+        if self._collection is None:
             return {}
         try:
             def _run() -> Dict[str, Any]:
