@@ -414,6 +414,9 @@ def _build_system_prompt(context: "ExecutionContext", active_doc: Optional[dict]
 ## قاموس المصطلحات (مهم جداً — لا تخلط بينها)
 | ما يقوله المستخدم | المقصود | الـ endpoint الصحيح |
 |---|---|---|
+| انا مين / هات بياناتي / بروفايلي / اسمي / قسمي / بياناتي | بيانات المستخدم الحالي (يعمل لكل الـ roles) | GET /api/auth/me |
+| مواد بتدرسها / مواد هادرسها / مواد الدكتور | المواد التي يدرّسها الدكتور | GET /api/Subjects/my-subjects |
+| مواد مسجل فيها / انرولمنت / مسجل في | المواد المسجل فيها الطالب | GET /api/Enrollments/my-enrollments |
 | لائحة / لوائح / ليحه / لايحه / الاليخه / دليل الطالب | وثيقة اللائحة الأكاديمية | /api/Regulations/* |
 | مادة / مواد / محاضرة / ملف / مادة مرفوعة | ملفات المحاضرات والمواد الدراسية | /api/Materials/by-subject/{{subjectIdOrCode}} |
 | مادة دراسية / subject / كورس | مادة في الخطة الدراسية | /api/Subjects/* |
@@ -427,6 +430,10 @@ def _build_system_prompt(context: "ExecutionContext", active_doc: Optional[dict]
 | كلية / كليات | الكليات | /api/Colleges/* |
 
 ## قواعد العمل
+0. **هوية المستخدم الحالي** — أي سؤال عن "انا مين / اسمي / بياناتي / قسمي / بروفايلي":
+   - استخدم دائماً `GET /api/auth/me` — يعمل لكل الـ roles (Student, Doctor, Admin) ويرجع الاسم + القسم + الكلية + الرقم الجامعي.
+   - ⛔ لا تستخدم `/api/Students/me` للدكتور ولا `/api/Enrollments/my-enrollments` للدكتور — هذه endpoints للطلاب فقط.
+   - للدكتور الذي يريد مواده: `GET /api/Subjects/my-subjects` بعد `/api/auth/me`.
 1. **لا تخمّن أبداً** — إذا احتجت بيانات، استخدم call_backend_api فوراً.
 2. **ابحث بمثابرة** — إذا أخفق endpoint، جرّب آخر ذا صلة.
 3. **استدعِ الأدوات بالتوازي** لو احتجت بيانات من مصادر متعددة.
