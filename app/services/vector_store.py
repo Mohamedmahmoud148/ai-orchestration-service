@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import math
 import os
+import tempfile
 from typing import Any, Dict, List, Optional
 
 from app.core.logging import logger
@@ -36,7 +37,9 @@ _DEFAULT_CHROMA_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
     "chroma_data",
 )
-_CHROMA_DATA_DIR = os.environ.get("CHROMA_DATA_DIR") or _DEFAULT_CHROMA_DIR
+_ENV_CHROMA_DATA_DIR = os.environ.get("CHROMA_DATA_DIR")
+_FALLBACK_CHROMA_DIR = os.path.join(tempfile.gettempdir(), "university_chroma_data")
+_CHROMA_DATA_DIR = _ENV_CHROMA_DATA_DIR or _DEFAULT_CHROMA_DIR
 
 # Minimum cosine similarity to include a chunk in search results.
 # Range: 0.0–1.0. Lower = more permissive.
@@ -71,35 +74,25 @@ class VectorStore:
         try:
             import chromadb  # type: ignore
 
-            os.makedirs(_CHROMA_DATA_DIR, exist_ok=True)
+            candidates = [_CHROMA_DATA_DIR]
+            if not _ENV_CHROMA_DATA_DIR and _FALLBACK_CHROMA_DIR not in candidates:
+                candidates.append(_FALLBACK_CHROMA_DIR)
 
-            # Verify the directory is writable before creating the client
-            _test_file = os.path.join(_CHROMA_DATA_DIR, ".write_test")
-            try:
-                with open(_test_file, "w") as f:
-                    f.write("ok")
-                os.remove(_test_file)
-            except OSError as err:
-                logger.error(
-                    "VectorStore: ChromaDB data dir %s is NOT writable — "
-                    "RAG persistence will fail. Mount a writable volume. Error: %s",
-                    _CHROMA_DATA_DIR, err,
-                )
-                # Continue anyway; ChromaDB may still work in-memory
+            errors: List[str] = []
+            for data_dir in candidates:
+                try:
+                    self._init_chroma_at_path(chromadb, data_dir)
+                    return
+                except Exception as exc:
+                    errors.append(f"{data_dir}: {exc}")
+                    logger.warning(
+                        "VectorStore: ChromaDB init failed at %s - %s",
+                        data_dir,
+                        exc,
+                    )
 
-            client = chromadb.PersistentClient(path=_CHROMA_DATA_DIR)
-            self._collection = client.get_or_create_collection(
-                name=_COLLECTION_NAME,
-                metadata={"hnsw:space": "cosine"},
-            )
-            count = self._collection.count()
-            self._available = True
-            self._backend = "chroma"
-            logger.info(
-                "VectorStore: ChromaDB initialised — path=%s collection=%s "
-                "existing_chunks=%d writable=True",
-                _CHROMA_DATA_DIR, _COLLECTION_NAME, count,
-            )
+            raise RuntimeError("; ".join(errors))
+
         except ImportError as exc:
             self._enable_memory_fallback(
                 "'chromadb' package not installed. Install with: pip install chromadb",
@@ -107,6 +100,31 @@ class VectorStore:
             )
         except Exception as exc:
             self._enable_memory_fallback("ChromaDB init failed", exc)
+
+    def _init_chroma_at_path(self, chromadb: Any, data_dir: str) -> None:
+        global _CHROMA_DATA_DIR
+
+        os.makedirs(data_dir, exist_ok=True)
+        test_file = os.path.join(data_dir, ".write_test")
+        with open(test_file, "w", encoding="utf-8") as f:
+            f.write("ok")
+        os.remove(test_file)
+
+        client = chromadb.PersistentClient(path=data_dir)
+        self._collection = client.get_or_create_collection(
+            name=_COLLECTION_NAME,
+            metadata={"hnsw:space": "cosine"},
+        )
+        count = self._collection.count()
+        _CHROMA_DATA_DIR = data_dir
+        self._available = True
+        self._backend = "chroma"
+        self._init_error = None
+        logger.info(
+            "VectorStore: ChromaDB initialised - path=%s collection=%s "
+            "existing_chunks=%d writable=True",
+            _CHROMA_DATA_DIR, _COLLECTION_NAME, count,
+        )
 
     def _enable_memory_fallback(self, reason: str, exc: Exception) -> None:
         self._collection = None
