@@ -434,7 +434,7 @@ def _build_system_prompt(context: "ExecutionContext", active_doc: Optional[dict]
 7. **لقراءة/تلخيص محتوى ملف PDF بالداخل** → استخدم `read_material_pdf` مع `file_url` المعروف. لا تستخدمه إلا لو المستخدم طلب صراحةً قراءة أو تلخيص محتوى ملف.
 8. **للمواد/الماتريال (ملفات المحاضرات)** — التسلسل الإجباري:
    a. أولاً: `GET /api/Enrollments/my-enrollments` → يرجع `subjectCode` (مثل DS-101) و `subjectOfferingId`
-   b. ثانياً: `GET /api/Materials/by-subject/{subjectCode}` باستخدام الـ `subjectCode` من الخطوة السابقة
+   b. ثانياً: `GET /api/Materials/by-subject/{{subjectCode}}` باستخدام الـ `subjectCode` من الخطوة السابقة
    ⛔ ممنوع استخدام أي ID من الـ context (departmentId, batchId, userId) — هذه ليست subject IDs.
    ⛔ ممنوع تخمين أي ID. كل ID يجب أن يأتي من نتيجة API call فعلية.
 8b. **إذا أعاد endpoint خطأ 403 أو 404** → لا تحاول مرة أخرى بنفس الـ ID. ارجع للخطوة (a).
