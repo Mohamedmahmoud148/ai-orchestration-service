@@ -47,6 +47,8 @@ class Intent(str, Enum):
     BACKEND_API_QUERY    = "backend_api_query"
     REGULATION           = "regulation"
     ACTION_EXECUTE       = "action_execute"
+    ASSIGNMENT_QUERY     = "assignment_query"
+    STUDY_PLAN           = "study_plan"
 
     @classmethod
     def values(cls) -> set[str]:

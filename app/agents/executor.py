@@ -61,6 +61,8 @@ _MODULE_CLASS_MAP: Dict[str, tuple[str, str]] = {
     "backend_api_query":  ("app.modules.dynamic_api",         "DynamicApiModule"),
     "action_execute":     ("app.modules.dynamic_api",         "DynamicApiModule"),
     "material_qa":        ("app.modules.material_qa",         "MaterialQAModule"),
+    "assignment_query":   ("app.modules.assignment_query",    "AssignmentQueryModule"),
+    "study_plan":         ("app.modules.study_plan",          "StudyPlanModule"),
 }
 
 # ── Tool allowlist ─────────────────────────────────────────────────────────────
@@ -85,6 +87,7 @@ ALLOWED_TOOL_NAMES: frozenset[str] = frozenset({
     "BulkCreateStudents",
     "BulkUploadGrades",
     "GetMaterials",
+    "GetStudentAssignments",
 })
 
 # ── Role-specific system prompts ──────────────────────────────────────────────

@@ -49,6 +49,8 @@ VALID_INTENTS = {
     "material_qa",
     "regulation",
     "action_execute",   # enrollment, submissions — routed to DynamicApiModule
+    "assignment_query", # student asks about their assignments, deadlines, submissions
+    "study_plan",       # student asks for a personalized study/revision plan
 }
 
 
@@ -259,6 +261,78 @@ def _detect_material_qa(message: str) -> bool:
     return False
 
 
+# ── Deterministic assignment keyword override ─────────────────────────────────
+_ASSIGNMENT_KEYWORDS: frozenset[str] = frozenset({
+    # Arabic — ask about assignments / deadlines
+    "واجب", "الواجب", "واجباتي", "واجبات", "تسليم", "التسليم",
+    "موعد التسليم", "الموعد النهائي", "deadline",
+    "سلمت", "لسه ما سلمتش", "هل سلمت", "حالة الواجب",
+    "درجة الواجب", "الواجب الجاي", "مش عارف الواجب",
+    "الواجبات المتأخرة", "واجب متأخر", "فاتني الواجب",
+    "ايه الواجبات", "اشرحلي الواجب", "شرح الواجب",
+    "تفاصيل الواجب", "متطلبات الواجب",
+    # English
+    "my assignment", "my assignments", "assignment deadline", "due date",
+    "submitted assignment", "did i submit", "assignment status",
+    "pending assignment", "overdue assignment", "late assignment",
+    "assignment grade", "assignment feedback", "explain assignment",
+    "assignment requirements", "assignment details", "what is the assignment",
+    "show me assignments", "list assignments",
+})
+
+
+def _detect_assignment_query(message: str) -> bool:
+    """Detect if the user is asking about their assignments."""
+    msg = message.strip().lower()
+    for kw in _ASSIGNMENT_KEYWORDS:
+        if kw in msg:
+            return True
+    return False
+
+
+# ── Deterministic study-plan keyword override ─────────────────────────────────
+_STUDY_PLAN_KEYWORDS: frozenset[str] = frozenset({
+    # Arabic — study plan / schedule requests
+    "خطة مذاكرة", "خطة دراسة", "خطة دراسية", "خطة للمذاكرة",
+    "اعمللي خطة", "اعمل لي خطة", "عمل خطة", "خطة للأسبوع",
+    "جدول مذاكرة", "جدول دراسة", "جدول للأسبوع", "جدول يومي",
+    "كيف أذاكر", "كيف اذاكر", "ازاي اذاكر", "ازاي أذاكر",
+    "أولوياتي", "اولوياتي", "رتب أولوياتي", "رتب اولوياتي",
+    "ما المواد التي أركز", "أركز على إيه", "أركز على ايه",
+    "كيف أرفع معدلي", "كيف ارفع معدلي", "أرفع المعدل",
+    "ارفع المعدل", "كيف أحسن معدلي", "كيف احسن معدلي",
+    "كيف أنجح", "كيف انجح", "كيف أكمل", "كيف اكمل الترم",
+    "ماذا أذاكر", "ماذا اذاكر", "ايه اللي أذاكره", "إيه اللي أذاكره",
+    "خطة للامتحانات", "خطة الامتحانات", "خطة للميدتيرم", "خطة للفاينل",
+    "خطة للاختبار", "استعداد للامتحان", "استعداد للميدتيرم",
+    "كيف أستعد للامتحان", "كيف استعد للامتحان",
+    "أذاكر إيه النهارده", "أذاكر ايه النهارده", "اذاكر ايه", "اذاكر إيه",
+    "وقت المذاكرة", "توزيع وقت", "توزيع المذاكرة",
+    "مواد محتاجة تركيز", "مواد محتاجة اهتمام", "المواد الصعبة",
+    "تقدر تساعدني أذاكر", "ساعدني في المذاكرة",
+    # English
+    "study plan", "study schedule", "study timetable",
+    "revision plan", "revision schedule",
+    "how to study", "how should i study", "what should i study",
+    "study for midterm", "study for final", "study for exam",
+    "prioritize my subjects", "my priorities this week",
+    "raise my gpa", "improve my gpa", "improve my grades",
+    "how to pass", "study tips", "focus on what",
+    "what to study today", "study today",
+    "weekly plan", "daily plan", "study this week",
+    "exam prep", "exam preparation", "prepare for exam",
+})
+
+
+def _detect_study_plan(message: str) -> bool:
+    """Detect if the user is asking for a study or revision plan."""
+    msg = message.strip().lower()
+    for kw in _STUDY_PLAN_KEYWORDS:
+        if kw in msg:
+            return True
+    return False
+
+
 # ── Available backend tools (referenced in system prompt) ─────────────────────
 
 _AVAILABLE_TOOLS = [
@@ -319,6 +393,8 @@ Your job is to classify the user's request and return a structured JSON plan.
 - material_explanation — explain or summarize real course material fetched from the backend
 - material_qa        — answer a student question grounded ONLY in indexed course material (RAG)
 - action_execute     — execute a write action in the system (enroll student, create entity, etc.)
+- assignment_query   — student asks about their assignments, deadlines, submission status, or requirements
+- study_plan         — student asks for a personalized study/revision plan, schedule, weekly priorities, or exam prep strategy
 
 ## Output Schema (return ONLY this JSON, no markdown, no extra text)
 {{
@@ -431,6 +507,23 @@ Rules for generate_exam:
 ### 9. academic_advice
 - Use intent=academic_advice when a student asks for study advice, course
   recommendations, or wants to know how to improve their GPA.
+
+### 9b. study_plan — PERSONALIZED STUDY SCHEDULE GENERATION
+
+⚠️ ALWAYS use intent=study_plan when the student asks for:
+- A study plan / revision plan / weekly schedule ("اعمللي خطة مذاكرة", "study plan")
+- How to study for an exam ("كيف أذاكر للميدتيرم", "how to study for final")
+- What to prioritize this week ("أولوياتي الأسبوع ده", "priorities this week")
+- How to raise/improve their GPA ("ازاي أرفع معدلي", "how to raise my GPA")
+- What to study today ("اذاكر ايه النهاردة", "what should I study today")
+- Exam preparation strategy ("كيف أستعد للامتحان", "exam prep")
+
+Rules for study_plan:
+- Use intent=study_plan for ALL schedule/planning/prioritization requests.
+- Steps MUST be [] — the StudyPlanModule fetches all data internally.
+- exam_params MUST be null.
+- NEVER use academic_advice for study scheduling requests — academic_advice is for
+  general standing queries ("how am I doing?"), study_plan is for actionable schedules.
 
 ### 10. material_explanation (STRICT DATA-FIRST — HIGHEST PRIORITY INTENT)
 - ALWAYS use intent=material_explanation when the user asks to EXPLAIN, SUMMARIZE,
@@ -727,6 +820,26 @@ class PlannerAgent(BaseAgent):
             plan.intent = "regulation"
             plan.goal_summary = "Read and answer from the official academic regulation PDF."
             plan.is_executable = True
+
+        # ── Layer 2: Study plan override (highest priority after exam/regulation) ─
+        # Fires before assignment_query — study plan is more specific
+        if plan.intent in ("general_chat", "academic_advice", "backend_api_query") \
+                and _detect_study_plan(agent_input.message):
+            logger.warning(
+                "PlannerAgent [Layer-2 override]: Correcting %r to study_plan.", plan.intent
+            )
+            plan.intent = "study_plan"
+            plan.goal_summary = (
+                "توليد خطة مذاكرة شخصية مبنية على بيانات الطالب الأكاديمية الفعلية."
+            )
+
+        # ── Layer 2: Assignment query override ────────────────────────────
+        if plan.intent in ("general_chat", "backend_api_query") and _detect_assignment_query(agent_input.message):
+            logger.warning(
+                "PlannerAgent [Layer-2 override]: Correcting %r to assignment_query.", plan.intent
+            )
+            plan.intent = "assignment_query"
+            plan.goal_summary = "Show the student their assignments, deadlines, and submission status."
 
         # ── Deterministic guard: ensure ResolveSubjectOffering pre-step ───
         plan = self._ensure_resolve_step(plan)
