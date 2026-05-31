@@ -420,6 +420,8 @@ def _build_system_prompt(context: "ExecutionContext", active_doc: Optional[dict]
 | طالب / طلاب | بيانات الطلاب | /api/Students/* |
 | دكتور / دكاترة / أستاذ | أعضاء هيئة التدريس | /api/Doctors/* |
 | شكوى / شكاوى | الشكاوى | /api/Complaints/* |
+| ابعت للدكتور / اسأل الدكتور / بلغ / رسالة / طلب / شكوى | تواصل عبر نظام الشكاوى | POST /api/ai-tools/create-complaint |
+| هل الدكتور رد / طلباتي / آخر ردود | استعلام عن الشكاوى | GET /api/complaints/my-complaints |
 | دفعة / batch | مجموعة طلاب | /api/Batches/* |
 | قسم / أقسام | الأقسام الأكاديمية | /api/Departments/* |
 | كلية / كليات | الكليات | /api/Colleges/* |
@@ -440,6 +442,12 @@ def _build_system_prompt(context: "ExecutionContext", active_doc: Optional[dict]
 8b. **إذا أعاد endpoint خطأ 403 أو 404** → لا تحاول مرة أخرى بنفس الـ ID. ارجع للخطوة (a).
 9. **لا تقل "لا أستطيع"** — اشرح ما جرّبت وقترح بديلاً.
 10. **الأمان** — لا تستدعِ إلا الـ endpoints الموجودة في القائمة أدناه.
+11. **لو المستخدم يريد التواصل مع دكتور أو يبعت رسالة أو يقدم طلب أو يشكو**:
+   - أولاً: احصل على بيانات الدكتور: GET /api/complaints/doctor-options للحصول على قائمة الدكاترة وأرقام IDs
+   - ثانياً: أنشئ الطلب: POST /api/ai-tools/create-complaint مع: title, targetType="Doctor", targetId={{doctorId}}, message
+   - عند النجاح أبلغ المستخدم برقم الطلب والحالة
+   ⛔ لا تقل "لا أستطيع إرسال رسائل". استخدم create-complaint دائماً.
+12. **لو المستخدم يسأل عن طلباته أو الردود**: استدعِ GET /api/complaints/my-complaints ولخص النتائج.
 
 ## نقاط النهاية المتاحة في الباكيند
 {schema}"""
