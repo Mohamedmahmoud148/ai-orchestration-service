@@ -292,6 +292,27 @@ class Agent:
                 await self._memory_store.save_file_context(context.user_id, best_url, fname)
                 logger.info("[Agent] Saved file URL to memory for user_id=%s url=%s", context.user_id, best_url[:60])
 
+                # Also persist as ActiveDocumentContext so ReactAgent can inject it
+                # into the system prompt for follow-up requests ("لخصه", "اقراه", etc.)
+                active_doc = {
+                    "document_type": "material",
+                    "file_url": best_url,
+                    "title": fname,
+                    "material_id": "",
+                    "subject_name": "",
+                }
+                # Try to enrich from academic_context (subject name may be known)
+                acad = context.academic_context or {}
+                if acad.get("subjectName"):
+                    active_doc["subject_name"] = acad["subjectName"]
+                elif acad.get("subject_name"):
+                    active_doc["subject_name"] = acad["subject_name"]
+                await self._memory_store.set_active_document(context.user_id, active_doc)
+                logger.info(
+                    "[Agent] Saved active_doc (material) for user_id=%s title=%s",
+                    context.user_id, fname,
+                )
+
             # Fire-and-forget: compress long conversations in the background
             if len(context.history) >= _SUMMARY_THRESHOLD:
                 asyncio.create_task(self._summarize_and_save(context))

@@ -28,6 +28,19 @@ if TYPE_CHECKING:
 _MODEL = "openai/gpt-4o-mini"
 _MAX_ITERATIONS = 4   # 4 allows: think → tool1 → tool2 → final answer for complex academic queries
 
+# Follow-up phrases that indicate the user wants to act on the previously active document
+_FOLLOWUP_AR = (
+    "لخصه", "لخصلي", "لخص", "اقراه", "اقرا", "اقرأه", "اقرأ", "اشرحه", "اشرح الملف",
+    "اشرح المحتوى", "اشرح المحتوي", "ماذا يحتوي", "ما يحتوي", "اعمل quiz",
+    "اعمل امتحان", "استخرج العناوين", "ملخص", "فيه ايه", "فيه إيه",
+    "محتواه", "محتواها", "عاوز تلخيص", "عايز تلخيص",
+)
+_FOLLOWUP_EN = (
+    "summarize it", "summarize this", "read it", "read this", "explain it",
+    "explain this", "make a quiz", "generate exam", "generate a quiz",
+    "list headings", "what's inside", "what is inside",
+)
+
 # ── Tool definitions ──────────────────────────────────────────────────────────
 
 _TOOL_CALL_API: dict = {
@@ -253,7 +266,39 @@ def _load_role_persona(role: str) -> str:
         return ""
 
 
-def _build_system_prompt(context: "ExecutionContext") -> str:
+def _build_active_doc_section(active_doc: dict) -> str:
+    """Build a system prompt section for the currently active document."""
+    if not active_doc:
+        return ""
+    doc_type = active_doc.get("document_type", "material")
+    title = active_doc.get("title", "")
+    subject = active_doc.get("subject_name", "")
+    file_url = active_doc.get("file_url", "")
+
+    if doc_type == "material" and file_url:
+        subject_line = f"\n- المادة: {subject}" if subject else ""
+        return (
+            f"\n## الوثيقة النشطة حالياً\n"
+            f"- النوع: ملف مادة دراسية (material)\n"
+            f"- العنوان: {title}{subject_line}\n"
+            f"- الرابط: {file_url}\n"
+            f"⚠️ **قاعدة ملزمة**: إذا قال المستخدم 'لخصه' أو 'اقراه' أو 'اشرحه' أو 'اشرح الملف' "
+            f"أو 'اشرح المحتوى' أو 'ماذا يحتوي' أو 'اعمل quiz' أو 'اعمل امتحان' أو 'استخرج العناوين' "
+            f"أو 'ملخص' أو 'summarize' أو 'read it' أو 'explain it' أو 'make a quiz' "
+            f"→ استخدم `read_material_pdf` مع الرابط أعلاه مباشرةً. "
+            f"لا تستخدم `read_regulation_pdf` أبداً لهذه الطلبات.\n"
+        )
+    elif doc_type == "regulation":
+        return (
+            f"\n## الوثيقة النشطة حالياً\n"
+            f"- النوع: لائحة أكاديمية (regulation)\n"
+            f"- العنوان: {title}\n"
+            f"إذا طلب المستخدم مزيداً من التفاصيل → استخدم `read_regulation_pdf`.\n"
+        )
+    return ""
+
+
+def _build_system_prompt(context: "ExecutionContext", active_doc: Optional[dict] = None) -> str:
     schema = get_allowed_endpoints_schema()
 
     user_ctx = context.academic_context or {}
@@ -322,11 +367,13 @@ def _build_system_prompt(context: "ExecutionContext") -> str:
         goal_label = goal_labels.get(user_goal, user_goal)
         goal_section = f"## هدف المستخدم الحالي\n- {goal_label}\n"
 
+    active_doc_section = _build_active_doc_section(active_doc or {})
+
     return f"""أنت مساعد أكاديمي ذكي لنظام إدارة الجامعة. تعمل كعميل reasoning-first: تُفكّر أولاً ثم تتصرف. تتذكر السياق، تحلّل العلاقات، وتعطي إجابات شخصية مبنية على بيانات حقيقية.
 {persona_section}
 ## الجلسة الحالية
 {ctx_line}
-{memory_section}{profile_section}{entity_section}{goal_section}
+{memory_section}{profile_section}{entity_section}{goal_section}{active_doc_section}
 ## قرارة حل الضمائر (COREFERENCE RESOLUTION)
 إذا كانت الرسالة الحالية قصيرة أو تحتوي ضمائر ("ها"، "ه"، "فيها"، "it"، "this"):
 1. ابحث في **ذاكرة المحادثة السابقة** أو **الكيانات المذكورة** لتحديد المرجع.
@@ -393,6 +440,41 @@ def _build_system_prompt(context: "ExecutionContext") -> str:
 {schema}"""
 
 
+# ── Follow-up chain detection ─────────────────────────────────────────────────
+
+def _is_followup_message(message: str) -> bool:
+    """Return True if the message is a short follow-up command to act on a document."""
+    msg = message.strip().lower()
+    if any(kw in msg for kw in _FOLLOWUP_AR):
+        return True
+    if any(kw in msg for kw in _FOLLOWUP_EN):
+        return True
+    return False
+
+
+def _inject_followup_context(message: str, active_doc: Optional[dict]) -> str:
+    """
+    If the message is a follow-up command AND there is an active material document,
+    prepend a context hint so the LLM uses read_material_pdf with the stored URL.
+    Returns the (possibly modified) message.
+    """
+    if not active_doc:
+        return message
+    if active_doc.get("document_type") != "material":
+        return message
+    file_url = active_doc.get("file_url", "").strip()
+    if not file_url:
+        return message
+    if _is_followup_message(message):
+        prefix = f"[CONTEXT: Active file = {file_url}. Use read_material_pdf with this URL.] "
+        logger.info(
+            "[ReactAgent] follow-up detected — injecting file_url into message url=%.60s",
+            file_url,
+        )
+        return prefix + message
+    return message
+
+
 # ── ReactAgent ────────────────────────────────────────────────────────────────
 
 class ReactAgent:
@@ -432,7 +514,30 @@ class ReactAgent:
             logger.info("[ReactAgent] fast-path answer user_id=%s", context.user_id)
             return fast
 
-        messages = _build_messages(context)
+        # Load active document context from memory store
+        active_doc: Optional[dict] = None
+        if context.user_id:
+            try:
+                from app.services.memory_store import get_memory_store
+                _mem = get_memory_store()
+                active_doc = await _mem.get_active_document(context.user_id)
+                if active_doc:
+                    logger.info(
+                        "[ReactAgent] loaded active_doc for user_id=%s type=%s title=%s",
+                        context.user_id, active_doc.get("document_type"), active_doc.get("title"),
+                    )
+                    # Also inject into metadata so _tool_read_material fallback can use it
+                    if not (context.metadata or {}).get("last_file_url") and active_doc.get("file_url"):
+                        context.add_metadata("last_file_url", active_doc["file_url"])
+            except Exception as _exc:
+                logger.warning("[ReactAgent] failed to load active_doc: %s", _exc)
+
+        # Follow-up chain detection (Task 4):
+        # If the user message is a short follow-up command AND there is an active
+        # material document, prepend context so the LLM uses read_material_pdf.
+        context.message = _inject_followup_context(context.message, active_doc)
+
+        messages = _build_messages(context, active_doc=active_doc)
         self._collected_results: list = []   # accumulate tool outputs for guard
 
         logger.info(
@@ -564,7 +669,22 @@ class ReactAgent:
             yield fast
             return
 
-        messages = _build_messages(context)
+        # Load active document context
+        active_doc: Optional[dict] = None
+        if context.user_id:
+            try:
+                from app.services.memory_store import get_memory_store
+                _mem = get_memory_store()
+                active_doc = await _mem.get_active_document(context.user_id)
+                if active_doc and not (context.metadata or {}).get("last_file_url") and active_doc.get("file_url"):
+                    context.add_metadata("last_file_url", active_doc["file_url"])
+            except Exception as _exc:
+                logger.warning("[ReactAgent.stream] failed to load active_doc: %s", _exc)
+
+        # Follow-up chain detection
+        context.message = _inject_followup_context(context.message, active_doc)
+
+        messages = _build_messages(context, active_doc=active_doc)
 
         logger.info(
             "[ReactAgent.stream] START user_id=%s message=%.80r",
@@ -708,9 +828,9 @@ def _format_tool_result(tool_name: str, result: Any) -> str:
 
 # ── Message builder ───────────────────────────────────────────────────────────
 
-def _build_messages(context: "ExecutionContext") -> List[Dict[str, Any]]:
+def _build_messages(context: "ExecutionContext", active_doc: Optional[dict] = None) -> List[Dict[str, Any]]:
     msgs: List[Dict[str, Any]] = [
-        {"role": "system", "content": _build_system_prompt(context)}
+        {"role": "system", "content": _build_system_prompt(context, active_doc=active_doc)}
     ]
 
     # Use last 10 turns (increased from 8 for better multi-turn reasoning)
@@ -749,6 +869,66 @@ async def _dispatch_tool(tool_call: Any, context: "ExecutionContext", model_rout
         return {"error": f"unknown tool: {fn}"}
 
 
+# ── Material context extractor ────────────────────────────────────────────────
+
+async def _extract_and_save_material_context(
+    result: Any, context: "ExecutionContext"
+) -> None:
+    """
+    Scan an API result for fileUrl / file_url items and save to active_document.
+
+    Called after call_backend_api succeeds. Handles the common shape:
+      {"data": {"items": [{"fileUrl": "...", "title": "...", "subjectName": "..."}, ...]}}
+    """
+    try:
+        if not isinstance(result, dict):
+            return
+        data = result.get("data") or result
+        items: list = []
+        if isinstance(data, dict):
+            items = data.get("items") or data.get("results") or []
+            if not items and isinstance(data, dict):
+                # Sometimes the response IS the item dict directly
+                items = [data]
+        elif isinstance(data, list):
+            items = data
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            file_url = (item.get("fileUrl") or item.get("file_url") or "").strip()
+            if not file_url:
+                continue
+            title = (
+                item.get("title") or item.get("fileName") or item.get("name")
+                or file_url.split("/")[-1].split("?")[0]
+            )
+            subject_name = (
+                item.get("subjectName") or item.get("subject_name")
+                or item.get("subject") or ""
+            )
+            material_id = str(item.get("id") or item.get("materialId") or "")
+            active_doc = {
+                "document_type": "material",
+                "file_url": file_url,
+                "title": title,
+                "material_id": material_id,
+                "subject_name": subject_name,
+            }
+            from app.services.memory_store import get_memory_store
+            _mem = get_memory_store()
+            await _mem.set_active_document(context.user_id or "", active_doc)
+            # Also update the last_file metadata so the fallback in _tool_read_material works
+            context.add_metadata("last_file_url", file_url)
+            logger.info(
+                "[ReactAgent] auto-saved active_doc from API result: title=%s url=%.60s",
+                title, file_url,
+            )
+            break  # save the first found; subsequent items are secondary
+    except Exception as exc:
+        logger.warning("[ReactAgent] _extract_and_save_material_context failed: %s", exc)
+
+
 # ── Tool: call_backend_api ────────────────────────────────────────────────────
 
 async def _tool_call_api(args: dict, context: "ExecutionContext") -> Any:
@@ -776,6 +956,11 @@ async def _tool_call_api(args: dict, context: "ExecutionContext") -> Any:
             return {"error": f"Method {method} not supported"}
 
         logger.info("[ReactAgent] API %s %s → ok", method, path)
+        # Auto-save any material file URL found in the response
+        if context.user_id:
+            asyncio.create_task(
+                _extract_and_save_material_context(result, context)
+            )
         return result
 
     except Exception as exc:

@@ -560,6 +560,37 @@ class MemoryStore:
                 subject, user_id,
             )
 
+    # ── Active Document Context (current material/regulation being discussed) ──
+
+    _TTL_ACTIVE_DOC = 7_200  # 2 hours — same session window
+
+    async def set_active_document(self, user_id: str, doc: dict) -> None:
+        """
+        Store the active document the user is currently working with.
+
+        doc shape:
+          {
+            "document_type": "material" | "regulation",
+            "file_url":      str,
+            "title":         str,
+            "material_id":   str,
+            "subject_name":  str,
+          }
+        """
+        if not user_id or not doc:
+            return
+        await self._set(f"user:{user_id}:active_doc", doc, self._TTL_ACTIVE_DOC)
+        logger.info(
+            "MemoryStore: saved active_doc for user_id=%s type=%s title=%s",
+            user_id, doc.get("document_type"), doc.get("title"),
+        )
+
+    async def get_active_document(self, user_id: str) -> Optional[Dict[str, Any]]:
+        """Return the active document context, or None if not set."""
+        if not user_id:
+            return None
+        return await self._get(f"user:{user_id}:active_doc")
+
     async def get_personalized_context(self, user_id: str) -> str:
         """
         Build a plain-text personalized context string for LLM prompt injection.
