@@ -232,18 +232,29 @@ class AcademicAdvisorModule:
         user_id: Optional[str],
         auth_header: Optional[str],
     ) -> Optional[Dict[str, Any]]:
-        """GET /api/ai-tools/student-overview/{userId} — grades + exams."""
-        if not user_id:
-            return None
+        """GET /api/ai-tools/student-overview/me — resolves from JWT ProfileId automatically.
+        Falls back to /{user_id} only if /me fails (e.g. called as admin on behalf of student)."""
         try:
             data = await self.backend_client.fetch(
-                route=f"/api/ai-tools/student-overview/{user_id}",
+                route="/api/ai-tools/student-overview/me",
                 auth_header=auth_header,
             )
             if isinstance(data, dict) and not data.get("_error"):
                 return data
         except Exception as exc:
-            logger.warning("AcademicAdvisor: student-overview fetch failed (non-fatal) — %s", exc)
+            logger.warning("AcademicAdvisor: student-overview/me failed — %s", exc)
+
+        # Fallback: try with explicit user_id (admin/doctor looking up a specific student)
+        if user_id:
+            try:
+                data = await self.backend_client.fetch(
+                    route=f"/api/ai-tools/student-overview/{user_id}",
+                    auth_header=auth_header,
+                )
+                if isinstance(data, dict) and not data.get("_error"):
+                    return data
+            except Exception as exc:
+                logger.warning("AcademicAdvisor: student-overview/{id} failed — %s", exc)
         return None
 
     # ────────────────────────────────────────────────────────────────────────
