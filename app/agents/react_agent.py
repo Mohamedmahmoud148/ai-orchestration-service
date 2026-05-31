@@ -181,11 +181,13 @@ _TOOL_READ_MATERIAL: dict = {
     "function": {
         "name": "read_material_pdf",
         "description": (
-            "Read, summarize, or extract content from a lecture/course material PDF file. "
-            "Use this when the user asks to: summarize a file, read a lecture, explain material contents, "
-            "list headings/topics in a file, or asks about lecture content. "
-            "DO NOT use this for academic regulations or student handbook — use read_regulation_pdf for that. "
-            "Provide the file_url if available, or the offering_id to fetch materials automatically."
+            "Download and read the CONTENT of a specific lecture/material PDF file. "
+            "ONLY use this when the user explicitly wants to READ or SUMMARIZE the content INSIDE a file — "
+            "e.g.: 'لخصلي الملف', 'اقرا المحاضرة', 'ايه اللي في الملف ده', 'explain this PDF', 'summarize the lecture'. "
+            "DO NOT use for: listing which subjects have materials, listing files, checking if materials exist, "
+            "or any question that is answered by an API call. "
+            "DO NOT use for academic regulations/student handbook — use read_regulation_pdf for that. "
+            "Requires a known file_url (from user message or previous API call result)."
         ),
         "parameters": {
             "type": "object",
@@ -386,9 +388,10 @@ def _build_system_prompt(context: "ExecutionContext") -> str:
 4. **حلّل ولا تكتفِ بالعرض** — قدّم insights حقيقية بعد جمع البيانات.
 5. **اللغة** — نفس لغة المستخدم بالضبط (عربي بعربي، إنجليزي بإنجليزي).
 6. **للائحة الأكاديمية / دليل الطالب** → استخدم `read_regulation_pdf` فقط.
-7. **لتلخيص أو قراءة ملف محاضرة / ماتريال** → استخدم `read_material_pdf` (مش read_regulation_pdf). مرر `file_url` لو معروف، أو `offering_id`.
-8. **لا تقل "لا أستطيع"** — اشرح ما جرّبت وقترح بديلاً.
-9. **الأمان** — لا تستدعِ إلا الـ endpoints الموجودة في القائمة أدناه.
+7. **لقراءة/تلخيص محتوى ملف PDF بالداخل** → استخدم `read_material_pdf` مع `file_url` المعروف. لا تستخدمه إلا لو المستخدم طلب صراحةً قراءة أو تلخيص محتوى ملف.
+8. **لو المستخدم يسأل عن قائمة الملفات أو المواد المتاحة** → استخدم `call_backend_api` (مثل GET /api/Materials/by-offering/...).
+9. **لا تقل "لا أستطيع"** — اشرح ما جرّبت وقترح بديلاً.
+10. **الأمان** — لا تستدعِ إلا الـ endpoints الموجودة في القائمة أدناه.
 
 ## نقاط النهاية المتاحة في الباكيند
 {schema}"""
