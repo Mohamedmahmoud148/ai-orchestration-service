@@ -181,36 +181,32 @@ _TOOL_READ_MATERIAL: dict = {
     "function": {
         "name": "read_material_pdf",
         "description": (
-            "Download and read the CONTENT of a specific lecture/material PDF file. "
-            "ONLY use this when the user explicitly wants to READ or SUMMARIZE the content INSIDE a file — "
-            "e.g.: 'لخصلي الملف', 'اقرا المحاضرة', 'ايه اللي في الملف ده', 'explain this PDF', 'summarize the lecture'. "
-            "DO NOT use for: listing which subjects have materials, listing files, checking if materials exist, "
-            "or any question that is answered by an API call. "
-            "DO NOT use for academic regulations/student handbook — use read_regulation_pdf for that. "
-            "Requires a known file_url (from user message or previous API call result)."
+            "Download and read the CONTENT INSIDE a specific PDF file whose URL is already known. "
+            "ONLY use this when: (1) you already have the file_url from a previous step or the user's message, "
+            "AND (2) the user explicitly asks to read/summarize/explain the file content — "
+            "e.g.: 'لخصلي الملف', 'اقرا المحاضرة دي', 'ايه اللي جوا الملف ده', 'summarize this PDF'. "
+            "NEVER use to list available materials or check what files exist — use call_backend_api for that. "
+            "NEVER use for regulations/student handbook — use read_regulation_pdf for that. "
+            "If file_url is unknown, first call the backend API to get it, then call this tool."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "task": {
-                    "type": "string",
-                    "description": "What to do with the file: 'summarize', 'list_headings', 'explain', 'read'",
-                    "enum": ["summarize", "list_headings", "explain", "read"],
-                },
                 "file_url": {
                     "type": "string",
-                    "description": "Direct URL of the PDF/file to read. Use if already known from previous API calls or user message.",
+                    "description": "The direct URL of the PDF file to read. MUST be known before calling this tool.",
                 },
-                "offering_id": {
+                "task": {
                     "type": "string",
-                    "description": "SubjectOffering ID to fetch materials from backend automatically.",
+                    "description": "What to do: 'summarize' | 'list_headings' | 'explain' | 'read'",
+                    "enum": ["summarize", "list_headings", "explain", "read"],
                 },
                 "question": {
                     "type": "string",
-                    "description": "Optional specific question to answer from the material.",
+                    "description": "Specific question to answer from the file content (optional).",
                 },
             },
-            "required": ["task"],
+            "required": ["file_url", "task"],
         },
     },
 }
@@ -825,34 +821,23 @@ async def _tool_read_material(args: dict, context: "ExecutionContext", model_rou
     import httpx
     import io
 
-    task       = args.get("task", "summarize")
-    file_url   = args.get("file_url") or ""
-    offering_id = args.get("offering_id") or ""
-    question   = args.get("question") or ""
-    auth       = (context.metadata or {}).get("auth_header") or ""
+    task     = args.get("task", "summarize")
+    file_url = (args.get("file_url") or "").strip()
+    question = args.get("question") or ""
+    auth     = (context.metadata or {}).get("auth_header") or ""
 
-    # 1. Resolve file URL — from args, context memory, or backend fetch
+    # Fallback: check agent memory for last saved file URL
     if not file_url:
-        # Check memory for last saved file URL
         mem = context.metadata or {}
-        file_url = mem.get("last_file_url") or ""
-
-    if not file_url and offering_id:
-        # Fetch from backend
-        try:
-            from app.services.backend_client import tool_execution_client as client
-            result = await client.fetch(
-                route=f"/api/Materials/by-offering/{offering_id}",
-                auth_header=auth,
-            )
-            items = result.get("items", []) if isinstance(result, dict) else []
-            if items:
-                file_url = items[0].get("fileUrl") or items[0].get("url") or ""
-        except Exception as exc:
-            logger.warning("[read_material_pdf] backend fetch failed — %s", exc)
+        file_url = (mem.get("last_file_url") or "").strip()
 
     if not file_url:
-        return {"error": "No file URL available. Please provide the file URL or ask about materials first."}
+        return {
+            "error": (
+                "file_url is required but was not provided. "
+                "First call the backend API to get the file URL, then call read_material_pdf."
+            )
+        }
 
     # 2. Download PDF
     try:
