@@ -432,9 +432,12 @@ def _build_system_prompt(context: "ExecutionContext", active_doc: Optional[dict]
 5. **اللغة** — نفس لغة المستخدم بالضبط (عربي بعربي، إنجليزي بإنجليزي).
 6. **للائحة الأكاديمية / دليل الطالب** → استخدم `read_regulation_pdf` فقط.
 7. **لقراءة/تلخيص محتوى ملف PDF بالداخل** → استخدم `read_material_pdf` مع `file_url` المعروف. لا تستخدمه إلا لو المستخدم طلب صراحةً قراءة أو تلخيص محتوى ملف.
-8. **لو المستخدم يسأل عن قائمة الملفات أو المواد المتاحة لمادة معينة** → استخدم GET /api/Materials/by-subject/{{subjectIdOrCode}} مباشرةً. يقبل subject ULID أو الكود (مثل DS-101). لا تستخدم /by-offering إطلاقاً إلا لو عندك subjectOfferingId ULID فعلي من /api/Enrollments/my-enrollments.
-8b. **⛔ ممنوع** تمرير subject code أو subject name أو أي رقم كـ offeringId في /api/Materials/by-offering. by-offering يقبل SubjectOffering ULID فقط (مثل 01KS4553X381...).
-8c. **إذا أعاد endpoint خطأ 403** → الطالب غير مسجل في هذا الـ offering.
+8. **للمواد/الماتريال (ملفات المحاضرات)** — التسلسل الإجباري:
+   a. أولاً: `GET /api/Enrollments/my-enrollments` → يرجع `subjectCode` (مثل DS-101) و `subjectOfferingId`
+   b. ثانياً: `GET /api/Materials/by-subject/{subjectCode}` باستخدام الـ `subjectCode` من الخطوة السابقة
+   ⛔ ممنوع استخدام أي ID من الـ context (departmentId, batchId, userId) — هذه ليست subject IDs.
+   ⛔ ممنوع تخمين أي ID. كل ID يجب أن يأتي من نتيجة API call فعلية.
+8b. **إذا أعاد endpoint خطأ 403 أو 404** → لا تحاول مرة أخرى بنفس الـ ID. ارجع للخطوة (a).
 9. **لا تقل "لا أستطيع"** — اشرح ما جرّبت وقترح بديلاً.
 10. **الأمان** — لا تستدعِ إلا الـ endpoints الموجودة في القائمة أدناه.
 
