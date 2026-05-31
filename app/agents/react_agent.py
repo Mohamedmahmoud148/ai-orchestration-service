@@ -415,7 +415,7 @@ def _build_system_prompt(context: "ExecutionContext", active_doc: Optional[dict]
 | ما يقوله المستخدم | المقصود | الـ endpoint الصحيح |
 |---|---|---|
 | لائحة / لوائح / ليحه / لايحه / الاليخه / دليل الطالب | وثيقة اللائحة الأكاديمية | /api/Regulations/* |
-| مادة / مواد / محاضرة / ملف / مادة مرفوعة | ملفات المحاضرات والمواد الدراسية | /api/Materials/by-subject/{subjectIdOrCode} |
+| مادة / مواد / محاضرة / ملف / مادة مرفوعة | ملفات المحاضرات والمواد الدراسية | /api/Materials/by-subject/{{subjectIdOrCode}} |
 | مادة دراسية / subject / كورس | مادة في الخطة الدراسية | /api/Subjects/* |
 | طالب / طلاب | بيانات الطلاب | /api/Students/* |
 | دكتور / دكاترة / أستاذ | أعضاء هيئة التدريس | /api/Doctors/* |
@@ -432,7 +432,7 @@ def _build_system_prompt(context: "ExecutionContext", active_doc: Optional[dict]
 5. **اللغة** — نفس لغة المستخدم بالضبط (عربي بعربي، إنجليزي بإنجليزي).
 6. **للائحة الأكاديمية / دليل الطالب** → استخدم `read_regulation_pdf` فقط.
 7. **لقراءة/تلخيص محتوى ملف PDF بالداخل** → استخدم `read_material_pdf` مع `file_url` المعروف. لا تستخدمه إلا لو المستخدم طلب صراحةً قراءة أو تلخيص محتوى ملف.
-8. **لو المستخدم يسأل عن قائمة الملفات أو المواد المتاحة لمادة معينة** → استخدم GET /api/Materials/by-subject/{subjectIdOrCode} مباشرةً. يقبل subject ULID أو الكود (مثل DS-101). لا تستخدم /by-offering إطلاقاً إلا لو عندك subjectOfferingId ULID فعلي من /api/Enrollments/my-enrollments.
+8. **لو المستخدم يسأل عن قائمة الملفات أو المواد المتاحة لمادة معينة** → استخدم GET /api/Materials/by-subject/{{subjectIdOrCode}} مباشرةً. يقبل subject ULID أو الكود (مثل DS-101). لا تستخدم /by-offering إطلاقاً إلا لو عندك subjectOfferingId ULID فعلي من /api/Enrollments/my-enrollments.
 8b. **⛔ ممنوع** تمرير subject code أو subject name أو أي رقم كـ offeringId في /api/Materials/by-offering. by-offering يقبل SubjectOffering ULID فقط (مثل 01KS4553X381...).
 8c. **إذا أعاد endpoint خطأ 403** → الطالب غير مسجل في هذا الـ offering.
 9. **لا تقل "لا أستطيع"** — اشرح ما جرّبت وقترح بديلاً.
