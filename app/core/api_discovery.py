@@ -30,7 +30,7 @@ _AUTH_WHITELIST = {
 _BLOCKED_PREFIXES = (
     "/api/auth",          # Authentication — AI never handles login/logout
     "/api/dev",           # Developer/debug routes
-    "/api/ai",            # Prevent self-loop (orchestrator calling itself)
+    "/api/ai/",           # Prevent self-loop — trailing slash avoids blocking /api/ai-tools/*
     "/api/auditlogs",     # Internal audit — not for AI queries
     "/api/notification",  # Push notifications — not an AI tool
 )
@@ -219,9 +219,11 @@ def validate_endpoint(method: str, endpoint: str) -> bool:
     Handles path-parameter substitution:
       /api/Students/01KMXFB... matches /api/Students/{code}
     """
-    # Fast-path: if _is_allowed passes for GET, trust it
-    # (Swagger set may be incomplete due to pagination/filtering)
-    if method.lower() == "get" and _is_allowed(endpoint, "get"):
+    # Fast-path: if _is_allowed passes, trust it for both GET and POST.
+    # The Swagger set (_allowed_endpoints) may be incomplete when the backend
+    # returns endpoints with unexpected casing or when Swagger scanning is slow.
+    # _is_allowed is the authoritative allowlist — Swagger is a secondary cache.
+    if _is_allowed(endpoint, method):
         logger.debug("api_discovery.validate_endpoint: ALLOWED %s %s", method, endpoint)
         return True
 
