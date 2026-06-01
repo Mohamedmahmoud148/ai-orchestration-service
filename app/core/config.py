@@ -61,6 +61,35 @@ class Settings(BaseSettings):
     BACKEND_BREAKER_FAIL_THRESHOLD: int = 5
     BACKEND_BREAKER_RESET_SECONDS: float = 30.0
 
+    # ── AI Pipeline — Layer 1/2/3 flags ──────────────────────────────────────
+    # EMBEDDING_CLASSIFIER_ENABLED:
+    #   True  → Layer 1 (embedding fast path) is active.
+    #   False → Skip Layer 1, always use LLM classification (old behavior).
+    EMBEDDING_CLASSIFIER_ENABLED: bool = True
+
+    # EMBEDDING_CLASSIFIER_SHADOW_MODE:
+    #   True  → Embedding classifier runs and logs results but does NOT change
+    #            execution path.  Use this for 1-week calibration.
+    #   False → Embedding classifier drives the fast path (production mode).
+    EMBEDDING_CLASSIFIER_SHADOW_MODE: bool = True
+
+    # EMBEDDING_HIGH_CONFIDENCE_THRESHOLD:
+    #   Cosine similarity threshold above which the embedding result is trusted
+    #   directly, skipping the LLM call entirely.
+    EMBEDDING_HIGH_CONFIDENCE_THRESHOLD: float = 0.82
+
+    # LLM confidence thresholds (function-call classifier, Layer 2)
+    LLM_CONFIDENCE_EXECUTE_THRESHOLD: float = 0.78
+    LLM_CONFIDENCE_CLARIFY_THRESHOLD: float = 0.55
+
+    # ACTION_GUARD_ENABLED:
+    #   True  → Layer 4 critical action guard is active (enrollment confirmation).
+    #   False → Write operations execute immediately (old behavior).
+    ACTION_GUARD_ENABLED: bool = True
+
+    # OPENROUTER_MODEL: model used for classification (planner) calls.
+    OPENROUTER_MODEL: str = "openai/gpt-4o-mini"
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

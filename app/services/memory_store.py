@@ -467,6 +467,87 @@ class MemoryStore:
         merged = {**existing, **updates}
         await self.save_conversation(user_id, merged)
 
+    # ── Conversation State (Layer 5 — structured entity/pronoun state) ────
+
+    _TTL_CONV_STATE = 7_200  # 2 hours — same window as entity tracking
+
+    async def get_conv_state(self, user_id: str) -> Optional[Any]:
+        """
+        Return the structured ConversationState for this user, or None if
+        no state has been saved yet (first message of a session).
+
+        Imports ConversationState lazily to avoid circular import at
+        module load time.
+        """
+        if not user_id:
+            return None
+        data = await self._get(f"user:{user_id}:conv_state")
+        if not isinstance(data, dict):
+            return None
+        try:
+            from app.core.conversation_state import ConversationState
+            return ConversationState.from_dict(data)
+        except Exception as exc:
+            logger.warning("MemoryStore.get_conv_state parse error: %s", exc)
+            return None
+
+    async def save_conv_state(self, user_id: str, state: Any) -> None:
+        """
+        Persist a ConversationState with a 2-hour TTL.
+
+        Accepts either a ConversationState instance (which has to_dict())
+        or a plain dict — graceful for both call sites.
+        """
+        if not user_id or state is None:
+            return
+        try:
+            data = state.to_dict() if hasattr(state, "to_dict") else dict(state)
+            await self._set(f"user:{user_id}:conv_state", data, self._TTL_CONV_STATE)
+        except Exception as exc:
+            logger.warning("MemoryStore.save_conv_state error: %s", exc)
+
+    # ── Intent Classification Log (pipeline monitoring) ───────────────────
+
+    _TTL_INTENT_LOG = 3_600  # 1 hour
+
+    async def append_intent_log(self, user_id: str, entry: Dict[str, Any]) -> None:
+        """
+        Append a classification log entry for monitoring / shadow-mode comparison.
+
+        Keeps the last 20 entries (FIFO).  Stored as a list.
+        Entry shape:
+          {
+            "ts":         ISO timestamp,
+            "message":    str (truncated),
+            "emb_intent": str | None,
+            "emb_score":  float | None,
+            "llm_intent": str | None,
+            "llm_conf":   float | None,
+            "final":      str,
+            "source":     "embedding" | "llm" | "keyword" | "pronoun",
+            "match":      bool  (emb_intent == llm_intent)
+          }
+        """
+        if not user_id:
+            return
+        try:
+            existing: list = await self._get(f"user:{user_id}:intent_log") or []
+            if not isinstance(existing, list):
+                existing = []
+            existing.append(entry)
+            # Keep last 20
+            trimmed = existing[-20:]
+            await self._set(f"user:{user_id}:intent_log", trimmed, self._TTL_INTENT_LOG)
+        except Exception as exc:
+            logger.warning("MemoryStore.append_intent_log error: %s", exc)
+
+    async def get_intent_log(self, user_id: str) -> list:
+        """Return the intent classification log for a user (for debugging)."""
+        if not user_id:
+            return []
+        data = await self._get(f"user:{user_id}:intent_log")
+        return data if isinstance(data, list) else []
+
     # ── Last seen file URL (persists across turns) ────────────────────────
     _TTL_FILE_CTX = 1_800  # 30 minutes
 

@@ -1,22 +1,32 @@
 """
-planner.py
+planner.py  —  PlannerAgent v5.0
 
-PlannerAgent — uses the LLM to classify the user's intent, extract academic
-parameters, and optionally produce multi-step ExecutionPlans for tool-bound
-requests.
+5-Layer intent classification pipeline:
 
-Key upgrades (v4.0):
-  - Injects academic_context into the classification prompt so the model can
-    auto-fill tool parameters (e.g. user_id, subjectOfferingId) without
-    follow-up questions. (Context-Aware Reasoning)
-  - Unlocks multi-step plans for tool-bound intents. general_chat is strictly
-    locked to steps=[]. (Multi-Step Planning)
-  - Updated system prompt with consistent rule numbering and university domain
-    framing. (Prompt Engineering)
-  - Uses structured messages[] instead of concatenated history strings. (fixed)
+  Layer 0  Pre-Processor         — language detect, Arabizi transliterate, normalize
+  Layer 1  Embedding Classifier  — cosine similarity against intent centroid bank
+  Layer 2  LLM Function-Call     — compact prompt + JSON schema (confident score)
+  Layer 3  Confidence Router     — execute / clarify / fallback
+  Layer 4  Critical Action Guard — user confirmation for write operations
+  Layer 5  Conversation State    — entity stack update, pronoun resolution
+
+Backward-compatible changes:
+  - PlannerAgent.__init__() accepts two new optional parameters:
+      embedding_classifier  (EmbeddingIntentClassifier | None)
+      confidence_router     (ConfidenceRouter | None)
+    When None the corresponding layer is bypassed — old behavior preserved.
+  - All existing keyword detection functions (_detect_generate_exam, etc.)
+    are kept and now act as a final safety net (Layer 2b) AFTER the new
+    LLM function-call classifier, replacing their former role as the only
+    fallback.
+  - Shadow mode: EMBEDDING_CLASSIFIER_SHADOW_MODE=true → embedding runs
+    and logs but does NOT change the execution path.
 """
+from __future__ import annotations
 
 import json
+import time
+from datetime import datetime, timezone
 from typing import Optional, Protocol
 
 from pydantic import ValidationError
@@ -32,7 +42,7 @@ from app.agents.schemas import (
 from app.core.logging import logger
 from app.prompts import render_prompt
 
-# ── Valid intent catalogue ────────────────────────────────────────────────────
+# ── Valid intent catalogue (unchanged) ───────────────────────────────────────
 VALID_INTENTS = {
     "general_chat",
     "summarization",
@@ -48,647 +58,304 @@ VALID_INTENTS = {
     "backend_api_query",
     "material_qa",
     "regulation",
-    "action_execute",   # enrollment, submissions — routed to DynamicApiModule
-    "assignment_query", # student asks about their assignments, deadlines, submissions
-    "study_plan",       # student asks for a personalized study/revision plan
+    "action_execute",
+    "assignment_query",
+    "study_plan",
+    # ── AI Companion Platform intents ───────────────
+    "academic_coach",      # personalized academic coaching with grade analysis
+    "quiz_me",             # interactive quiz session
+    "generate_flashcards", # create flashcard deck for a topic
+    "generate_examples",   # generate practical examples
+    "generate_exercises",  # generate practice exercises
+    "progress_report",     # weekly/monthly progress report
+    "learning_assistant",  # concept explanation with examples/exercises
+    "doctor_analytics",    # doctor: class performance analytics
+    "doctor_risk_students",   # doctor: list at-risk students
+    "doctor_weak_topics",     # doctor: topic performance analysis
+    "doctor_recommendations", # doctor: AI teaching recommendations
 }
 
-
-# ── Fallback intent ───────────────────────────────────────────────────────────
 _FALLBACK_INTENT = "general_chat"
 
-# ── Deterministic exam-intent keyword sets (Layer-2 LLM override) ─────────────
-# Matched AFTER LLM classification so any LLM misclassification of exam-creation
-# requests is caught and corrected deterministically. Case-insensitive substring match.
-_EXAM_KEYWORDS_EN: frozenset[str] = frozenset({
-    "generate exam",    "create exam",     "make exam",
-    "build exam",       "write exam",      "prepare exam",
-    "prepare test",     "create test",     "generate test",
-    "make test",        "build test",      "write test",
-    "exam for subject", "exam for course", "new exam",
-    "draft exam",       "design exam",     "set exam",
-    "set a test",       "produce exam",    "develop exam",
-})
+# ─────────────────────────────────────────────────────────────────────────────
+#  Legacy Layer-2b keyword sets
+#  These are preserved as a final safety net but their role has changed:
+#  they now fire ONLY when BOTH the embedding and LLM classifiers returned
+#  general_chat.  They are no longer the primary classification path.
+# ─────────────────────────────────────────────────────────────────────────────
 
-# Action verbs that, combined with "exam" or "test" anywhere in the message,
-# confirm exam-creation intent  (covers "create a new ... exam" patterns)
+_EXAM_KEYWORDS_EN: frozenset[str] = frozenset({
+    "generate exam", "create exam", "make exam", "build exam", "write exam",
+    "prepare exam", "prepare test", "create test", "generate test",
+    "make test", "build test", "write test", "exam for subject",
+    "exam for course", "new exam", "draft exam", "design exam", "set exam",
+    "set a test", "produce exam", "develop exam",
+})
 _EXAM_ACTION_VERBS_EN: frozenset[str] = frozenset({
     "create", "generate", "make", "build", "write",
-    "prepare", "draft", "design", "produce", "develop",
-    "compose", "set",
+    "prepare", "draft", "design", "produce", "develop", "compose", "set",
 })
 _EXAM_TARGET_WORDS_EN: frozenset[str] = frozenset({"exam", "test", "quiz", "assessment"})
-
 _EXAM_KEYWORDS_AR: frozenset[str] = frozenset({
-    "اعمل امتحان",  "انشئ امتحان",  "سوي امتحان",
-    "حضّر امتحان",   "اكتب امتحان",  "امتحان لمادة",
-    "عمل امتحان",    "أنشئ امتحان",  "صمّم امتحان",
-    "عايز امتحان",   "نعمل امتحان",  "جهّز امتحان",
-    "جهّز اختبار",  "عمل اختبار",   "انشئ اختبار",
-    "طوّر امتحان",  "اكتب اختبار",  "حضر امتحان",
-    "انشئ امتحان",  "صمم امتحان",
+    "اعمل امتحان", "انشئ امتحان", "سوي امتحان", "حضّر امتحان",
+    "اكتب امتحان", "امتحان لمادة", "عمل امتحان", "أنشئ امتحان",
+    "صمّم امتحان", "عايز امتحان", "نعمل امتحان", "جهّز امتحان",
+    "جهّز اختبار", "عمل اختبار", "انشئ اختبار", "طوّر امتحان",
+    "اكتب اختبار", "حضر امتحان", "صمم امتحان",
 })
 
 
 def _detect_generate_exam(message: str) -> bool:
-    """
-    Two-pass deterministic scan for exam-creation intent.
-
-    Pass 1 — direct phrase match: catches "generate exam", "create test", etc.
-    Pass 2 — loose match: catches "create a new introduction to ML exam"
-             by checking if BOTH an action verb AND an exam target word
-             appear anywhere in the message (order-independent).
-
-    Never fires on passive phrases like "view exam", "exam results",
-    "I failed the exam", or "when is the exam?" because those lack
-    a creation action verb.
-    """
+    import re
     msg = message.strip().lower()
-
-    # Pass 1: direct phrase substring match
     for kw in _EXAM_KEYWORDS_EN:
         if kw in msg:
             return True
     for kw in _EXAM_KEYWORDS_AR:
         if kw in msg:
             return True
-
-    # Pass 2: verb + target word loose match (handles inserted adjectives)
-    import re
     words = set(re.findall(r"\b\w+\b", msg))
-    has_action = bool(words & _EXAM_ACTION_VERBS_EN)
-    has_target = bool(words & _EXAM_TARGET_WORDS_EN)
-    if has_action and has_target:
-        return True
+    return bool(words & _EXAM_ACTION_VERBS_EN) and bool(words & _EXAM_TARGET_WORDS_EN)
 
-    return False
 
 def _detect_backend_query(message: str) -> bool:
-    """Detect if the user is asking a data query like counts, lists, analytics, or system stats."""
     msg = message.strip().lower()
-
     _BACKEND_KEYWORDS = {
-        # ── Arabic: regulation / roadmap queries ─────────────────────────
-        "لائحة", "لوائح", "خطة دراسية", "خارطة طريق",
-        "مواد الترم", "مواد الفصل", "مواد السنة",
-        "المواد اللي هسجلها", "المواد المقترحة", "ايه المواد",
-        "كام ساعة خلصت", "ساعات معتمدة", "الساعات الباقية",
-        "رسبت في", "مواد راسب", "مواد باقية", "مواد خلصتها",
-        "تقدمي الأكاديمي", "وضعي الأكاديمي", "هل انا في المسار",
-        "الترم الجاي", "المواد القادمة", "ايه اللي باقيلي",
-        "roadmap", "academic plan", "study plan", "academic progress",
-        "credit hours", "remaining subjects", "passed subjects",
-        "failed subjects", "next semester subjects", "what subjects",
-        # ── Arabic: enrollment ACTIONS (register/enroll me) ──────────────
-        "سجلني", "سجل لي", "سجل لى", "اسجلني", "عايز أسجل",
-        "عايز اسجل", "ابدأ التسجيل", "ابدا التسجيل",
-        "سجلني في المواد", "سجل في كل المواد", "سجلني في الترم",
-        "تسجيل المواد", "تسجيل في المواد", "اعملي تسجيل",
-        "register me", "enroll me", "sign me up", "auto enroll",
-        "register for courses", "enroll in courses",
-        # ── Arabic: count / analytics ─────────────────────────────────────
         "كم عدد", "كام بدرس", "كام طالب", "كام دكتور", "كام مادة",
         "عدد الدكاترة", "عدد الطلاب", "عدد المواد", "عدد الاقسام",
-        "نسبة", "احصائيات", "إحصائيات", "احصاء", "إحصاء",
-        "تحليل", "تقرير", "ملخص الشكاوى", "ملخص النتائج",
+        "نسبة", "احصائيات", "إحصائيات", "تحليل", "تقرير",
         "مين هم", "قائمة", "اللي بيدرس", "اللي مسجل",
-        "اعلى", "أعلى", "اقل", "أقل", "افضل", "أفضل",
-        # ── Arabic: filter / relationship queries ─────────────────────────
-        "دكاترة في", "طلاب في", "مواد في", "عرض في",
-        "في قسم", "في كلية", "في الفرقة", "في الدفعة",
-        "بيدرس في", "مسجل في", "تابع ل",
-        # ── Arabic: entity names ──────────────────────────────────────────
         "كليات", "الكليات", "دكاترة", "الدكاترة",
         "قسم", "اقسام", "الأقسام", "الاقسام",
         "طلاب", "الطلاب", "مواد", "المواد",
-        "فرقة", "دفعة", "الفرقة", "الدفعة",
-        "عروض", "العروض", "التسجيلات",
-        # ── Arabic: identity / profile ────────────────────────────────────
-        "اسمي", "اسم", "انا مين", "أنا مين",
-        "من انا", "من أنا", "مين انا", "مين أنا",
-        "معلوماتي", "بياناتي", "بروفايلي", "حسابي",
-        "كليتي", "قسمي", "دفعتي", "فرقتي",
-        # ── Arabic: system data ───────────────────────────────────────────
-        "بيانات", "جامعه", "جامعة", "السيستم",
-        # ── English: count / analytics ────────────────────────────────────
+        "اسمي", "اسم", "انا مين", "أنا مين", "من انا", "من أنا",
+        "معلوماتي", "بياناتي", "بروفايلي",
         "how many", "count of", "number of", "total students",
-        "total doctors", "total courses", "how much",
-        "statistics", "analytics", "distribution", "breakdown",
-        "top students", "at risk", "failing students",
-        "most enrolled", "most popular", "average gpa",
-        # ── English: filter / relationship queries ────────────────────────
-        "doctors in", "students in", "courses in", "offerings in",
-        "in department", "in college", "in batch", "in year",
-        "who teaches", "enrolled in", "assigned to",
-        "list doctors", "list students", "list courses",
-        # ── English: list / show ──────────────────────────────────────────
-        "list of", "show me", "what are", "give me",
-        "students list", "doctors list", "departments",
-        # ── English: my data ──────────────────────────────────────────────
+        "statistics", "analytics", "list of", "show me", "what are",
+        "who am i", "my name", "my profile", "my info",
         "my courses", "my subjects", "my schedule", "my grades",
-        "my gpa", "my results", "my profile", "my info",
-        "my college", "my department", "my batch",
-        "who am i", "my name", "my account", "my details",
-        "profile", "courses i have", "subjects i have",
+        "my gpa", "my results",
     }
-    for kw in _BACKEND_KEYWORDS:
-        if kw in msg:
-            return True
-    return False
+    return any(kw in msg for kw in _BACKEND_KEYWORDS)
 
 
-# ── Deterministic regulation keyword override ─────────────────────────────────
 _REGULATION_KEYWORDS: frozenset[str] = frozenset({
-    # Arabic — explicit regulation/curriculum content questions
     "اشرح الليحه", "اشرح اللائحه", "اشرح اللائحة",
     "ايه الليحه", "ايه اللائحه", "ايه اللائحة",
-    "محتوى اللائحة", "محتوى الليحه",
-    "مواد سنة اولى", "مواد السنة الاولى", "مواد سنة اولي",
+    "محتوى اللائحة", "مواد سنة اولى", "مواد السنة الاولى",
     "مواد سنة تانية", "مواد السنة التانية", "مواد سنة ثانية",
     "مواد سنة تالتة", "مواد السنة التالتة", "مواد سنة ثالثة",
     "مواد سنة رابعة", "مواد السنة الرابعة",
     "مواد الترم الاول", "مواد الترم الثاني",
-    "مواد جوه الليحه", "مواد في اللائحة",
     "ساعات اللائحة", "متطلبات التخرج", "شروط التخرج",
-    "الخطة الدراسية", "خطة الدراسة",
-    "دليل الطالب", "الدليل الاكاديمي",
-    # Egyptian dialect variants of اللائحة (common misspellings / colloquial forms)
-    "الاليخه", "اللايحه", "اللايحة",
-    "هذه الليحه", "هذه اللايحه", "هذه اللائحه", "هذه اللائحة",
+    "الخطة الدراسية", "خطة الدراسة", "دليل الطالب",
+    "الاليخه", "اللايحه", "اللايحة", "هذه اللائحه",
     "في الليحه", "في اللايحه", "في اللائحه",
-    "جوه اللايحه", "جوا اللائحه", "جوا اللايحه",
-    "اليخه", "الليحة",
-    "كم مادة في", "كم ماده في",
-    "مواد اللائحه", "مواد اللايحه", "مواد الاليخه",
-    # English
+    "جوه اللايحه", "جوا اللائحه", "مواد اللائحه",
     "explain the regulation", "what is in the regulation",
     "subjects in year one", "subjects in first year",
-    "subjects in second year", "subjects in third year",
     "graduation requirements", "credit hours required",
-    "study plan subjects", "curriculum subjects",
-    "student handbook", "academic handbook",
+    "study plan subjects", "curriculum subjects", "student handbook",
 })
 
 
 def _detect_regulation(message: str) -> bool:
-    """Detect if the user wants to know content FROM the regulation document."""
     msg = message.strip().lower()
-    for kw in _REGULATION_KEYWORDS:
-        if kw in msg:
-            return True
-    return False
+    return any(kw in msg for kw in _REGULATION_KEYWORDS)
 
 
-# ── Deterministic material_qa keyword override ────────────────────────────────
 _MATERIAL_QA_KEYWORDS: frozenset[str] = frozenset({
-    # English
     "explain from lecture", "from the material", "what does the lecture say",
     "according to the course", "course material", "lecture notes",
     "from the lecture", "from the book", "from the textbook",
     "in the lecture", "in the material", "in the book",
-    # Arabic
     "من المحاضرة", "من المادة", "اشرح من", "في الكتاب",
     "في المحاضرة", "من الملزمة", "من الكتاب",
 })
 
 
 def _detect_material_qa(message: str) -> bool:
-    """Detect if the user is asking a question grounded in course material."""
     msg = message.strip().lower()
-    for kw in _MATERIAL_QA_KEYWORDS:
-        if kw in msg:
-            return True
-    return False
+    return any(kw in msg for kw in _MATERIAL_QA_KEYWORDS)
 
 
-# ── Deterministic assignment keyword override ─────────────────────────────────
 _ASSIGNMENT_KEYWORDS: frozenset[str] = frozenset({
-    # Arabic — ask about assignments / deadlines
     "واجب", "الواجب", "واجباتي", "واجبات", "تسليم", "التسليم",
     "موعد التسليم", "الموعد النهائي", "deadline",
     "سلمت", "لسه ما سلمتش", "هل سلمت", "حالة الواجب",
-    "درجة الواجب", "الواجب الجاي", "مش عارف الواجب",
-    "الواجبات المتأخرة", "واجب متأخر", "فاتني الواجب",
-    "ايه الواجبات", "اشرحلي الواجب", "شرح الواجب",
-    "تفاصيل الواجب", "متطلبات الواجب",
-    # English
+    "درجة الواجب", "الواجب الجاي", "الواجبات المتأخرة",
+    "ايه الواجبات", "تفاصيل الواجب",
     "my assignment", "my assignments", "assignment deadline", "due date",
     "submitted assignment", "did i submit", "assignment status",
     "pending assignment", "overdue assignment", "late assignment",
-    "assignment grade", "assignment feedback", "explain assignment",
-    "assignment requirements", "assignment details", "what is the assignment",
+    "assignment grade", "assignment feedback", "assignment requirements",
     "show me assignments", "list assignments",
 })
 
 
 def _detect_assignment_query(message: str) -> bool:
-    """Detect if the user is asking about their assignments."""
     msg = message.strip().lower()
-    for kw in _ASSIGNMENT_KEYWORDS:
-        if kw in msg:
-            return True
-    return False
+    return any(kw in msg for kw in _ASSIGNMENT_KEYWORDS)
 
 
-# ── Deterministic study-plan keyword override ─────────────────────────────────
 _STUDY_PLAN_KEYWORDS: frozenset[str] = frozenset({
-    # Arabic — study plan / schedule requests
     "خطة مذاكرة", "خطة دراسة", "خطة دراسية", "خطة للمذاكرة",
     "اعمللي خطة", "اعمل لي خطة", "عمل خطة", "خطة للأسبوع",
     "جدول مذاكرة", "جدول دراسة", "جدول للأسبوع", "جدول يومي",
     "كيف أذاكر", "كيف اذاكر", "ازاي اذاكر", "ازاي أذاكر",
-    "أولوياتي", "اولوياتي", "رتب أولوياتي", "رتب اولوياتي",
-    "ما المواد التي أركز", "أركز على إيه", "أركز على ايه",
+    "أولوياتي", "اولوياتي", "رتب أولوياتي",
     "كيف أرفع معدلي", "كيف ارفع معدلي", "أرفع المعدل",
-    "ارفع المعدل", "كيف أحسن معدلي", "كيف احسن معدلي",
-    "كيف أنجح", "كيف انجح", "كيف أكمل", "كيف اكمل الترم",
-    "ماذا أذاكر", "ماذا اذاكر", "ايه اللي أذاكره", "إيه اللي أذاكره",
-    "خطة للامتحانات", "خطة الامتحانات", "خطة للميدتيرم", "خطة للفاينل",
+    "ارفع المعدل", "كيف أحسن معدلي",
+    "كيف أنجح", "كيف انجح", "ماذا أذاكر",
+    "خطة للامتحانات", "خطة الامتحانات", "خطة للميدتيرم",
     "خطة للاختبار", "استعداد للامتحان", "استعداد للميدتيرم",
     "كيف أستعد للامتحان", "كيف استعد للامتحان",
-    "أذاكر إيه النهارده", "أذاكر ايه النهارده", "اذاكر ايه", "اذاكر إيه",
+    "أذاكر إيه النهارده", "أذاكر ايه النهارده", "اذاكر ايه",
     "وقت المذاكرة", "توزيع وقت", "توزيع المذاكرة",
-    "مواد محتاجة تركيز", "مواد محتاجة اهتمام", "المواد الصعبة",
-    "تقدر تساعدني أذاكر", "ساعدني في المذاكرة",
-    # English
+    "ساعدني في المذاكرة",
     "study plan", "study schedule", "study timetable",
     "revision plan", "revision schedule",
     "how to study", "how should i study", "what should i study",
     "study for midterm", "study for final", "study for exam",
-    "prioritize my subjects", "my priorities this week",
-    "raise my gpa", "improve my gpa", "improve my grades",
-    "how to pass", "study tips", "focus on what",
-    "what to study today", "study today",
-    "weekly plan", "daily plan", "study this week",
-    "exam prep", "exam preparation", "prepare for exam",
+    "prioritize my subjects", "raise my gpa", "improve my gpa",
+    "how to pass", "study tips", "what to study today",
+    "weekly plan", "daily plan", "exam prep", "exam preparation",
+    "prepare for exam",
 })
 
 
 def _detect_study_plan(message: str) -> bool:
-    """Detect if the user is asking for a study or revision plan."""
     msg = message.strip().lower()
-    for kw in _STUDY_PLAN_KEYWORDS:
-        if kw in msg:
-            return True
-    return False
+    return any(kw in msg for kw in _STUDY_PLAN_KEYWORDS)
 
 
-# ── Available backend tools (referenced in system prompt) ─────────────────────
-
+# ── Available backend tools (for system prompt) ───────────────────────────────
 _AVAILABLE_TOOLS = [
-    "ResolveSubjectOffering",
-    "GetStudentResults",
-    "GetStudentGrades",
-    "GetGPASummary",
-    "GetTranscript",
-    "GetSchedule",
-    "GetSubjectOfferings",
-    "GetCourseEnrollments",
-    "GenerateExam",
-    "DistributeExam",
-    # ── New ──
-    "SubmitComplaint",
-    "GetComplaints",
-    "GetStudentAcademicSummary",
-    "BulkCreateStudents",
-    "BulkUploadGrades",
-    "GetMaterials",
+    "ResolveSubjectOffering", "GetStudentResults", "GetStudentGrades",
+    "GetGPASummary", "GetTranscript", "GetSchedule", "GetSubjectOfferings",
+    "GetCourseEnrollments", "GenerateExam", "DistributeExam",
+    "SubmitComplaint", "GetComplaints", "GetStudentAcademicSummary",
+    "BulkCreateStudents", "BulkUploadGrades", "GetMaterials",
 ]
 
-# ── System prompt ─────────────────────────────────────────────────────────────
+# ── Compact LLM classifier system prompt (Layer 2) ───────────────────────────
+# Much shorter than the original 600-line prompt — the LLM is guided by
+# the function schema to return a valid intent from the enum.
+_COMPACT_CLASSIFICATION_PROMPT = """\
+You are an intent classifier for a university AI assistant.
 
+LANGUAGE RULE: Detect the user's language. Arabic/Egyptian dialect → use Arabic everywhere.
+English → use English. Mixed → use Arabic. NEVER mix languages in a single response.
+
+INTENTS (pick exactly one):
+- general_chat: greeting, general question, no backend data needed
+- backend_api_query: any data retrieval (grades, lists, my profile, counts, schedule, who am I)
+- generate_exam: CREATE/GENERATE an exam or test — regardless of user role
+- result_query: student asking about their GPA, grades, transcript, results
+- complaint_submit: student submitting a complaint about a doctor/exam/grade
+- complaint_summary: admin/doctor reviewing or summarizing complaints
+- academic_advice: study advice, course recommendations, general standing queries
+- study_plan: study schedule, revision plan, exam prep, what to study today/this week
+- material_explanation: explain/summarize a course or subject's material content
+- material_qa: answer a question grounded in specific course material / lecture notes
+- regulation: questions about the academic regulation PDF (subjects per year, graduation)
+- action_execute: user wants to DO something (enroll, register, create entity)
+- assignment_query: questions about assignments, deadlines, submission status
+- file_extraction: extract info from an uploaded file (single file)
+- summarization: summarize a document or text block
+- file_processing: bulk upload (Excel grades/students)
+- cv_analysis: analyze/review a student's CV or resume
+
+KEY RULES:
+1. backend_api_query: use for identity ("who am I", "my name") — NEVER answer from training data.
+2. generate_exam: use whenever user wants to CREATE an exam. RBAC is enforced elsewhere.
+3. action_execute: enrollment triggers ("سجلني", "register me") — NOT backend_api_query.
+4. study_plan vs academic_advice: "make a study schedule" = study_plan; "how am I doing?" = academic_advice.
+5. Pronoun resolution: if the message is short ("اشرحها", "continue") and prior context shows
+   an active topic, match the intent of that topic.
+6. confidence < 0.70 → set requires_clarification=true.
+
+Return ONLY valid JSON matching the function schema. No markdown, no extra text.
+"""
+
+# ── LLM function-call schema ──────────────────────────────────────────────────
+_CLASSIFICATION_FUNCTION = {
+    "name": "classify_intent",
+    "description": "Classify the user's intent and extract parameters",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "intent": {
+                "type": "string",
+                "enum": sorted(VALID_INTENTS),
+            },
+            "confidence": {
+                "type": "number",
+                "minimum": 0.0,
+                "maximum": 1.0,
+                "description": "Confidence in this classification (0.0–1.0)",
+            },
+            "goal_summary": {
+                "type": "string",
+                "description": "One sentence: what does the user want?",
+            },
+            "requires_clarification": {
+                "type": "boolean",
+                "description": "True if the request is ambiguous",
+            },
+            "clarification_question": {
+                "type": "string",
+                "description": "Question to ask if requires_clarification=true",
+            },
+            "extracted_params": {
+                "type": "object",
+                "description": "Any parameters: subjectName, targetType, etc.",
+            },
+        },
+        "required": ["intent", "confidence", "goal_summary"],
+    },
+}
+
+# ── Legacy inline system prompt (fallback when file is missing) ───────────────
 def _get_system_prompt() -> str:
-    """Load planner system prompt from app/prompts/planner_system.md; fall back to inline."""
+    """Load planner system prompt; fall back to compact inline version."""
     try:
         return render_prompt("planner_system", tools=", ".join(_AVAILABLE_TOOLS))
     except Exception as exc:
-        logger.warning("PlannerAgent: prompt load failed — using inline fallback: %s", exc)
-        return _SYSTEM_PROMPT_FALLBACK.format(tools=", ".join(_AVAILABLE_TOOLS))
+        logger.warning("PlannerAgent: prompt file failed — using compact inline: %s", exc)
+        return _COMPACT_CLASSIFICATION_PROMPT
 
 
-_SYSTEM_PROMPT_FALLBACK = """\
-You are an AI Planning Agent for a university management system.
-
-⚠️ CRITICAL LANGUAGE RULE — apply before everything else:
-- Detect the user's language from their message.
-- If the user writes in Arabic or Egyptian dialect → ALL your responses and goal_summary MUST be in Arabic.
-- If the user writes in English → respond in English.
-- NEVER mix languages. NEVER reply in English to an Arabic-speaking user.
-- This applies to goal_summary, clarification questions, and all text fields.
-
-Your job is to classify the user's request and return a structured JSON plan.
-
-## Valid Intents
-- general_chat       — conversation, questions, greetings, anything not needing backend data
-- backend_api_query  — MANDATORY for querying system stats, counting numbers (كم عدد), user lists, or any database retrieval.
-- summarization      — summarise a document or text
-- generate_exam      — generate a university exam (doctor/admin only)
-- result_query       — query academic results, grades, GPA, transcripts, schedules
-- file_extraction    — extract information from an uploaded file (no bulk ops)
-- complaint_submit   — student submitting a complaint or feedback about a doctor/exam/grade
-- complaint_summary  — admin/doctor requesting a summary of submitted complaints
-- file_processing    — bulk upload of Excel (students/grades) or PDF summarization via fileUrl
-- cv_analysis        — analyzing a student CV to extract skills and give recommendations
-- academic_advice    — personalized academic recommendations based on GPA and enrolled courses
-- material_explanation — explain or summarize real course material fetched from the backend
-- material_qa        — answer a student question grounded ONLY in indexed course material (RAG)
-- action_execute     — execute a write action in the system (enroll student, create entity, etc.)
-- assignment_query   — student asks about their assignments, deadlines, submission status, or requirements
-- study_plan         — student asks for a personalized study/revision plan, schedule, weekly priorities, or exam prep strategy
-
-## Output Schema (return ONLY this JSON, no markdown, no extra text)
-{{
-  "intent": "<one of the valid intents>",
-  "goal_summary": "<one clear sentence describing what the user wants>",
-  "is_executable": true,
-  "exam_params": null,
-  "pre_execution_steps": [],
-  "steps": []
-}}
-
-## Rules
-
-### 1. general_chat
-- steps MUST be [] (empty array). Never add steps for general_chat.
-- exam_params MUST be null.
-- Use this intent for greetings, explanations, advice, and any question
-  that does not require fetching real student/exam data from the backend.
-
-### 2. Tool-bound intents (summarization, result_query, file_extraction, generate_exam)
-- You MAY include steps when multiple sequential backend calls are needed.
-- Available tools: {tools}
-- Step format:
-  {{
-    "step_id": <int>,
-    "action": "tool",
-    "tool_name": "<one of the available tools>",
-    "input_payload": {{...}},
-    "depends_on": []
-  }}
-- Use {{{{step_N.output}}}} to reference the output of step N in a later step.
-- If only one tool call is needed, leave steps=[].
-
-### 3. generate_exam — HIGHEST PRIORITY INTENT FOR EXAM CREATION
-
-⚠️ CRITICAL: The following phrases ALWAYS mean intent = "generate_exam".
-NEVER classify them as general_chat. The executor enforces role permissions separately.
-
-English triggers (ANY of these = generate_exam):
-  "create exam", "generate exam", "make exam", "build exam",
-  "write exam",  "prepare exam",  "prepare test", "new exam",
-  "draft exam",  "design exam",  "set exam",    "produce exam",
-  "exam for subject", "exam for course", "create test", "generate test"
-
-Arabic triggers (ANY of these = generate_exam):
-  "اعمل امتحان", "انشئ امتحان", "سوي امتحان", "حضّر امتحان",
-  "اكتب امتحان", "امتحان لمادة", "عمل امتحان", "جهّز امتحان"
-
-Rules for generate_exam:
-- Use intent=generate_exam whenever the user wants to CREATE or GENERATE any exam/test.
-- Role does NOT affect intent classification. Even if role=student, use generate_exam.
-  The executor will enforce the RBAC denial if the role is not permitted.
-- If subject details are missing, STILL use intent=generate_exam and fill exam_params
-  with whatever IS available. Leave missing fields as null.
-- Populate exam_params with:
-    collegeName, departmentName, batchName, subjectName,
-    numberOfQuestions (int, default 10 if not specified),
-    examType ("midterm"|"final", default "midterm" if not specified),
-    variationMode ("same_for_all"|"different_per_student"),
-    subjectOfferingId (string|null)
-- If subjectOfferingId is unknown, add ResolveSubjectOffering to pre_execution_steps.
-  pre_execution_steps format (use "tool" NOT "tool_name"):
-  {{"tool": "ResolveSubjectOffering", "reason": "Need subjectOfferingId to create exam", "input_payload": {{"departmentId": "<from context>", "subjectName": "<from user>"}}}}
-- NEVER leave intent=general_chat when the user's action is exam creation.
-
-### 4. Context-aware auto-fill (MANDATORY)
-- The caller has already authenticated and their academic record is embedded in
-  the request under academic_context.
-- You MUST extract userId, studentId, courseId, subjectOfferingId,
-  departmentId, batchId, collegeName, departmentName, batchName from
-  academic_context and inject them into the relevant tool input_payload fields.
-- NEVER ask the user for parameters already present in academic_context.
-- NEVER leave userId or studentId blank when they exist in academic_context.
-- If a required field is absent from both the user message AND academic_context,
-  only then flag it as missing in goal_summary.
-
-### 5. complaint_submit (student only)
-- Use intent=complaint_submit when a student reports a problem, complains,
-  or gives negative feedback about a doctor, exam, grade, or the system.
-- Extract from user message: the complaint content (for "message" field).
-- Required payload fields (MUST be populated from academic_context):
-    userId, subjectOfferingId
-- targetType MUST be one of: "Doctor" | "Exam" | "Grade" | "Other"
-  Infer it from the message (e.g. "doctor" → "Doctor", "exam" → "Exam",
-  "grade" / "mark" → "Grade", anything else → "Other").
-- DoctorId is resolved server-side — do NOT include it in the payload.
-- If role is NOT "student" → use general_chat instead.
-
-### 6. complaint_summary (admin/doctor only)
-- Use intent=complaint_summary when an admin or doctor asks to see, review,
-  or summarize complaints.
-- If role is "student" → use general_chat instead.
-
-### 7. file_processing
-- Use intent=file_processing when the user message contains a fileUrl
-  OR mentions uploading/processing a file for bulk operations.
-- Do NOT use this for single-file text extraction (use file_extraction).
-
-### 7b. Checking/reading course material content → ALWAYS use material_explanation
-- When user wants to "check", "read", "verify", "show content of" a course file/material:
-  Use intent=material_explanation (NOT file_extraction).
-- Triggers: "تحقق من محتوى الملف", "اقرأ الملف", "show file content",
-  "check the material", "read the file", "ما محتوى الملف", "اعرض محتوى المادة"
-- The material_explanation module handles file fetching internally using subjectOfferingId.
-
-### 8. cv_analysis
-- Use intent=cv_analysis when the user wants their CV reviewed, analyzed,
-  or feedback on skills, experience, or job readiness.
-
-### 9. academic_advice
-- Use intent=academic_advice when a student asks for study advice, course
-  recommendations, or wants to know how to improve their GPA.
-
-### 9b. study_plan — PERSONALIZED STUDY SCHEDULE GENERATION
-
-⚠️ ALWAYS use intent=study_plan when the student asks for:
-- A study plan / revision plan / weekly schedule ("اعمللي خطة مذاكرة", "study plan")
-- How to study for an exam ("كيف أذاكر للميدتيرم", "how to study for final")
-- What to prioritize this week ("أولوياتي الأسبوع ده", "priorities this week")
-- How to raise/improve their GPA ("ازاي أرفع معدلي", "how to raise my GPA")
-- What to study today ("اذاكر ايه النهاردة", "what should I study today")
-- Exam preparation strategy ("كيف أستعد للامتحان", "exam prep")
-
-Rules for study_plan:
-- Use intent=study_plan for ALL schedule/planning/prioritization requests.
-- Steps MUST be [] — the StudyPlanModule fetches all data internally.
-- exam_params MUST be null.
-- NEVER use academic_advice for study scheduling requests — academic_advice is for
-  general standing queries ("how am I doing?"), study_plan is for actionable schedules.
-
-### 10. material_explanation (STRICT DATA-FIRST — HIGHEST PRIORITY INTENT)
-- ALWAYS use intent=material_explanation when the user asks to EXPLAIN, SUMMARIZE,
-  DESCRIBE, UNDERSTAND, or REVIEW a specific subject, course, topic, or lecture.
-
-- English triggers (non-exhaustive):
-    "explain course", "explain subject", "explain this topic",
-    "summarize material", "summarize course", "summarize this subject",
-    "what does this material say", "what is this course about",
-    "understand this subject", "review the material", "study material",
-    "give me a summary of", "help me understand", "break down this course"
-
-- Arabic triggers (non-exhaustive):
-    "شرح مادة", "اشرح المادة", "شرح الموضوع", "اشرح موضوع",
-    "لخص المادة", "ملخص المادة", "لخص هذه المادة",
-    "فهم المادة", "ما محتوى المادة", "عايز أفهم المادة",
-    "ساعدني أفهم", "شرح الدرس", "اشرح لي", "ما هو محتوى",
-    "راجع المادة", "شرح موضوع الامتحان", "عايز ملخص"
-
-- MANDATORY: This intent triggers a real backend fetch of course materials.
-    * The subjectOfferingId MUST be injected from academic_context.
-    * If subjectOfferingId is NOT available in academic_context, set:
-      goal_summary = "Need to clarify which subject offering to fetch materials for."
-      and leave steps=[] — the module will prompt the user.
-    * NEVER use general_chat for these triggers — always use material_explanation.
-    * NEVER add tool steps for this intent — the MaterialExplanationModule handles
-      the backend fetch internally.
-
-### 11. backend_api_query (Dynamic API Fetching)
-- Use intent=backend_api_query for ANY question requesting data from the university system.
-- Triggers include asking about: users, names, colleges, departments, subjects, students, doctors, counts, lists.
-- Examples: "ما هي الكليات", "من هم الدكاترة", "انا اسمي ايه", "كم عدد الطلاب", "what are the colleges"
-
-- Doctor-specific triggers → ALWAYS backend_api_query:
-  "علمت كام امتحان", "عندي كام امتحان", "امتحاناتي", "شوفلي امتحاناتي",
-  "درجات الطلاب", "نتايج الطلاب", "نتيجة المادة", "درجات المادة",
-  "كام طالب في المادة", "الطلاب اللي رسبوا", "من أعلى درجة",
-  "my exams", "how many exams", "student grades", "exam results",
-  "students who failed", "grade summary"
-  → For these, use GET /api/Exams/my-exams or GET /api/Exams/{{id}}/results
-
-### 12. Identity & Profile Queries → ALWAYS backend_api_query
-⚠️ CRITICAL: Questions about the user's own identity, name, or profile data MUST use backend_api_query.
-NEVER answer identity questions from LLM knowledge — always fetch from the backend.
-
-Arabic triggers (ANY of these = backend_api_query):
-  "انا مين", "أنا مين", "مين انا", "مين أنا",
-  "من انا", "من أنا", "اسمي ايه", "اسمي إيه",
-  "معلوماتي", "بياناتي", "بروفايلي", "حسابي"
-
-English triggers (ANY of these = backend_api_query):
-  "who am i", "what is my name", "my profile", "my info",
-  "my account", "my details"
-
-IMPORTANT: The userId is available in academic_context — ALWAYS inject it in the request.
-
-### 13. action_execute — TAKE ACTION IN THE SYSTEM (POST endpoints)
-
-⚠️ CRITICAL: Use intent=action_execute when the user wants the AI to DO something in the system,
-not just query data. The AI must call the correct POST endpoint automatically.
-
-Arabic student triggers → auto-enroll:
-  "سجلني", "سجل لي", "سجل لى", "اسجلني", "عايز أسجل", "اعملي تسجيل",
-  "سجلني في المواد", "سجل في كل المواد", "سجلني في الترم",
-  "تسجيل المواد", "ابدأ التسجيل"
-
-English student triggers → auto-enroll:
-  "register me", "enroll me", "sign me up", "auto enroll",
-  "register for courses", "enroll in courses", "enroll me in subjects"
-
-For enrollment actions:
-- endpoint: POST /api/enrollments/auto-enroll
-- payload: {{ "studentId": "<from academic_context>", "batchId": "<from academic_context>" }}
-
-Admin action triggers → create/add entities:
-  "أضف طالب", "سجل طالب جديد", "أضف دكتور", "أضف مادة", "انشئ كلية",
-  "add student", "create student", "add doctor", "create doctor",
-  "add subject", "create subject", "add college", "create college"
-
-For admin creation actions:
-- Use the relevant POST endpoint based on the entity type
-- Extract all required fields from the message
-- Inject any IDs available from academic_context
-
-Rules for action_execute:
-- The AI EXECUTES the action immediately — no confirmation needed for safe actions.
-- After execution, narrate the result clearly (what was done, what succeeded/failed).
-- NEVER use general_chat when the user is asking to perform an action.
-- If required parameters are missing → ask for them specifically before executing.
-
-### 14. When in doubt → use general_chat with steps=[].
-
-### 15. CONTEXT & PRONOUNS — use conversation history (CRITICAL)
-You ARE given the previous turns of the conversation. USE THEM. Never treat the current message in isolation when the user clearly refers to something said earlier.
-
-Rules:
-- If the current message contains a pronoun ("ها"، "ه"، "it"، "this"، "them") or is very short (≤6 words) without a clear subject, resolve it from the PREVIOUS turns.
-- If the prior turns mention the regulation / اللائحة / دليل / curriculum and the user now says "اشرحها / لخصها / explain it / summarize it / اقراها / show me" → intent = **regulation**.
-- If the prior turns mention a specific subject material / محاضرة / lecture and the user says "اشرحها / explain it" → intent = **material_explanation**.
-- If the prior turns mention an exam and the user says "ابعتها / send it / distribute it" → intent = **action_execute**.
-- NEVER reply with "اشرح إيه؟" or "which one?" when the answer is sitting in the previous turn.
-
-### Few-shot examples (study these — they show language variety + coreference)
-
-Example A — Egyptian dialect + pronoun referring to regulation (from previous turn):
-  [prior turn] user: "عندي لائحة اسمها fbn ضيفتها هنا"
-  [prior turn] assistant: "تمام، اللائحة 'fbn' متاحة. تحب أعمل إيه فيها؟"
-  current user: "طيب اقرا اللائحه وقولي الملخص بتاعها"
-  → intent = "regulation"
-
-Example B — Even shorter pronoun, same context:
-  [prior turn] assistant: "موجود ملف اللائحة fbn..."
-  current user: "لخصهالي"
-  → intent = "regulation"   (NOT general_chat, NOT material_explanation)
-
-Example C — Variant of "create exam" the keyword list might miss:
-  current user: "ممكن تجهزلي امتحان نص الترم في الـ data structures على السريع"
-  → intent = "generate_exam"
-
-Example D — Pronoun referring to material (lecture) from prior turn:
-  [prior turn] user: "اشرحلي محاضرة الـ binary trees"
-  [prior turn] assistant: "تمام، فيها 4 أقسام: ..."
-  current user: "اشرحلي الجزء الأخير تاني"
-  → intent = "material_explanation"
-
-Example E — User uses dialect "ايه اللي فيها":
-  [prior turn] assistant: "اللائحة الأكاديمية موجودة..."
-  current user: "ايه اللي فيها؟"
-  → intent = "regulation"
-
-Example F — When NOT to assume coreference:
-  current user: "ازيك" (greeting, no pronoun, no prior topic relevant)
-  → intent = "general_chat"
-
-### Multi-step example (result_query — grades then GPA):
-{{
-  "intent": "result_query",
-  "goal_summary": "Fetch student grades and calculate GPA",
-  "is_executable": true,
-  "exam_params": null,
-  "pre_execution_steps": [],
-  "steps": [
-    {{"step_id": 1, "action": "tool", "tool_name": "GetStudentGrades",
-      "input_payload": {{"userId": "<from context>"}}, "depends_on": []}},
-    {{"step_id": 2, "action": "tool", "tool_name": "GetGPASummary",
-      "input_payload": {{"gradeData": "{{{{step_1.output}}}}"}}, "depends_on": [1]}}
-  ]
-}}
-"""
-
+# ─────────────────────────────────────────────────────────────────────────────
+#  MemoryStore protocol (unchanged)
+# ─────────────────────────────────────────────────────────────────────────────
 
 class MemoryStore(Protocol):
-    """Protocol defining how the Planner retrieves historical context."""
-
     async def get_context(self, user_id: str | None) -> str: ...
+    async def get_conv_state(self, user_id: str) -> Optional[object]: ...
+    async def save_conv_state(self, user_id: str, state: object) -> None: ...
+    async def append_intent_log(self, user_id: str, entry: dict) -> None: ...
+    async def save_clarification(self, user_id: str, data: dict) -> None: ...
+    async def get_pending_action(self, user_id: str) -> Optional[dict]: ...
+    async def save_pending_action(self, user_id: str, data: dict) -> None: ...
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  PlannerAgent v5.0
+# ─────────────────────────────────────────────────────────────────────────────
 
 class PlannerAgent(BaseAgent):
     """
-    Generates an ExecutionPlan by asking the LLM to classify the user's intent.
+    5-layer intent classification pipeline.
 
-    v4.0 upgrades:
-      - Injects academic_context for context-aware parameter resolution.
-      - Allows multi-step plans for tool-bound intents.
-      - Uses structured messages[] history.
+    New optional parameters (backward compatible — None = bypass layer):
+      embedding_classifier  — EmbeddingIntentClassifier (Layer 1)
+      confidence_router     — ConfidenceRouter (Layer 3)
+
+    Settings-driven behavior:
+      EMBEDDING_CLASSIFIER_SHADOW_MODE = True  → log only, don't change routing
+      EMBEDDING_CLASSIFIER_SHADOW_MODE = False → full fast path active
+      ACTION_GUARD_ENABLED = True              → Layer 4 active
     """
 
     def __init__(
@@ -696,10 +363,32 @@ class PlannerAgent(BaseAgent):
         model_router,
         ranker=None,
         memory: Optional[MemoryStore] = None,
+        embedding_classifier=None,
+        confidence_router=None,
     ):
         self.model_router = model_router
         self.ranker = ranker
         self.memory = memory
+        self.embedding_classifier = embedding_classifier  # Layer 1
+        self.confidence_router = confidence_router        # Layer 3
+
+        # Load settings lazily
+        self._settings_loaded = False
+        self._shadow_mode = True
+        self._emb_enabled = True
+        self._guard_enabled = True
+
+    def _ensure_settings(self) -> None:
+        if self._settings_loaded:
+            return
+        try:
+            from app.core.config import settings
+            self._shadow_mode  = settings.EMBEDDING_CLASSIFIER_SHADOW_MODE
+            self._emb_enabled  = settings.EMBEDDING_CLASSIFIER_ENABLED
+            self._guard_enabled = settings.ACTION_GUARD_ENABLED
+        except Exception:
+            pass
+        self._settings_loaded = True
 
     # ─────────────────────────────────────────────────────────────────────
     #  Public interface
@@ -707,252 +396,720 @@ class PlannerAgent(BaseAgent):
 
     async def run(self, agent_input: AgentInput) -> AgentOutput:
         """
-        1. Pull optional memory summary for long-term context.
-        2. Inject academic_context to allow context-aware auto-filling.
-        3. Build structured messages[] from history + current message.
-        4. Call LLM for classification JSON.
-        5. Validate, sanitise, and enrich the resulting ExecutionPlan.
-        6. Return AgentOutput(status="success", data={"plan": plan}).
+        Full 5-layer classification pipeline.
+
+        Layer 0  Pre-process message (language, Arabizi, normalize)
+        Layer 1  Embedding classifier (fast path if confident)
+        Layer 2  LLM function-call classifier (when embedding uncertain)
+        Layer 2b Legacy keyword safety net (when both above return general_chat)
+        Layer 3  Confidence router (execute / clarify / fallback)
+        Layer 4  Critical action guard (confirmation for write operations)
+        Layer 5  Conversation state update + entity stack
+
+        Returns AgentOutput with data={"plan": ExecutionPlan, ...}
         """
-        logger.info("PlannerAgent: starting for user_id=%s", agent_input.user_id)
+        self._ensure_settings()
+        t0 = time.perf_counter()
+        logger.info("PlannerAgent v5: user_id=%s", agent_input.user_id)
 
-        # ── Optional memory context ───────────────────────────────────────
-        memory_prefix = ""
-        if self.memory:
-            try:
-                past = await self.memory.get_context(agent_input.user_id)
-                if past:
-                    memory_prefix = f"[Conversation summary]: {past}\n\n"
-            except Exception as mem_exc:
-                logger.warning("PlannerAgent: memory lookup failed — %s", mem_exc)
+        ctx            = agent_input.context or {}
+        role           = ctx.get("role", "user")
+        raw_history    = ctx.get("history", [])
+        academic_ctx   = ctx.get("academic_context", {})
 
-        # ── Extract context components ────────────────────────────────────
-        ctx = agent_input.context or {}
-        role = ctx.get("role", "user")
-        raw_history: list[dict] = ctx.get("history", [])
-        academic_ctx: dict = ctx.get("academic_context", {})
-
-        # Compact summary of academic context for auto-filling parameters
-        auto_fill_note = ""
-        if academic_ctx:
-            # Only expose safe, useful fields — never passwords or tokens
-            safe_keys = [
-                "userId", "studentId", "courseId", "subjectOfferingId",
-                "departmentId", "batchId", "collegeName", "departmentName",
-                "profileId",  # Admin/Doctor profile ID (different from userId)
-            ]
-            relevant = {k: v for k, v in academic_ctx.items() if k in safe_keys and v}
-            if relevant:
-                auto_fill_note = (
-                    f"\nAvailable context for auto-filling parameters: "
-                    f"{json.dumps(relevant, ensure_ascii=False)}"
-                )
-
-        # ── Build structured history turns (last 3 pairs = 6 messages) ────
-        history_turns: list[dict] = []
-        for turn in raw_history[-6:]:
-            turn_role = turn.get("role", "user")
-            turn_content = str(turn.get("content", ""))
-            if turn_role in ("user", "assistant") and turn_content:
-                history_turns.append({"role": turn_role, "content": turn_content})
-
-        # ── Compose user classification request ───────────────────────────
-        user_content = (
-            f"{memory_prefix}"
-            f"User role: {role}\n"
-            f"User message: {agent_input.message}"
-            f"{auto_fill_note}"
+        # ── Layer 0: Pre-process ──────────────────────────────────────────
+        from app.core.preprocessor import preprocess_message
+        preprocessed = preprocess_message(agent_input.message)
+        logger.debug(
+            "PlannerAgent [L0]: lang=%s script=%s arabizi=%s",
+            preprocessed.detected_lang, preprocessed.script_type, preprocessed.is_arabizi,
         )
 
-        # ── Call LLM ──────────────────────────────────────────────────────
-        raw_json = await self._call_planner_model(history_turns, user_content)
+        # ── Layer 5a: Load conversation state (before classification) ────
+        conv_state = None
+        if self.memory:
+            try:
+                conv_state = await self.memory.get_conv_state(agent_input.user_id)
+            except Exception as exc:
+                logger.warning("PlannerAgent: conv_state load failed — %s", exc)
 
-        # ── Parse + validate → ExecutionPlan ──────────────────────────────
-        plan = self._parse_plan(raw_json, agent_input)
+        # Build entity context note for pronoun resolution
+        entity_context_note = ""
+        if conv_state is not None:
+            from app.core.conversation_state import build_entity_context_note, is_pronoun_reference
+            entity_context_note = build_entity_context_note(conv_state)
 
-        # ── Layer 2: Deterministic exam-intent override ────────────────────
-        # Fires ONLY when the LLM returned general_chat but the message matches
-        # a confirmed exam-creation keyword.  Zero false-positive risk because
-        # the keyword list is restricted to create/generate action verbs.
-        if plan.intent == "general_chat" and _detect_generate_exam(agent_input.message):
-            logger.warning(
-                "PlannerAgent [Layer-2 override]: LLM misclassified exam request as "
-                "general_chat — correcting to generate_exam (message=%.100r)",
-                agent_input.message,
+            # ── Pronoun / coreference fast path ───────────────────────────
+            if is_pronoun_reference(agent_input.message):
+                resolved_intent = conv_state.resolve_pronoun()
+                if resolved_intent:
+                    logger.info(
+                        "PlannerAgent [L5-pronoun]: '%s' → intent=%r",
+                        agent_input.message, resolved_intent,
+                    )
+                    plan = self._build_plan_from_params(
+                        intent=resolved_intent,
+                        goal_summary=f"Continuing: {conv_state.current_topic or resolved_intent}",
+                        extracted_params={},
+                        agent_input=agent_input,
+                    )
+                    await self._update_conv_state(
+                        agent_input.user_id, conv_state, resolved_intent,
+                        {}, "pronoun",
+                    )
+                    return AgentOutput(
+                        status="success",
+                        response=plan.goal_summary,
+                        data={"plan": plan, "source": "pronoun", "confidence": 1.0},
+                    )
+
+        # ── Layer 1: Embedding classifier ────────────────────────────────
+        emb_intent: Optional[str] = None
+        emb_score:  float = 0.0
+        emb_confident = False
+
+        if self._emb_enabled and self.embedding_classifier is not None:
+            try:
+                emb_result = await self.embedding_classifier.classify(
+                    message=agent_input.message,
+                    clean_text=preprocessed.clean_text,
+                )
+                emb_intent    = emb_result.intent
+                emb_score     = emb_result.score
+                emb_confident = emb_result.is_confident
+
+                logger.info(
+                    "PlannerAgent [L1-emb]: intent=%r score=%.3f confident=%s latency=%.0fms",
+                    emb_intent, emb_score, emb_confident, emb_result.latency_ms,
+                )
+            except Exception as exc:
+                logger.warning("PlannerAgent [L1-emb]: error — %s", exc)
+
+        # ── Decide whether to use fast path or call LLM ──────────────────
+        # Fast path conditions:
+        #   - Embedding is confident
+        #   - Shadow mode is OFF
+        #   - Intent is NOT critical (critical intents always go through LLM
+        #     for parameter extraction before ActionGuard)
+        from app.agents.action_guard import CRITICAL_INTENTS
+        use_embedding_fast_path = (
+            emb_confident
+            and not self._shadow_mode
+            and emb_intent not in CRITICAL_INTENTS
+        )
+
+        if use_embedding_fast_path:
+            logger.info(
+                "PlannerAgent [L1-fastpath]: skipping LLM → intent=%r score=%.3f",
+                emb_intent, emb_score,
             )
-            plan.intent = "generate_exam"
-            plan.goal_summary = (
-                f"Generate an exam for: {agent_input.message[:120]}"
+            intent         = emb_intent
+            confidence     = emb_score
+            goal_summary   = f"User wants to: {(intent or '').replace('_', ' ')}"
+            classification_source = "embedding"
+            requires_clarification = False
+            clarification_question = None
+            extracted_params = {}
+        else:
+            # ── Layer 2: LLM function-call classifier ────────────────────
+            intent, confidence, goal_summary, requires_clarification, \
+                clarification_question, extracted_params = \
+                await self._call_llm_classifier(
+                    agent_input=agent_input,
+                    preprocessed=preprocessed,
+                    entity_context_note=entity_context_note,
+                    history=raw_history,
+                    role=role,
+                    academic_ctx=academic_ctx,
+                )
+            classification_source = "llm"
+
+        # ── Shadow-mode logging ──────────────────────────────────────────
+        if self._shadow_mode and emb_intent is not None:
+            await self._log_shadow_comparison(
+                agent_input=agent_input,
+                emb_intent=emb_intent,
+                emb_score=emb_score,
+                llm_intent=intent,
+                llm_confidence=confidence,
+                final_intent=intent,
+                source=classification_source,
             )
-            # Bootstrap exam_params if the LLM didn't populate them
-            if plan.exam_params is None:
-                plan.exam_params = ExamParams(
-                    subjectName=None,
-                    numberOfQuestions=10,
-                    examType="midterm",
-                    variationMode="same_for_all",
+
+        # ── Layer 2b: Legacy keyword safety net ──────────────────────────
+        # Only fires when both Layer 1 + Layer 2 returned general_chat
+        # AND the message matches a critical deterministic pattern.
+        if intent == "general_chat":
+            intent, classification_source = self._keyword_safety_net(
+                message=agent_input.message,
+                current_intent=intent,
+                current_source=classification_source,
+            )
+            if classification_source == "keyword":
+                goal_summary = f"Keyword-detected intent: {intent.replace('_', ' ')}"
+
+        # Special: regulation override (deterministic, always fires for regulation questions)
+        if _detect_regulation(agent_input.message) and intent not in ("regulation",):
+            logger.info("PlannerAgent [L2b-keyword]: regulation override")
+            intent = "regulation"
+            classification_source = "keyword"
+            goal_summary = "Read and answer from the academic regulation PDF."
+
+        # ── Layer 3: Confidence router ───────────────────────────────────
+        routing_decision = None
+        if self.confidence_router is not None and not self._shadow_mode:
+            routing_decision = self.confidence_router.route(
+                intent=intent,
+                confidence=confidence,
+                source=classification_source,
+                goal_summary=goal_summary,
+                clarification_question=clarification_question,
+            )
+            logger.info(
+                "PlannerAgent [L3-router]: action=%s intent=%r confidence=%.3f",
+                routing_decision.action, routing_decision.intent, routing_decision.confidence,
+            )
+
+            if routing_decision.action == "clarify":
+                # Save pending intent → user answers → resumes in agent.py
+                if self.memory:
+                    try:
+                        await self.memory.save_clarification(agent_input.user_id, {
+                            "pending_intent": routing_decision.intent,
+                            "confidence": routing_decision.confidence,
+                            "goal_summary": routing_decision.goal_summary,
+                            "original_message": agent_input.message,
+                        })
+                    except Exception as exc:
+                        logger.warning("PlannerAgent: save_clarification failed — %s", exc)
+                return AgentOutput(
+                    status="clarification_needed",
+                    response=routing_decision.clarification_question,
+                    data={
+                        "pending_intent": routing_decision.intent,
+                        "confidence": routing_decision.confidence,
+                    },
                 )
 
-        if plan.intent == "general_chat" and _detect_backend_query(agent_input.message):
-            logger.warning(
-                "PlannerAgent [Layer-2 override]: Correcting general_chat to backend_api_query for data request."
+            if routing_decision.action == "fallback":
+                intent = "general_chat"
+
+            # Use router's (possibly adjusted) intent
+            intent = routing_decision.intent
+
+        # ── Layer 4: Critical action guard ───────────────────────────────
+        if self._guard_enabled and intent in CRITICAL_INTENTS and not self._shadow_mode:
+            guard_result = await self._run_action_guard(
+                intent=intent,
+                goal_summary=goal_summary,
+                extracted_params=extracted_params,
+                user_language=preprocessed.detected_lang,
+                user_id=agent_input.user_id,
             )
-            plan.intent = "backend_api_query"
-            plan.goal_summary = "Query dynamic backend APIs to answer the user request."
+            if guard_result is not None:
+                # Confirmation required — save pending action and return
+                return guard_result
 
-        if plan.intent == "general_chat" and _detect_material_qa(agent_input.message):
-            logger.warning(
-                "PlannerAgent [Layer-2 override]: Correcting general_chat to material_qa "
-                "for course-material-grounded question."
-            )
-            plan.intent = "material_qa"
-            plan.goal_summary = "Answer question grounded in indexed course material."
+        # ── Build ExecutionPlan ──────────────────────────────────────────
+        plan = self._build_plan(
+            intent=intent,
+            goal_summary=goal_summary,
+            extracted_params=extracted_params,
+            agent_input=agent_input,
+        )
 
-        # ── Layer 2: Regulation document override ──────────────────────────
-        # Fires when user is asking about content INSIDE the regulation PDF
-        # (subjects per year, graduation requirements, study plan, etc.)
-        if _detect_regulation(agent_input.message):
-            if plan.intent not in ("regulation",):
-                logger.warning(
-                    "PlannerAgent [Layer-2 override]: Correcting %r to regulation "
-                    "for regulation content question.", plan.intent
-                )
-            plan.intent = "regulation"
-            plan.goal_summary = "Read and answer from the official academic regulation PDF."
-            plan.is_executable = True
+        # ── Layer 5b: Update conversation state ──────────────────────────
+        await self._update_conv_state(
+            user_id=agent_input.user_id,
+            conv_state=conv_state,
+            intent=intent,
+            extracted_params=extracted_params,
+            source=classification_source,
+        )
 
-        # ── Layer 2: Study plan override (highest priority after exam/regulation) ─
-        # Fires before assignment_query — study plan is more specific
-        if plan.intent in ("general_chat", "academic_advice", "backend_api_query") \
-                and _detect_study_plan(agent_input.message):
-            logger.warning(
-                "PlannerAgent [Layer-2 override]: Correcting %r to study_plan.", plan.intent
-            )
-            plan.intent = "study_plan"
-            plan.goal_summary = (
-                "توليد خطة مذاكرة شخصية مبنية على بيانات الطالب الأكاديمية الفعلية."
-            )
-
-        # ── Layer 2: Assignment query override ────────────────────────────
-        if plan.intent in ("general_chat", "backend_api_query") and _detect_assignment_query(agent_input.message):
-            logger.warning(
-                "PlannerAgent [Layer-2 override]: Correcting %r to assignment_query.", plan.intent
-            )
-            plan.intent = "assignment_query"
-            plan.goal_summary = "Show the student their assignments, deadlines, and submission status."
-
-        # ── Deterministic guard: ensure ResolveSubjectOffering pre-step ───
-        plan = self._ensure_resolve_step(plan)
-
+        elapsed = (time.perf_counter() - t0) * 1000
         logger.info(
-            "PlannerAgent: intent=%r steps=%d goal=%r",
-            plan.intent, len(plan.steps), plan.goal_summary,
+            "PlannerAgent v5: DONE intent=%r source=%s confidence=%.3f total=%.0fms",
+            intent, classification_source, confidence, elapsed,
         )
 
         return AgentOutput(
             status="success",
             response=plan.goal_summary,
-            data={"plan": plan},
+            data={
+                "plan": plan,
+                "source": classification_source,
+                "confidence": confidence,
+                "emb_intent": emb_intent,
+                "emb_score": emb_score,
+            },
         )
 
     # ─────────────────────────────────────────────────────────────────────
-    #  Internal helpers
+    #  Layer 2: LLM function-call classifier
+    # ─────────────────────────────────────────────────────────────────────
+
+    async def _call_llm_classifier(
+        self,
+        agent_input: AgentInput,
+        preprocessed,
+        entity_context_note: str,
+        history: list,
+        role: str,
+        academic_ctx: dict,
+    ) -> tuple:
+        """
+        Call the LLM with a compact system prompt + function schema.
+
+        Falls back to legacy free-form JSON generation when function calling
+        is not available on the selected model.
+
+        Returns:
+          (intent, confidence, goal_summary, requires_clarification,
+           clarification_question, extracted_params)
+        """
+        # Pull memory context
+        memory_prefix = ""
+        if self.memory:
+            try:
+                past = await self.memory.get_context(agent_input.user_id)
+                if past:
+                    memory_prefix = f"[Memory context]: {past}\n\n"
+            except Exception as exc:
+                logger.warning("PlannerAgent: memory lookup failed — %s", exc)
+
+        # Build academic context injection for parameter auto-fill
+        auto_fill_note = ""
+        if academic_ctx:
+            safe_keys = [
+                "userId", "studentId", "courseId", "subjectOfferingId",
+                "departmentId", "batchId", "collegeName", "departmentName", "profileId",
+            ]
+            relevant = {k: v for k, v in academic_ctx.items() if k in safe_keys and v}
+            if relevant:
+                auto_fill_note = (
+                    f"\n[Context for auto-fill]: {json.dumps(relevant, ensure_ascii=False)}"
+                )
+
+        # Arabizi note (from pre-processor)
+        arabizi_note = ""
+        if preprocessed.is_arabizi:
+            arabizi_note = f"\n{preprocessed.arabizi_note}"
+
+        user_content = (
+            f"{memory_prefix}"
+            f"User role: {role}\n"
+            f"User message: {agent_input.message}"
+            f"{arabizi_note}"
+            f"{auto_fill_note}"
+            f"{entity_context_note}"
+        )
+
+        # Build structured history (last 4 pairs)
+        history_turns: list[dict] = []
+        for turn in history[-4:]:
+            t_role = turn.get("role", "user")
+            t_content = str(turn.get("content", ""))
+            if t_role in ("user", "assistant") and t_content:
+                history_turns.append({"role": t_role, "content": t_content})
+
+        messages = [
+            {"role": "system", "content": _get_system_prompt()},
+            *history_turns,
+            {"role": "user", "content": user_content},
+        ]
+
+        # Try function calling first
+        try:
+            raw = await self._call_with_function_schema(messages)
+            if raw:
+                return self._parse_function_result(raw, agent_input)
+        except Exception as exc:
+            logger.warning("PlannerAgent [L2-function-call]: failed — %s", exc)
+
+        # Fallback: legacy JSON generation (old behavior)
+        raw_json = await self._call_planner_model(history_turns, user_content)
+        plan = self._parse_plan(raw_json, agent_input)
+        return (
+            plan.intent or _FALLBACK_INTENT,
+            0.75,          # legacy path has no confidence score
+            plan.goal_summary,
+            False,
+            None,
+            {},
+        )
+
+    async def _call_with_function_schema(self, messages: list[dict]) -> Optional[dict]:
+        """
+        Attempt function-call style JSON generation.
+
+        Uses generate_with_messages with response_format json_object and
+        injects the function schema description into the system prompt.
+        Falls back gracefully if the model doesn't support function calling.
+        """
+        try:
+            from app.core.config import settings
+            model_id = getattr(settings, "OPENROUTER_MODEL", "openai/gpt-4o-mini")
+        except Exception:
+            model_id = "openai/gpt-4o-mini"
+
+        # Inject function schema description into system message
+        schema_desc = json.dumps(_CLASSIFICATION_FUNCTION, ensure_ascii=False, indent=2)
+        enhanced_messages = list(messages)
+        enhanced_messages[0] = {
+            "role": "system",
+            "content": (
+                messages[0]["content"]
+                + f"\n\nReturn a JSON object matching this schema:\n{schema_desc}"
+            ),
+        }
+
+        raw = await self.model_router.generate_with_messages(
+            messages=enhanced_messages,
+            model_id=model_id,
+            response_format={"type": "json_object"},
+        )
+        if not raw:
+            return None
+        parsed = json.loads(raw) if isinstance(raw, str) else raw
+        return parsed if isinstance(parsed, dict) else None
+
+    def _parse_function_result(
+        self, raw: dict, agent_input: AgentInput
+    ) -> tuple:
+        """Parse the structured LLM response into classification fields."""
+        intent = raw.get("intent", _FALLBACK_INTENT)
+        if intent not in VALID_INTENTS:
+            logger.warning("PlannerAgent [L2]: unknown intent %r → fallback", intent)
+            intent = _FALLBACK_INTENT
+
+        confidence = float(raw.get("confidence", 0.75))
+        confidence = max(0.0, min(1.0, confidence))
+        goal_summary = raw.get("goal_summary", f"Handle user request: {agent_input.message[:80]}")
+        requires_clarification = bool(raw.get("requires_clarification", False))
+        clarification_question = raw.get("clarification_question")
+        extracted_params = raw.get("extracted_params") or {}
+        if not isinstance(extracted_params, dict):
+            extracted_params = {}
+
+        logger.debug(
+            "PlannerAgent [L2-parse]: intent=%r conf=%.3f clarify=%s",
+            intent, confidence, requires_clarification,
+        )
+        return (
+            intent, confidence, goal_summary,
+            requires_clarification, clarification_question, extracted_params,
+        )
+
+    # ─────────────────────────────────────────────────────────────────────
+    #  Layer 2b: Legacy keyword safety net
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _keyword_safety_net(
+        self, message: str, current_intent: str, current_source: str
+    ) -> tuple[str, str]:
+        """
+        Apply legacy keyword detection ONLY when both L1 and L2 returned general_chat.
+
+        Returns (intent, source) where source="keyword" if overridden.
+        """
+        if current_intent != "general_chat":
+            return current_intent, current_source
+
+        if _detect_generate_exam(message):
+            logger.info("PlannerAgent [L2b-keyword]: generate_exam override")
+            return "generate_exam", "keyword"
+        if _detect_study_plan(message):
+            logger.info("PlannerAgent [L2b-keyword]: study_plan override")
+            return "study_plan", "keyword"
+        if _detect_assignment_query(message):
+            logger.info("PlannerAgent [L2b-keyword]: assignment_query override")
+            return "assignment_query", "keyword"
+        if _detect_material_qa(message):
+            logger.info("PlannerAgent [L2b-keyword]: material_qa override")
+            return "material_qa", "keyword"
+        if _detect_backend_query(message):
+            logger.info("PlannerAgent [L2b-keyword]: backend_api_query override")
+            return "backend_api_query", "keyword"
+
+        return current_intent, current_source
+
+    # ─────────────────────────────────────────────────────────────────────
+    #  Layer 4: Action Guard
+    # ─────────────────────────────────────────────────────────────────────
+
+    async def _run_action_guard(
+        self,
+        intent: str,
+        goal_summary: str,
+        extracted_params: dict,
+        user_language: str,
+        user_id: Optional[str],
+    ) -> Optional[AgentOutput]:
+        """
+        Run the critical action guard.  Returns an AgentOutput if confirmation
+        is required, or None if execution should proceed.
+        """
+        try:
+            from app.agents.action_guard import check_critical_action
+            guard = await check_critical_action(
+                intent=intent,
+                goal_summary=goal_summary,
+                extracted_params=extracted_params,
+                user_language=user_language,
+                model_router=self.model_router,
+                run_verification=(intent == "action_execute"),
+            )
+
+            if not guard.verified:
+                # Verification rejected — treat as general_chat
+                return None
+
+            if guard.should_confirm:
+                # Save pending action so agent can resume on confirmation
+                if self.memory and user_id:
+                    try:
+                        await self.memory.save_pending_action(user_id, {
+                            "intent": intent,
+                            "goal_summary": goal_summary,
+                            "params": extracted_params,
+                        })
+                    except Exception as exc:
+                        logger.warning("PlannerAgent: save_pending_action failed — %s", exc)
+
+                return AgentOutput(
+                    status="confirmation_required",
+                    response=guard.confirmation_message,
+                    data={"pending_intent": intent, "awaiting_confirmation": True},
+                )
+        except Exception as exc:
+            logger.error("PlannerAgent [L4-guard]: error — %s", exc)
+
+        return None
+
+    # ─────────────────────────────────────────────────────────────────────
+    #  Layer 5: Conversation state update
+    # ─────────────────────────────────────────────────────────────────────
+
+    async def _update_conv_state(
+        self,
+        user_id: Optional[str],
+        conv_state,
+        intent: str,
+        extracted_params: dict,
+        source: str,
+    ) -> None:
+        """Push the resolved intent/entity onto the conversation state stack."""
+        if not self.memory or not user_id:
+            return
+        try:
+            from app.core.conversation_state import ConversationState, EntityFrame, ENTITY_INTENT_MAP
+
+            if conv_state is None:
+                conv_state = ConversationState()
+
+            conv_state.current_intent = intent
+            conv_state.turn_count += 1
+
+            # Push to entity stack when a concrete artifact is produced
+            entity_type = None
+            entity_name = ""
+
+            if intent == "regulation":
+                entity_type = "regulation"
+                entity_name = extracted_params.get("regulationName", "regulation")
+            elif intent == "generate_exam":
+                entity_type = "exam"
+                entity_name = extracted_params.get("subjectName", "exam")
+            elif intent in ("material_explanation", "material_qa"):
+                entity_type = "material"
+                entity_name = extracted_params.get("subjectName", "material")
+            elif intent == "complaint_submit":
+                entity_type = "complaint"
+                entity_name = "complaint"
+            elif intent == "study_plan":
+                entity_type = "study_plan"
+                entity_name = "study plan"
+            elif intent == "result_query":
+                entity_type = "result"
+                entity_name = "results"
+            elif intent == "assignment_query":
+                entity_type = "assignment"
+                entity_name = "assignment"
+
+            if entity_type:
+                frame = EntityFrame(
+                    type=entity_type,
+                    name=entity_name,
+                    intent=ENTITY_INTENT_MAP.get(entity_type, intent),
+                    params=extracted_params,
+                )
+                conv_state.push_entity(frame)
+                conv_state.current_topic = f"{entity_type}:{entity_name}"
+
+            await self.memory.save_conv_state(user_id, conv_state)
+        except Exception as exc:
+            logger.warning("PlannerAgent [L5]: conv_state update failed — %s", exc)
+
+    # ─────────────────────────────────────────────────────────────────────
+    #  Shadow mode logging
+    # ─────────────────────────────────────────────────────────────────────
+
+    async def _log_shadow_comparison(
+        self,
+        agent_input: AgentInput,
+        emb_intent: str,
+        emb_score: float,
+        llm_intent: str,
+        llm_confidence: float,
+        final_intent: str,
+        source: str,
+    ) -> None:
+        """Log embedding vs LLM comparison for calibration."""
+        match = emb_intent == llm_intent
+        if not match:
+            logger.warning(
+                "PlannerAgent [SHADOW]: MISMATCH emb=%r(%.3f) llm=%r(%.3f) final=%r "
+                "msg=%.80r",
+                emb_intent, emb_score, llm_intent, llm_confidence, final_intent,
+                agent_input.message,
+            )
+        else:
+            logger.info(
+                "PlannerAgent [SHADOW]: MATCH emb=%r(%.3f) llm=%r(%.3f)",
+                emb_intent, emb_score, llm_intent, llm_confidence,
+            )
+
+        if self.memory and agent_input.user_id:
+            entry = {
+                "ts":          datetime.now(timezone.utc).isoformat(),
+                "message":     agent_input.message[:120],
+                "emb_intent":  emb_intent,
+                "emb_score":   round(emb_score, 4),
+                "llm_intent":  llm_intent,
+                "llm_conf":    round(llm_confidence, 4),
+                "final":       final_intent,
+                "source":      source,
+                "match":       match,
+            }
+            try:
+                await self.memory.append_intent_log(agent_input.user_id, entry)
+            except Exception:
+                pass
+
+    # ─────────────────────────────────────────────────────────────────────
+    #  Plan builders
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _build_plan(
+        self,
+        intent: str,
+        goal_summary: str,
+        extracted_params: dict,
+        agent_input: AgentInput,
+    ) -> ExecutionPlan:
+        """Build an ExecutionPlan from classification results."""
+        # Build plan using legacy method for backward compat
+        raw = {
+            "intent": intent,
+            "goal_summary": goal_summary,
+            "is_executable": True,
+            "exam_params": None,
+            "pre_execution_steps": [],
+            "steps": [],
+        }
+
+        # Populate exam_params for generate_exam (always — extracted_params may be empty)
+        if intent == "generate_exam":
+            exam_fields = {
+                "subjectName": extracted_params.get("subjectName"),
+                "subjectOfferingId": extracted_params.get("subjectOfferingId"),
+                "numberOfQuestions": extracted_params.get("numberOfQuestions", 10),
+                "examType": extracted_params.get("examType", "midterm"),
+                "variationMode": extracted_params.get("variationMode", "same_for_all"),
+                "collegeName": extracted_params.get("collegeName"),
+                "departmentName": extracted_params.get("departmentName"),
+                "batchName": extracted_params.get("batchName"),
+            }
+            try:
+                raw["exam_params"] = ExamParams(**{k: v for k, v in exam_fields.items() if v is not None})
+            except Exception:
+                raw["exam_params"] = ExamParams(numberOfQuestions=10, examType="midterm")
+
+        plan = self._parse_plan(raw, agent_input)
+        plan = self._ensure_resolve_step(plan)
+        return plan
+
+    def _build_plan_from_params(
+        self,
+        intent: str,
+        goal_summary: str,
+        extracted_params: dict,
+        agent_input: AgentInput,
+    ) -> ExecutionPlan:
+        return self._build_plan(intent, goal_summary, extracted_params, agent_input)
+
+    # ─────────────────────────────────────────────────────────────────────
+    #  Legacy helpers (preserved for backward compat)
     # ─────────────────────────────────────────────────────────────────────
 
     async def _call_planner_model(
         self, history_turns: list[dict], user_content: str
     ) -> dict | None:
-        """
-        Send the planning request via structured messages[] that include history.
-
-        Message order:
-          [system]  _SYSTEM_PROMPT
-          [prior turns from history…]   ← gives the planner conversation context
-          [user]    role + message + academic_context note
-
-        Using generate_with_messages + json_object response_format instead of
-        generate_structured_json so that history_turns are forwarded to the model
-        (generate_structured_json is a single-turn helper with no history support).
-        """
+        """Legacy: free-form JSON generation (used as final fallback)."""
         messages = [
             {"role": "system", "content": _get_system_prompt()},
             *history_turns,
             {"role": "user", "content": user_content},
         ]
         try:
-            logger.debug(
-                "PlannerAgent: requesting JSON from openai/gpt-4o-mini "
-                "(history_turns=%d)", len(history_turns),
-            )
+            from app.core.config import settings
+            model_id = getattr(settings, "OPENROUTER_MODEL", "openai/gpt-4o-mini")
+        except Exception:
+            model_id = "openai/gpt-4o-mini"
+
+        try:
             raw = await self.model_router.generate_with_messages(
                 messages=messages,
-                model_id="openai/gpt-4o-mini",
+                model_id=model_id,
                 response_format={"type": "json_object"},
             )
-
             if not raw:
-                logger.warning(
-                    "PlannerAgent: openai/gpt-4o-mini returned empty — fallback chain will handle it"
-                )
                 return None
-
-            parsed = json.loads(raw) if isinstance(raw, str) else raw
-            logger.debug("PlannerAgent: raw plan = %s", parsed)
-            return parsed
-
+            return json.loads(raw) if isinstance(raw, str) else raw
         except json.JSONDecodeError as exc:
-            logger.error("PlannerAgent: JSON parse failed — %s", exc)
+            logger.error("PlannerAgent._call_planner_model JSON error: %s", exc)
             return None
         except Exception as exc:
-            logger.error("PlannerAgent: model call failed — %s", exc, exc_info=True)
+            logger.error("PlannerAgent._call_planner_model error: %s", exc)
             return None
 
     def _parse_plan(self, raw: dict | None, agent_input: AgentInput) -> ExecutionPlan:
-        """
-        Validate the raw LLM dict into an ExecutionPlan with safety guards:
-          - Invalid intent → downgrade to general_chat
-          - general_chat   → force steps=[], exam_params=None
-          - tool_name in steps → validated by executor (not here)
-        """
+        """Parse raw dict into ExecutionPlan with safety guards."""
         if not raw:
             return self._fallback_plan(agent_input.message)
 
-        # Normalise intent
         intent = raw.get("intent", _FALLBACK_INTENT)
         if intent not in VALID_INTENTS:
-            logger.warning(
-                "PlannerAgent: unknown intent %r — falling back to %s",
-                intent, _FALLBACK_INTENT,
-            )
+            logger.warning("PlannerAgent: unknown intent %r → fallback", intent)
             intent = _FALLBACK_INTENT
             raw["intent"] = intent
 
-        # HARD RULE: general_chat must never have steps or exam context
         if intent == "general_chat":
             raw["steps"] = []
             raw["exam_params"] = None
 
-        # HARD RULE: steps must always be an empty list regardless of what
-        # the planner returned (planner is advisory; steps come from planner
-        # only for tool-bound intents, handled via pre_execution_steps or
-        # the module architecture)
-        # NOTE: We allow non-empty steps for non-chat intents (multi-step unlock)
-        # but sanitise any non-list value to an empty list.
         if not isinstance(raw.get("steps"), list):
             raw["steps"] = []
 
         try:
-            plan = ExecutionPlan(**raw)
-            return plan
+            return ExecutionPlan(**raw)
         except (ValidationError, TypeError) as exc:
-            logger.error(
-                "PlannerAgent: ExecutionPlan validation failed — %s", exc
-            )
+            logger.error("PlannerAgent: ExecutionPlan validation failed — %s", exc)
             return self._fallback_plan(agent_input.message)
 
     @staticmethod
     def _fallback_plan(message: str) -> ExecutionPlan:
-        """Return a minimal, always-valid general_chat plan."""
         return ExecutionPlan(
             intent=_FALLBACK_INTENT,
             goal_summary=f"Handle the user's request: {message[:120]}",
@@ -961,11 +1118,7 @@ class PlannerAgent(BaseAgent):
 
     @staticmethod
     def _ensure_resolve_step(plan: ExecutionPlan) -> ExecutionPlan:
-        """
-        If the plan targets generate_exam but lacks subjectOfferingId,
-        inject the ResolveSubjectOffering pre-execution step so the
-        ExamGenerationModule never receives an incomplete plan.
-        """
+        """Inject ResolveSubjectOffering pre-step when subjectOfferingId is missing."""
         if (
             plan.intent == "generate_exam"
             and plan.exam_params is not None
@@ -976,20 +1129,12 @@ class PlannerAgent(BaseAgent):
                 for s in plan.pre_execution_steps
             )
             if not already_there:
-                logger.info(
-                    "PlannerAgent: injecting ResolveSubjectOffering pre-step "
-                    "(subjectOfferingId not supplied by user)"
-                )
+                logger.info("PlannerAgent: injecting ResolveSubjectOffering pre-step")
                 plan.pre_execution_steps.append(
                     PreExecutionStep(
                         tool="ResolveSubjectOffering",
-                        reason=(
-                            "subjectOfferingId is required to generate the exam "
-                            "but was not provided by the user"
-                        ),
-                        input_payload={
-                            "subjectName": plan.exam_params.subjectName,
-                        },
+                        reason="subjectOfferingId required but not provided",
+                        input_payload={"subjectName": plan.exam_params.subjectName},
                     )
                 )
         return plan

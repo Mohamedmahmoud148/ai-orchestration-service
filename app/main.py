@@ -20,6 +20,7 @@ from app.agents.model_router import ModelRouter
 from app.agents.planner import PlannerAgent
 
 from app.api.routes import chat, health, complaint_intelligence, rag as rag_routes, memory as memory_routes, ai_grading, exam_generation_api
+from app.api.routes import companion as companion_routes
 from app.core.config import settings
 from app.core.logging import logger, setup_logging
 from app.core.middleware import CorrelationIDMiddleware, RequestTimingMiddleware
@@ -106,10 +107,50 @@ async def lifespan(app: FastAPI):
     app.state.memory_store = memory_store
     app.state.rate_limiter = RateLimiter()
 
+    # ── 3.5 Embedding Intent Classifier (Layer 1) ─────────────────────────
+    # Warm up ONCE here so every request benefits from pre-computed centroids.
+    # Graceful degradation: if embedding_service is in keyword_fallback mode,
+    # the classifier still runs but with degraded quality (logged as WARNING).
+    from app.services.embedding_service import embedding_service as _emb_svc
+    from app.agents.embedding_classifier import EmbeddingIntentClassifier
+    from app.agents.confidence_router import ConfidenceRouter
+
+    embedding_classifier = EmbeddingIntentClassifier(_emb_svc)
+    try:
+        await embedding_classifier.warm_up()
+        app.state.embedding_classifier = embedding_classifier
+        logger.info(
+            "EmbeddingIntentClassifier: warm_up complete — "
+            "%d intents loaded", embedding_classifier.intent_count,
+        )
+    except Exception as exc:
+        logger.warning(
+            "EmbeddingIntentClassifier: warm_up failed (non-fatal) — "
+            "Layer 1 will be bypassed: %s", exc,
+        )
+        embedding_classifier = None
+        app.state.embedding_classifier = None
+
+    confidence_router = ConfidenceRouter(
+        embedding_execute_threshold=settings.EMBEDDING_HIGH_CONFIDENCE_THRESHOLD,
+        llm_execute_threshold=settings.LLM_CONFIDENCE_EXECUTE_THRESHOLD,
+        llm_clarify_threshold=settings.LLM_CONFIDENCE_CLARIFY_THRESHOLD,
+    )
+
+    shadow_mode = settings.EMBEDDING_CLASSIFIER_SHADOW_MODE
+    logger.info(
+        "Pipeline config: shadow_mode=%s embedding_enabled=%s action_guard=%s",
+        shadow_mode,
+        settings.EMBEDDING_CLASSIFIER_ENABLED,
+        settings.ACTION_GUARD_ENABLED,
+    )
+
     planner = PlannerAgent(
         model_router=model_router,
         memory=memory_store,
         ranker=None,
+        embedding_classifier=embedding_classifier,
+        confidence_router=confidence_router,
     )
 
     executor = PlanExecutor(
@@ -249,6 +290,7 @@ app.include_router(rag_routes.router)
 app.include_router(memory_routes.router)
 app.include_router(ai_grading.router)
 app.include_router(exam_generation_api.router)
+app.include_router(companion_routes.router)
 
 
 @app.get("/")

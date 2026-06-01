@@ -63,6 +63,19 @@ _MODULE_CLASS_MAP: Dict[str, tuple[str, str]] = {
     "material_qa":        ("app.modules.material_qa",         "MaterialQAModule"),
     "assignment_query":   ("app.modules.assignment_query",    "AssignmentQueryModule"),
     "study_plan":         ("app.modules.study_plan",          "StudyPlanModule"),
+    # ── AI Companion Platform modules ────────────────────────────────────────
+    "academic_coach":      ("app.modules.academic_coach",      "AcademicCoachModule"),
+    "quiz_me":             ("app.modules.study_partner",       "StudyPartnerModule"),
+    "generate_flashcards": ("app.modules.learning_assistant",  "LearningAssistantModule"),
+    "generate_examples":   ("app.modules.learning_assistant",  "LearningAssistantModule"),
+    "generate_exercises":  ("app.modules.learning_assistant",  "LearningAssistantModule"),
+    "learning_assistant":  ("app.modules.learning_assistant",  "LearningAssistantModule"),
+    "progress_report":     ("app.modules.progress_intelligence", "ProgressIntelligenceModule"),
+    # ── AI Teaching Intelligence Platform ─────────────────────────────────
+    "doctor_analytics":        ("app.modules.doctor_intelligence", "DoctorIntelligenceModule"),
+    "doctor_risk_students":    ("app.modules.doctor_intelligence", "DoctorIntelligenceModule"),
+    "doctor_weak_topics":      ("app.modules.doctor_intelligence", "DoctorIntelligenceModule"),
+    "doctor_recommendations":  ("app.modules.doctor_intelligence", "DoctorIntelligenceModule"),
 }
 
 # ── Tool allowlist ─────────────────────────────────────────────────────────────
