@@ -74,6 +74,20 @@ class RecordSessionRequest(BaseModel):
     completed: bool = True
 
 
+class GenerateQuestionsRequest(BaseModel):
+    topic: str
+    session_type: str = "quiz"   # quiz | active_recall | concept_check | exam_prep
+    difficulty: str = "medium"   # easy | medium | hard
+    count: int = Field(default=5, ge=1, le=15)
+
+
+class GradeOpenAnswerRequest(BaseModel):
+    question: str
+    student_answer: str
+    topic: str
+    difficulty: str = "medium"
+
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @router.post("/generate-flashcards")
@@ -244,6 +258,141 @@ Use the student's name if provided. End with a specific action recommendation.
         return {"report": _fallback_progress_text(body)}
 
 
+@router.post("/generate-questions")
+async def generate_study_questions(request: Request, body: GenerateQuestionsRequest):
+    """
+    Generate study session questions (MCQ or open-ended).
+    Called by AiCompanionService.GenerateSessionQuestionsAsync().
+    Returns a JSON array of question objects WITH correct answers (backend stores them, frontend never sees them).
+    """
+    import uuid, re
+
+    model_router = _get_model_router(request)
+
+    is_open = body.session_type in ("active_recall", "concept_check")
+    q_type  = "open" if is_open else "mcq"
+
+    diff_note = {
+        "easy":   "Use straightforward, definition-level questions.",
+        "medium": "Use application and understanding questions.",
+        "hard":   "Use analysis, synthesis, and evaluation questions.",
+    }.get(body.difficulty, "Use mixed difficulty.")
+
+    if q_type == "mcq":
+        format_example = (
+            '[{"id":"uuid","type":"mcq","text":"What is ...?","options":["A. ...","B. ...","C. ...","D. ..."],'
+            '"correct_answer":"A","explanation":"..."}]'
+        )
+        type_instruction = (
+            f"Generate {body.count} MCQ questions. Each must have exactly 4 options labeled A/B/C/D. "
+            "correct_answer must be the letter only (A, B, C, or D)."
+        )
+    else:
+        format_example = (
+            '[{"id":"uuid","type":"open","text":"Explain ...","options":null,'
+            '"correct_answer":"The model answer is ...","explanation":"..."}]'
+        )
+        type_instruction = (
+            f"Generate {body.count} open-ended questions. "
+            "correct_answer should be a concise model answer (1-3 sentences)."
+        )
+
+    prompt = f"""\
+Topic: "{body.topic}"
+Session type: {body.session_type} | Difficulty: {body.difficulty}
+{diff_note}
+
+{type_instruction}
+
+Return ONLY a valid JSON array — no markdown, no extra text:
+{format_example}
+
+Replace "uuid" with a real unique ID for each question.
+Write questions in Arabic if the topic is in Arabic, otherwise in English.
+"""
+
+    if model_router:
+        try:
+            raw = await model_router.generate(
+                prompt=prompt,
+                system_instruction=(
+                    "You are an expert university tutor and exam author. "
+                    "Return ONLY a valid JSON array, nothing else."
+                ),
+                model_id="openai/gpt-4o-mini",
+            )
+            if raw:
+                match = re.search(r"\[\s*\{.*?\}\s*\]", raw, re.DOTALL)
+                if match:
+                    questions = json.loads(match.group(0))
+                    # ensure every question has an id
+                    for q in questions:
+                        if not q.get("id"):
+                            q["id"] = str(uuid.uuid4())
+                    logger.info(
+                        "companion/generate-questions: %d questions for topic=%r type=%s",
+                        len(questions), body.topic, q_type,
+                    )
+                    return questions
+        except Exception as exc:
+            logger.error("companion/generate-questions: %s", exc)
+
+    # Fallback questions
+    return _fallback_questions(body.topic, body.count, q_type)
+
+
+@router.post("/grade-open-answer")
+async def grade_open_answer(request: Request, body: GradeOpenAnswerRequest):
+    """
+    Grade a single open-ended answer using the LLM.
+    Called by AiCompanionService.SubmitAnswerAsync() for open/active_recall questions.
+    Returns: {score, is_correct, feedback, explanation}
+    """
+    import re
+
+    model_router = _get_model_router(request)
+
+    prompt = f"""\
+You are grading a student's open-ended answer.
+
+Topic: {body.topic}
+Difficulty: {body.difficulty}
+Question: {body.question}
+Student's answer: {body.student_answer}
+
+Evaluate strictly. Return ONLY valid JSON:
+{{"score": <0-100>, "is_correct": <true if score >= 60>, "feedback": "<2 sentences in Arabic praising or correcting>", "explanation": "<correct model answer in 1-2 sentences>"}}
+"""
+
+    if model_router:
+        try:
+            raw = await model_router.generate(
+                prompt=prompt,
+                system_instruction=(
+                    "You are a strict but fair university examiner. "
+                    "Return ONLY valid JSON, no markdown."
+                ),
+                model_id="openai/gpt-4o-mini",
+            )
+            if raw:
+                match = re.search(r"\{.*\}", raw, re.DOTALL)
+                if match:
+                    result = json.loads(match.group(0))
+                    result["is_correct"] = result.get("score", 0) >= 60
+                    return result
+        except Exception as exc:
+            logger.error("companion/grade-open-answer: %s", exc)
+
+    # Fallback: basic length heuristic
+    score = 70 if len(body.student_answer.split()) >= 5 else 30
+    return {
+        "score":       score,
+        "is_correct":  score >= 60,
+        "feedback":    "تم تسجيل إجابتك." if score >= 60 else "حاول الإجابة بشكل أكثر تفصيلاً.",
+        "explanation": "خدمة التقييم غير متاحة حالياً، سيتم المراجعة لاحقاً.",
+    }
+
+
 @router.post("/record-session")
 async def record_session(request: Request, body: RecordSessionRequest):
     """
@@ -356,6 +505,33 @@ def _fallback_study_plan(body: StudyPlanRequest) -> dict:
         "focus_areas": body.weak_subjects[:3] or ["المواد الأساسية"],
         "motivational_note": "كل يوم مذاكرة هو خطوة نحو النجاح! 💪",
     }
+
+
+def _fallback_questions(topic: str, count: int, q_type: str) -> list[dict]:
+    import uuid
+    if q_type == "mcq":
+        return [
+            {
+                "id": str(uuid.uuid4()),
+                "type": "mcq",
+                "text": f"Which of the following best describes {topic}?",
+                "options": ["A. Option A", "B. Option B", "C. Option C", "D. Option D"],
+                "correct_answer": "A",
+                "explanation": "AI service unavailable — please try again.",
+            }
+            for _ in range(count)
+        ]
+    return [
+        {
+            "id": str(uuid.uuid4()),
+            "type": "open",
+            "text": f"Explain the concept of {topic} in your own words.",
+            "options": None,
+            "correct_answer": f"A comprehensive explanation of {topic}.",
+            "explanation": "AI service unavailable — please try again.",
+        }
+        for _ in range(count)
+    ]
 
 
 def _fallback_progress_text(body: ProgressReportRequest) -> str:
