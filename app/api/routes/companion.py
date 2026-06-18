@@ -90,6 +90,119 @@ class GradeOpenAnswerRequest(BaseModel):
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
+@router.post("/explain-file")
+async def explain_file(request: Request, file: "UploadFile" = None):  # type: ignore[name-defined]
+    """
+    Student uploads any file (PDF, DOCX, XLSX, image, TXT).
+    AI extracts text, explains the content, and generates flashcards.
+
+    Returns:
+      {
+        "explanation": "...",
+        "flashcards": [...],
+        "filename": "...",
+        "chars_extracted": N
+      }
+    """
+    from fastapi import UploadFile as _UploadFile
+    from app.modules.file_extraction import extract_text_from_bytes
+
+    model_router = _get_model_router(request)
+
+    # Accept file from multipart form
+    form = await request.form()
+    uploaded = form.get("file")
+    if uploaded is None:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=400, content={"detail": "No file provided."})
+
+    filename: str = getattr(uploaded, "filename", "file")
+    file_bytes: bytes = await uploaded.read()
+
+    if not file_bytes:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=400, content={"detail": "Empty file."})
+
+    # ── 1. Extract text ───────────────────────────────────────────────────────
+    try:
+        text = extract_text_from_bytes(file_bytes, filename)
+    except Exception as exc:
+        logger.error("explain-file: extraction failed for %s — %s", filename, exc)
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=422, content={"detail": f"Could not extract text from file: {exc}"})
+
+    if not text or not text.strip():
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=422, content={
+            "detail": "لم يتم التعرف على نص في الملف. تأكد إن الملف مش صورة فقط أو مشفّر.",
+            "detailEn": "No text could be extracted. The file may be a scanned image or encrypted."
+        })
+
+    text = text[:6_000]  # safe token limit
+
+    # ── 2. Generate explanation ───────────────────────────────────────────────
+    explanation = None
+    if model_router:
+        try:
+            explanation = await model_router.generate(
+                prompt=(
+                    f"الملف: {filename}\n\n"
+                    f"=== محتوى الملف ===\n{text}\n=== نهاية المحتوى ===\n\n"
+                    "بناءً على المحتوى أعلاه فقط، قدّم:\n"
+                    "1. ملخص واضح للمحتوى الرئيسي\n"
+                    "2. النقاط الأساسية مُرقّمة\n"
+                    "3. أي مفاهيم مهمة يجب فهمها\n"
+                    "استخدم المحتوى المقدّم فقط — لا تضف معلومات من خارج الملف."
+                ),
+                system_instruction=(
+                    "أنت مساعد أكاديمي ذكي. مهمتك شرح وتلخيص المحتوى المُقدّم فقط. "
+                    "لا تستخدم معلومات خارج النص المُرفق. "
+                    "إذا كان النص بالعربية فأجب بالعربية، وإذا كان بالإنجليزية فأجب بالإنجليزية."
+                ),
+                model_id="openai/gpt-4o-mini",
+            )
+        except Exception as exc:
+            logger.error("explain-file: LLM explanation failed — %s", exc)
+
+    if not explanation:
+        explanation = f"تم استخراج النص من الملف ({len(text)} حرف). خدمة الشرح غير متاحة مؤقتاً."
+
+    # ── 3. Generate flashcards from file content ───────────────────────────────
+    flashcards = []
+    if model_router:
+        try:
+            import re, json as _json, uuid as _uuid
+            fc_raw = await model_router.generate(
+                prompt=(
+                    f"بناءً على المحتوى التالي فقط، أنشئ 8 flashcards تعليمية:\n\n"
+                    f"{text[:3_000]}\n\n"
+                    "أرجع JSON array فقط بالشكل:\n"
+                    '[{"front": "السؤال", "back": "الجواب"}, ...]'
+                ),
+                system_instruction=(
+                    "You are a flashcard generator. Return ONLY a valid JSON array. "
+                    "No markdown, no explanation — pure JSON."
+                ),
+                model_id="openai/gpt-4o-mini",
+            )
+            if fc_raw:
+                match = re.search(r"\[\s*\{.*?\}\s*\]", fc_raw, re.DOTALL)
+                if match:
+                    raw_cards = _json.loads(match.group(0))
+                    flashcards = [
+                        {"id": str(_uuid.uuid4()), "front": c.get("front", ""), "back": c.get("back", "")}
+                        for c in raw_cards if isinstance(c, dict)
+                    ]
+        except Exception as exc:
+            logger.warning("explain-file: flashcard generation failed — %s", exc)
+
+    return {
+        "explanation": explanation,
+        "flashcards": flashcards,
+        "filename": filename,
+        "chars_extracted": len(text),
+    }
+
 @router.post("/generate-flashcards")
 async def generate_flashcards(request: Request, body: GenerateFlashcardsRequest):
     """
