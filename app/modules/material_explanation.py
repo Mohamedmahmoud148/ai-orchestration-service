@@ -469,41 +469,7 @@ class MaterialExplanationModule:
             materials_data, agent_input.auth_header
         )
 
-        # ── 4b. Vision fallback for scanned PDFs / PPTs / image-only files ──────
-        # If text is empty or very short (< 500 chars), try vision model on the file
-        if len(material_text.strip()) < 500:
-            logger.info(
-                "MaterialExplanationModule: text too short (%d chars) — trying vision for offering=%s",
-                len(material_text.strip()), offering_id
-            )
-            try:
-                # Get the first material's URL and try vision
-                items_for_vision = materials_data if isinstance(materials_data, list) \
-                    else (materials_data.get("items") or [])
-                for item_v in (items_for_vision[:3] if isinstance(items_for_vision, list) else []):
-                    if not isinstance(item_v, dict): continue
-                    vurl = (item_v.get("fileUrl") or item_v.get("signedUrl") or item_v.get("url") or "")
-                    vname = (item_v.get("fileName") or "").lower()
-                    if not vurl or not any(vname.endswith(e) for e in (".pdf",".ppt",".pptx",".png",".jpg",".jpeg")):
-                        continue
-                    vbytes = await _fetch_file_url_bytes(vurl, agent_input.auth_header)
-                    if not vbytes:
-                        continue
-                    # Try text extraction first (for PPT we only get slide text)
-                    from app.modules.file_extraction import extract_text_from_bytes, _vision_extract
-                    vision_text = await _vision_extract(
-                        vbytes, vname,
-                        agent_input.message or "اشرح محتوى هذا الملف بالتفصيل",
-                        self.model_router, agent_input.auth_header
-                    )
-                    if vision_text and len(vision_text.strip()) > 100:
-                        material_text = vision_text
-                        logger.info("MaterialExplanationModule: vision extracted %d chars from %s", len(vision_text), vname)
-                        break
-            except Exception as ve:
-                logger.warning("MaterialExplanationModule: vision fallback failed — %s", ve)
-
-        if not material_text or len(material_text.strip()) < 50:
+        if not material_text or len(material_text.strip()) < 30:
             logger.info(
                 "MaterialExplanationModule: no material text found for offering=%s",
                 offering_id,

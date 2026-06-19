@@ -117,33 +117,30 @@ async def transcribe_from_url(request: Request, body: TranscribeUrlRequest):
         except Exception as e:
             logger.error("lecture/transcribe-url: OpenAI Whisper failed — %s", e)
 
-    # ── 4. Fallback: Whisper via OpenRouter ───────────────────────────────────
-    if settings.OPENROUTER_API_KEY:
+    # ── 4. Fallback: Whisper via Groq (free, fast, 25MB limit) ───────────────
+    if settings.GROQ_API_KEY:
         try:
-            logger.info("lecture/transcribe-url: trying Whisper via OpenRouter")
-            async with httpx.AsyncClient(timeout=600.0) as client:
+            logger.info("lecture/transcribe-url: trying Whisper via Groq")
+            async with httpx.AsyncClient(timeout=300.0) as client:
                 files = {"file": (filename, whisper_bytes, _mime_from_name(filename))}
-                data = {"model": "openai/whisper-large-v3"}
-                headers = {
-                    "Authorization": f"Bearer {settings.OPENROUTER_API_KEY}",
-                    "HTTP-Referer": "https://bsnu.web.app",
-                    "X-Title": "UniSys Lecture Intelligence",
-                }
+                data = {"model": "whisper-large-v3", "response_format": "verbose_json"}
+                headers = {"Authorization": f"Bearer {settings.GROQ_API_KEY}"}
                 resp = await client.post(
-                    "https://openrouter.ai/api/v1/audio/transcriptions",
+                    "https://api.groq.com/openai/v1/audio/transcriptions",
                     headers=headers, files=files, data=data
                 )
                 resp.raise_for_status()
                 d = resp.json()
                 transcript = d.get("text", "")
-                logger.info("lecture/transcribe-url: OpenRouter Whisper returned %d chars", len(transcript))
+                duration = int(d.get("duration", 0)) if "duration" in d else None
+                logger.info("lecture/transcribe-url: Groq Whisper returned %d chars", len(transcript))
                 if transcript:
-                    return {"transcript": transcript, "duration_seconds": None, "provider": "openrouter-whisper"}
+                    return {"transcript": transcript, "duration_seconds": duration, "provider": "groq-whisper"}
         except Exception as e:
-            logger.error("lecture/transcribe-url: OpenRouter Whisper failed — %s", e)
+            logger.error("lecture/transcribe-url: Groq Whisper failed — %s", e)
 
     return JSONResponse(status_code=503, content={
-        "detail": "Speech-to-text unavailable. Set OPENAI_API_KEY or OPENROUTER_API_KEY in environment."
+        "detail": "Speech-to-text unavailable. Add OPENAI_API_KEY or GROQ_API_KEY to Railway environment variables."
     })
 
 

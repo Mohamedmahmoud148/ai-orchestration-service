@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     # EMBEDDING_MODEL: override to use a different embedding model.
     # If none are set the service falls back to keyword-overlap (no real vectors).
     OPENAI_API_KEY: str = ""
+    GROQ_API_KEY: str = ""          # Free Whisper via Groq — fastest option
     EMBEDDING_BASE_URL: str = "https://api.openai.com/v1"
     EMBEDDING_MODEL: str = "text-embedding-3-small"
 
