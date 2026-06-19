@@ -13,12 +13,17 @@ RUN addgroup --system appgroup && \
 # Set working directory
 WORKDIR /app
 
+# Install system deps: ffmpeg for audio compression (lecture recordings > 25MB)
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && \
+    rm -rf /var/lib/apt/lists/*
+
 # Install dependencies before copying application code
 # This optimizes Docker layer caching
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir torch==2.2.0 --index-url https://download.pytorch.org/whl/cpu && \
-    pip install --no-cache-dir -r requirements.txt
+    pip install --no-cache-dir -r requirements.txt && \
+    pip install --no-cache-dir pydub
 
 # Copy application source code
 COPY --chown=appuser:appgroup app/ app/
