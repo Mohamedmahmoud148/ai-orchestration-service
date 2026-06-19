@@ -234,6 +234,42 @@ _IDENTITY_KEYWORDS = (
     "من انا", "من أنا", "who am i", "my name", "what is my name",
 )
 
+def _normalize_academic_context(ctx: dict) -> dict:
+    """
+    The .NET backend serializes with JsonNamingPolicy.SnakeCaseLower.
+    E.g. batchId → batch_id.  ReactAgent expects camelCase keys.
+    This function ensures BOTH forms exist so lookups always succeed.
+    """
+    if not ctx:
+        return ctx
+    mappings = [
+        ("batch_id",       "batchId"),
+        ("student_id",     "studentId"),
+        ("user_id",        "userId"),
+        ("doctor_id",      "doctorId"),
+        ("department_id",  "departmentId"),
+        ("college_id",     "collegeId"),
+        ("group_id",       "groupId"),
+        ("semester_id",    "semesterId"),
+        ("offering_id",    "offeringId"),
+        ("subject_offering_id", "subjectOfferingId"),
+        ("batch_name",     "batchName"),
+        ("student_name",   "studentName"),
+        ("full_name",      "fullName"),
+        ("doctor_name",    "doctorName"),
+        ("department_name","departmentName"),
+        ("college_name",   "collegeName"),
+    ]
+    for snake, camel in mappings:
+        # If snake_case exists but camelCase doesn't → add camelCase alias
+        if snake in ctx and camel not in ctx:
+            ctx[camel] = ctx[snake]
+        # If camelCase exists but snake_case doesn't → add snake_case alias
+        elif camel in ctx and snake not in ctx:
+            ctx[snake] = ctx[camel]
+    return ctx
+
+
 def _try_answer_from_context(context: "ExecutionContext") -> Optional[str]:
     """
     Answer simple identity/profile questions directly from academic_context
@@ -516,6 +552,10 @@ class ReactAgent:
         context.set_model(_MODEL)
         context.set_tool("react_agent")
 
+        # Normalize academic_context keys (snake_case ↔ camelCase)
+        if context.academic_context:
+            context.academic_context = _normalize_academic_context(context.academic_context)
+
         # Input guard — truncate suspiciously long messages / injection attempts
         input_check = check_user_input(context.message)
         if not input_check.passed:
@@ -680,6 +720,10 @@ class ReactAgent:
         token-by-token via OpenAI streaming so the user sees the first word
         within ~500ms of the last tool call completing.
         """
+        # Normalize academic_context keys (snake_case ↔ camelCase)
+        if context.academic_context:
+            context.academic_context = _normalize_academic_context(context.academic_context)
+
         context.set_model(_MODEL)
         context.set_tool("react_agent")
 
