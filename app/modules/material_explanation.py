@@ -469,19 +469,46 @@ class MaterialExplanationModule:
             materials_data, agent_input.auth_header
         )
 
+        # ── Vision retry for scanned/image PDFs ─────────────────────────────────
         if not material_text or len(material_text.strip()) < 30:
-            logger.info(
-                "MaterialExplanationModule: no material text found for offering=%s",
-                offering_id,
-            )
+            # Try vision model before giving up
+            try:
+                items_v = materials_data if isinstance(materials_data, list) \
+                    else (materials_data.get("items") or [])
+                for item_v in (items_v[:2] if isinstance(items_v, list) else []):
+                    if not isinstance(item_v, dict): continue
+                    vurl = (item_v.get("fileUrl") or item_v.get("signedUrl") or "")
+                    vname = (item_v.get("fileName") or "").lower()
+                    if not vurl: continue
+                    vbytes = await _fetch_file_url_bytes(vurl, agent_input.auth_header)
+                    if not vbytes: continue
+                    from app.modules.file_extraction import _vision_extract
+                    vision_text = await _vision_extract(
+                        vbytes, vname,
+                        agent_input.message or "اشرح محتوى الملف",
+                        self.model_router, agent_input.auth_header
+                    )
+                    if vision_text and len(vision_text.strip()) > 50:
+                        material_text = vision_text
+                        logger.info("MaterialExplanationModule: vision rescued %d chars", len(vision_text))
+                        break
+            except Exception as ve:
+                logger.warning("MaterialExplanationModule: vision rescue failed — %s", ve)
+
+        if not material_text or len(material_text.strip()) < 30:
+            logger.info("MaterialExplanationModule: no readable text for offering=%s", offering_id)
+            # Don't say "problem" — ask what they want instead
+            subject = academic_ctx.get("subjectName") or academic_ctx.get("courseName") or "المادة"
             return AgentOutput(
                 status="success",
-                response=_NO_MATERIALS_BILINGUAL,
-                data={
-                    "module":       "MaterialExplanationModule",
-                    "offering_id":  offering_id,
-                    "has_material": False,
-                },
+                response=(
+                    f"الملف في مادة **{subject}** مش قابل للقراءة كـ نص عادي "
+                    f"(ممكن يكون PDF مسحوب ضوئياً أو slides بالصور).\n\n"
+                    f"ممكن تساعدني وتقولي:\n"
+                    f"- ايه الموضوع اللي عايز تفهمه؟\n"
+                    f"- ولا عايز أشرحلك أي مفهوم معين في {subject}؟"
+                ),
+                data={"module": "MaterialExplanationModule", "offering_id": offering_id, "has_material": False},
             )
 
         logger.info(
