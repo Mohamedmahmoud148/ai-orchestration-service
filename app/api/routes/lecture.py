@@ -71,13 +71,43 @@ async def transcribe_audio(request: Request):
 
         logger.info("lecture/transcribe: received %d bytes for %s", len(audio_bytes), filename)
 
+        _WHISPER_MAX_BYTES = 24 * 1024 * 1024  # 24MB (Whisper limit is 25MB)
+
         # ── Try OpenAI Whisper first ──────────────────────────────────────────
         from app.core.config import settings
         if settings.OPENAI_API_KEY:
             try:
                 import httpx
+
+                # Whisper has 25MB limit — compress if needed
+                whisper_bytes = audio_bytes
+                if len(audio_bytes) > _WHISPER_MAX_BYTES:
+                    logger.warning(
+                        "lecture/transcribe: file %d bytes > 24MB limit — attempting compression",
+                        len(audio_bytes)
+                    )
+                    try:
+                        # Try to compress MP3 using pydub (lower bitrate)
+                        import io
+                        from pydub import AudioSegment
+                        seg = AudioSegment.from_file(io.BytesIO(audio_bytes))
+                        buf = io.BytesIO()
+                        # Export at 32kbps mono which reduces size ~8x
+                        seg.export(buf, format="mp3", bitrate="32k", parameters=["-ac", "1"])
+                        whisper_bytes = buf.getvalue()
+                        logger.info(
+                            "lecture/transcribe: compressed %d → %d bytes",
+                            len(audio_bytes), len(whisper_bytes)
+                        )
+                    except Exception as compress_ex:
+                        logger.warning("lecture/transcribe: compression failed — %s", compress_ex)
+                        # If still too large, chunk and transcribe first 24MB
+                        if len(audio_bytes) > _WHISPER_MAX_BYTES:
+                            whisper_bytes = audio_bytes[:_WHISPER_MAX_BYTES]
+                            logger.info("lecture/transcribe: truncated to first 24MB for Whisper")
+
                 async with httpx.AsyncClient(timeout=300.0) as client:
-                    files = {"file": (filename, audio_bytes, _mime_from_name(filename))}
+                    files = {"file": (filename, whisper_bytes, _mime_from_name(filename))}
                     data = {"model": "whisper-1", "response_format": "verbose_json"}
                     headers = {"Authorization": f"Bearer {settings.OPENAI_API_KEY}"}
                     resp = await client.post(

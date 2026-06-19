@@ -137,7 +137,30 @@ async def explain_file(request: Request, body: ExplainFileRequest):
             "detailEn": "No text could be extracted. The file may be a scanned image or encrypted."
         })
 
-    text = text[:6_000]  # safe token limit
+    # If very little text was extracted → try vision model for scanned PDFs/images
+    fname_lower = filename.lower()
+    is_likely_scanned = len(text.strip()) < 500 and fname_lower.endswith((".pdf", ".png", ".jpg", ".jpeg", ".webp"))
+    if is_likely_scanned and model_router:
+        try:
+            import base64 as _b64v
+            vision_b64 = _b64.b64encode(file_bytes).decode() if 'file_bytes' in dir() else body.content_b64
+            vision_text = await model_router.generate_with_messages(
+                messages=[
+                    {"role": "system", "content": "أنت خبير في قراءة الوثائق. استخرج كل النص والمحتوى من الصورة/الملف بدقة."},
+                    {"role": "user", "content": [
+                        {"type": "text", "text": f"استخرج وشرح كل محتوى هذا الملف بالتفصيل: {filename}"},
+                        {"type": "image_url", "image_url": {"url": f"data:{body.content_type};base64,{vision_b64[:500000]}"}}
+                    ]}
+                ],
+                model_id="google/gemini-flash-1.5",
+            )
+            if vision_text and len(vision_text.strip()) > len(text.strip()):
+                text = vision_text
+                logger.info("explain-file: vision extraction got %d chars", len(text))
+        except Exception as ve:
+            logger.warning("explain-file: vision fallback failed — %s", ve)
+
+    text = text[:20_000]  # increased from 6K to 20K for deeper coverage
 
     # ── 2. Generate explanation ───────────────────────────────────────────────
     explanation = None
@@ -146,17 +169,22 @@ async def explain_file(request: Request, body: ExplainFileRequest):
             explanation = await model_router.generate(
                 prompt=(
                     f"الملف: {filename}\n\n"
-                    f"=== محتوى الملف ===\n{text}\n=== نهاية المحتوى ===\n\n"
-                    "بناءً على المحتوى أعلاه فقط، قدّم:\n"
-                    "1. ملخص واضح للمحتوى الرئيسي\n"
-                    "2. النقاط الأساسية مُرقّمة\n"
-                    "3. أي مفاهيم مهمة يجب فهمها\n"
-                    "استخدم المحتوى المقدّم فقط — لا تضف معلومات من خارج الملف."
+                    f"=== محتوى الملف الكامل ===\n{text}\n=== نهاية المحتوى ===\n\n"
+                    f"سؤال/طلب المستخدم: اشرحلي محتوى الملف بالتفصيل\n\n"
+                    "قدّم شرحاً أكاديمياً شاملاً ومفصلاً يشمل:\n"
+                    "## 1. نظرة عامة على الملف\n"
+                    "## 2. المفاهيم الأساسية مع شرح مفصل لكل منها\n"
+                    "## 3. المعادلات والتعريفات المهمة (إن وُجدت)\n"
+                    "## 4. العلاقات بين المفاهيم\n"
+                    "## 5. نقاط مهمة للامتحان\n\n"
+                    "⚠️ استخدم المحتوى المقدّم فقط. اجعل الشرح طويلاً ومفصلاً قدر الإمكان."
                 ),
                 system_instruction=(
-                    "أنت مساعد أكاديمي ذكي. مهمتك شرح وتلخيص المحتوى المُقدّم فقط. "
-                    "لا تستخدم معلومات خارج النص المُرفق. "
-                    "إذا كان النص بالعربية فأجب بالعربية، وإذا كان بالإنجليزية فأجب بالإنجليزية."
+                    "أنت أستاذ جامعي متخصص. مهمتك شرح المحتوى بعمق وتفصيل كامل. "
+                    "لا تختصر أبداً — الطالب يريد الفهم الكامل. "
+                    "استخدم عناوين وأمثلة وشرح مبسط لكل مفهوم. "
+                    "الرد يجب أن يكون طويلاً ومفيداً جداً. "
+                    "إذا كان المحتوى بالإنجليزية يمكنك الشرح بالعربية مع الاحتفاظ بالمصطلحات الإنجليزية."
                 ),
                 model_id="openai/gpt-4o-mini",
             )
