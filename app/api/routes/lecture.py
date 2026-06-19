@@ -97,7 +97,7 @@ async def transcribe_from_url(request: Request, body: TranscribeUrlRequest):
             logger.warning("lecture/transcribe-url: pydub compression failed — %s — truncating", ce)
             whisper_bytes = audio_bytes[:_WHISPER_MAX_BYTES]
 
-    # ── 3. Whisper API ────────────────────────────────────────────────────────
+    # ── 3. Whisper via OpenAI API ─────────────────────────────────────────────
     if settings.OPENAI_API_KEY:
         try:
             async with httpx.AsyncClient(timeout=600.0) as client:
@@ -112,12 +112,39 @@ async def transcribe_from_url(request: Request, body: TranscribeUrlRequest):
                 d = resp.json()
                 transcript = d.get("text", "")
                 duration = int(d.get("duration", 0)) if "duration" in d else None
-                logger.info("lecture/transcribe-url: Whisper returned %d chars", len(transcript))
+                logger.info("lecture/transcribe-url: Whisper/OpenAI returned %d chars", len(transcript))
                 return {"transcript": transcript, "duration_seconds": duration, "provider": "whisper-1"}
         except Exception as e:
-            logger.error("lecture/transcribe-url: Whisper failed — %s", e)
+            logger.error("lecture/transcribe-url: OpenAI Whisper failed — %s", e)
 
-    return JSONResponse(status_code=503, content={"detail": "Speech-to-text service unavailable. Please set OPENAI_API_KEY."})
+    # ── 4. Fallback: Whisper via OpenRouter ───────────────────────────────────
+    if settings.OPENROUTER_API_KEY:
+        try:
+            logger.info("lecture/transcribe-url: trying Whisper via OpenRouter")
+            async with httpx.AsyncClient(timeout=600.0) as client:
+                files = {"file": (filename, whisper_bytes, _mime_from_name(filename))}
+                data = {"model": "openai/whisper-large-v3"}
+                headers = {
+                    "Authorization": f"Bearer {settings.OPENROUTER_API_KEY}",
+                    "HTTP-Referer": "https://bsnu.web.app",
+                    "X-Title": "UniSys Lecture Intelligence",
+                }
+                resp = await client.post(
+                    "https://openrouter.ai/api/v1/audio/transcriptions",
+                    headers=headers, files=files, data=data
+                )
+                resp.raise_for_status()
+                d = resp.json()
+                transcript = d.get("text", "")
+                logger.info("lecture/transcribe-url: OpenRouter Whisper returned %d chars", len(transcript))
+                if transcript:
+                    return {"transcript": transcript, "duration_seconds": None, "provider": "openrouter-whisper"}
+        except Exception as e:
+            logger.error("lecture/transcribe-url: OpenRouter Whisper failed — %s", e)
+
+    return JSONResponse(status_code=503, content={
+        "detail": "Speech-to-text unavailable. Set OPENAI_API_KEY or OPENROUTER_API_KEY in environment."
+    })
 
 
 # ── POST /api/lecture/transcribe ──────────────────────────────────────────────
