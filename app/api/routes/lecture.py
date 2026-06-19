@@ -28,6 +28,11 @@ router = APIRouter(prefix="/api/lecture", tags=["lecture"])
 
 # ── Request/Response Models ───────────────────────────────────────────────────
 
+class TranscribeUrlRequest(BaseModel):
+    audio_url: str
+    filename: str = "recording.mp3"
+    mime_type: str = "audio/mpeg"
+
 class AnalyzeRequest(BaseModel):
     transcript: str
 
@@ -47,7 +52,76 @@ def _get_model_router(request: Request):
     return getattr(request.app.state, "model_router", None)
 
 
+# ── POST /api/lecture/transcribe-url ─────────────────────────────────────────
+# Primary endpoint: .NET sends R2 signed URL → FastAPI downloads → Whisper
+# No file size limit issues — direct R2→Whisper pipeline
+
+@router.post("/transcribe-url")
+async def transcribe_from_url(request: Request, body: TranscribeUrlRequest):
+    """
+    Download audio from URL (R2 signed URL) and transcribe via Whisper.
+    Avoids sending large audio bytes between .NET and FastAPI.
+    """
+    from app.core.config import settings
+    import httpx
+
+    filename = body.filename
+    logger.info("lecture/transcribe-url: downloading %s", filename)
+
+    # ── 1. Download audio from R2 ─────────────────────────────────────────────
+    try:
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            dl = await client.get(body.audio_url, follow_redirects=True)
+            dl.raise_for_status()
+            audio_bytes = dl.content
+        logger.info("lecture/transcribe-url: downloaded %d bytes", len(audio_bytes))
+    except Exception as e:
+        logger.error("lecture/transcribe-url: download failed — %s", e)
+        return JSONResponse(status_code=502, content={"detail": f"Failed to download audio: {e}"})
+
+    _WHISPER_MAX_BYTES = 24 * 1024 * 1024  # 24MB
+
+    # ── 2. Compress if > 24MB ─────────────────────────────────────────────────
+    whisper_bytes = audio_bytes
+    if len(audio_bytes) > _WHISPER_MAX_BYTES:
+        logger.warning("lecture/transcribe-url: %d bytes > 24MB — compressing", len(audio_bytes))
+        try:
+            import io
+            from pydub import AudioSegment
+            seg = AudioSegment.from_file(io.BytesIO(audio_bytes))
+            buf = io.BytesIO()
+            seg.export(buf, format="mp3", bitrate="32k", parameters=["-ac", "1"])
+            whisper_bytes = buf.getvalue()
+            logger.info("lecture/transcribe-url: compressed %d → %d bytes", len(audio_bytes), len(whisper_bytes))
+        except Exception as ce:
+            logger.warning("lecture/transcribe-url: pydub compression failed — %s — truncating", ce)
+            whisper_bytes = audio_bytes[:_WHISPER_MAX_BYTES]
+
+    # ── 3. Whisper API ────────────────────────────────────────────────────────
+    if settings.OPENAI_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=600.0) as client:
+                files = {"file": (filename, whisper_bytes, _mime_from_name(filename))}
+                data = {"model": "whisper-1", "response_format": "verbose_json"}
+                headers = {"Authorization": f"Bearer {settings.OPENAI_API_KEY}"}
+                resp = await client.post(
+                    "https://api.openai.com/v1/audio/transcriptions",
+                    headers=headers, files=files, data=data
+                )
+                resp.raise_for_status()
+                d = resp.json()
+                transcript = d.get("text", "")
+                duration = int(d.get("duration", 0)) if "duration" in d else None
+                logger.info("lecture/transcribe-url: Whisper returned %d chars", len(transcript))
+                return {"transcript": transcript, "duration_seconds": duration, "provider": "whisper-1"}
+        except Exception as e:
+            logger.error("lecture/transcribe-url: Whisper failed — %s", e)
+
+    return JSONResponse(status_code=503, content={"detail": "Speech-to-text service unavailable. Please set OPENAI_API_KEY."})
+
+
 # ── POST /api/lecture/transcribe ──────────────────────────────────────────────
+# Legacy multipart endpoint (kept for compatibility)
 
 @router.post("/transcribe")
 async def transcribe_audio(request: Request):
