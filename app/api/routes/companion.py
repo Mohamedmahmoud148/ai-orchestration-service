@@ -91,7 +91,7 @@ class GradeOpenAnswerRequest(BaseModel):
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @router.post("/explain-file")
-async def explain_file(request: Request, file: "UploadFile" = None):  # type: ignore[name-defined]
+async def explain_file(request: Request):
     """
     Student uploads any file (PDF, DOCX, XLSX, image, TXT).
     AI extracts text, explains the content, and generates flashcards.
@@ -104,7 +104,6 @@ async def explain_file(request: Request, file: "UploadFile" = None):  # type: ig
         "chars_extracted": N
       }
     """
-    from fastapi import UploadFile as _UploadFile
     from app.modules.file_extraction import extract_text_from_bytes
 
     model_router = _get_model_router(request)
