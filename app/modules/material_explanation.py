@@ -330,7 +330,82 @@ class MaterialExplanationModule:
                     if material_text:
                         return await self._explain(material_text, agent_input, model_id, role, ctx)
 
-            # Fallback C: give a helpful response
+            # Fallback C: search for the file by name across all student's enrolled offerings
+            student_id = academic_ctx.get("studentId") or academic_ctx.get("student_id")
+            if student_id and agent_input.auth_header:
+                try:
+                    enrollments = await self.backend_client.fetch(
+                        route="/api/SubjectOfferings/my-enrollments",
+                        auth_header=agent_input.auth_header,
+                    )
+                    items = enrollments if isinstance(enrollments, list) else \
+                            (enrollments.get("items") or enrollments.get("data") or [])
+                    # Extract file name from user message to search for
+                    import re
+                    fname_match = re.search(
+                        r'([^\s/\\]+\.(?:pdf|docx|xlsx|xls|csv|txt|png|jpg))',
+                        agent_input.message or "", re.IGNORECASE
+                    )
+                    fname_query = fname_match.group(1).lower() if fname_match else ""
+
+                    for offering in (items[:8] if isinstance(items, list) else []):
+                        oid = (offering.get("id") or offering.get("offeringId") or
+                               offering.get("subjectOfferingId") or "")
+                        if not oid:
+                            continue
+                        try:
+                            mats = await self.backend_client.fetch(
+                                route=f"/api/Materials/by-offering/{oid}",
+                                auth_header=agent_input.auth_header,
+                            )
+                            mat_items = mats if isinstance(mats, list) else \
+                                        (mats.get("items") or [])
+                            for mat in (mat_items if isinstance(mat_items, list) else []):
+                                mat_fname = (mat.get("fileName") or mat.get("title") or "").lower()
+                                if fname_query and fname_query not in mat_fname:
+                                    continue  # skip if looking for specific file
+                                mat_url = (mat.get("fileUrl") or mat.get("signedUrl")
+                                           or mat.get("url") or "")
+                                if mat_url:
+                                    material_text = await _fetch_file_url_text(
+                                        mat_url, agent_input.auth_header,
+                                        mat.get("fileName") or ""
+                                    )
+                                    if material_text:
+                                        logger.info(
+                                            "MaterialExplanationModule: found file '%s' in offering %s",
+                                            mat.get("fileName"), oid
+                                        )
+                                        # Store offering_id so deep PDF mode works
+                                        offering_id = oid
+                                        # Use deep PDF if file is large
+                                        if mat_fname.endswith(".pdf") and len(material_text) > 8_000:
+                                            from app.modules.deep_pdf_study import extract_pdf_pages, summarize_large_pdf
+                                            url_bytes = await _fetch_file_url_bytes(mat_url, agent_input.auth_header)
+                                            if url_bytes:
+                                                pages = extract_pdf_pages(url_bytes)
+                                                if pages:
+                                                    explanation = await summarize_large_pdf(
+                                                        pages=pages,
+                                                        user_question=agent_input.message or "اشرح الملف",
+                                                        model_router=self.model_router,
+                                                        model_id=model_id,
+                                                        subject_name=mat.get("title") or mat.get("fileName") or "",
+                                                    )
+                                                    return AgentOutput(
+                                                        status="success",
+                                                        response=explanation,
+                                                        data={"module": "MaterialExplanationModule",
+                                                              "mode": "cross_offering_deep_pdf",
+                                                              "page_count": len(pages)},
+                                                    )
+                                        return await self._explain(material_text, agent_input, model_id, role, ctx)
+                        except Exception:
+                            continue
+                except Exception as fe:
+                    logger.warning("MaterialExplanationModule: enrollment search failed — %s", fe)
+
+            # Fallback D: give a helpful response
             enrolled = academic_ctx.get("enrolledCourses") or academic_ctx.get("courses") or []
             if enrolled:
                 course_list = ", ".join(
