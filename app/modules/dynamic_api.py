@@ -951,16 +951,26 @@ class DynamicApiModule:
             or raw_ac.get("studentCode") or raw_ac.get("universityId")
             or raw_ac.get("staffId") or ""
         )
+        # Handle both camelCase (frontend) and snake_case (.NET backend serialization)
+        def ac(camel: str, snake: str | None = None, fallback: str = "") -> str:
+            snake = snake or camel.replace("Id", "_id").replace("Name", "_name").lower()
+            # try exact camel, then snake_case, then fallback
+            return raw_ac.get(camel) or raw_ac.get(snake) or fallback
+
         substitutions = {
-            "{userId}":    raw_ac.get("userId", ""),
-            "{profileId}": raw_ac.get("profileId", ""),
-            "{studentId}": raw_ac.get("studentId") or raw_ac.get("userId", ""),
-            "{doctorId}":  raw_ac.get("doctorId") or raw_ac.get("profileId", ""),
-            "{batchId}":   raw_ac.get("batchId", ""),
-            "{offeringId}": raw_ac.get("subjectOfferingId", ""),
-            "{id}":        raw_ac.get("profileId") or raw_ac.get("userId", ""),
-            "{code}":      user_code or raw_ac.get("profileId") or raw_ac.get("userId", ""),
-            "{userCode}":  user_code,
+            "{userId}":     ac("userId",    "user_id"),
+            "{profileId}":  ac("profileId", "profile_id"),
+            "{studentId}":  ac("studentId", "student_id") or ac("userId", "user_id"),
+            "{doctorId}":   ac("doctorId",  "doctor_id")  or ac("profileId", "profile_id"),
+            "{batchId}":    ac("batchId",   "batch_id"),
+            "{offeringId}": ac("subjectOfferingId", "subject_offering_id"),
+            "{id}":         ac("profileId", "profile_id") or ac("userId", "user_id"),
+            "{code}":       user_code or ac("profileId", "profile_id") or ac("userId", "user_id"),
+            "{userCode}":   user_code,
+            "{departmentId}": ac("departmentId", "department_id"),
+            "{collegeId}":    ac("collegeId",    "college_id"),
+            "{semesterId}":   ac("semesterId",   "semester_id"),
+            "{groupId}":      ac("groupId",      "group_id"),
         }
 
         original = endpoint

@@ -135,6 +135,13 @@ def _detect_backend_query(message: str) -> bool:
         "who am i", "my name", "my profile", "my info",
         "my courses", "my subjects", "my schedule", "my grades",
         "my gpa", "my results",
+        # Schedule-specific keywords — must NOT fall to general_chat or study_plan
+        "جدولي", "جدول دراسي", "جدول المحاضرات", "جدول الأسبوع", "جدول الاسبوع",
+        "الجدول الدراسي", "محاضرات النهارده", "محاضرات بكرا",
+        "موعد المحاضرة", "المحاضرة الجاية",
+        "schedule this week", "class schedule", "lecture schedule",
+        "timetable", "weekly schedule", "today's classes", "tomorrow's classes",
+        "next lecture", "class today", "classes tomorrow",
     }
     return any(kw in msg for kw in _BACKEND_KEYWORDS)
 
