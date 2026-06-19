@@ -90,33 +90,33 @@ class GradeOpenAnswerRequest(BaseModel):
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
-@router.post("/explain-file")
-async def explain_file(request: Request):
-    """
-    Student uploads any file (PDF, DOCX, XLSX, image, TXT).
-    AI extracts text, explains the content, and generates flashcards.
+class ExplainFileRequest(BaseModel):
+    filename: str = "document.pdf"
+    content_b64: str = ""   # base64-encoded file bytes
+    content_type: str = "application/pdf"
 
-    Returns:
-      {
-        "explanation": "...",
-        "flashcards": [...],
-        "filename": "...",
-        "chars_extracted": N
-      }
+
+@router.post("/explain-file")
+async def explain_file(request: Request, body: ExplainFileRequest):
     """
+    Student uploads any file — received as base64 JSON to avoid multipart limits.
+    AI extracts text, explains the content, and generates flashcards.
+    """
+    import base64 as _b64
     from app.modules.file_extraction import extract_text_from_bytes
 
     model_router = _get_model_router(request)
 
-    # Accept file from multipart form
-    form = await request.form()
-    uploaded = form.get("file")
-    if uploaded is None:
+    filename = body.filename
+    if not body.content_b64:
         from fastapi.responses import JSONResponse
-        return JSONResponse(status_code=400, content={"detail": "No file provided."})
+        return JSONResponse(status_code=400, content={"detail": "No file content provided."})
 
-    filename: str = getattr(uploaded, "filename", "file")
-    file_bytes: bytes = await uploaded.read()
+    try:
+        file_bytes: bytes = _b64.b64decode(body.content_b64)
+    except Exception:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=400, content={"detail": "Invalid base64 content."})
 
     if not file_bytes:
         from fastapi.responses import JSONResponse
