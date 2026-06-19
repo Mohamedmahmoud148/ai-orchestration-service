@@ -21,6 +21,7 @@ from app.agents.planner import PlannerAgent
 
 from app.api.routes import chat, health, complaint_intelligence, rag as rag_routes, memory as memory_routes, ai_grading, exam_generation_api
 from app.api.routes import companion as companion_routes
+from app.api.routes import lecture as lecture_routes
 from app.core.config import settings
 from app.core.logging import logger, setup_logging
 from app.core.middleware import CorrelationIDMiddleware, RequestTimingMiddleware
@@ -291,6 +292,7 @@ app.include_router(memory_routes.router)
 app.include_router(ai_grading.router)
 app.include_router(exam_generation_api.router)
 app.include_router(companion_routes.router)
+app.include_router(lecture_routes.router)
 
 
 @app.get("/")
