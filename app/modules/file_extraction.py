@@ -29,7 +29,7 @@ from app.core.logging import logger
 
 # ── Vision model for scanned PDFs / images ────────────────────────────────────
 _VISION_MODEL = "google/gemini-flash-1.5"   # via OpenRouter — fast + cheap + great OCR
-_VISION_MAX_PAGES = 5                        # max PDF pages to send as images
+_VISION_MAX_PAGES = 20                       # max PDF pages to send as images (increased for full coverage)
 
 # ── Excel column limit — avoid token explosion ────────────────────────────────
 _MAX_EXCEL_ROWS = 200
@@ -393,13 +393,20 @@ class FileExtractionModule:
         raw_text = extract_text_from_bytes(file_bytes, file_name)
         used_vision = False
 
-        # ── 3. Vision fallback if text extraction empty ───────────────────────
+        # ── 3. Vision fallback ───────────────────────────────────────────────────
+        # Use vision for:
+        # - Images always (no text extraction possible)
+        # - PDFs/PPTs when text is empty (scanned docs, image-only slides)
+        # - PPT files always (slides are mostly images, little extractable text)
         name_lower = file_name.lower()
+        is_image = name_lower.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp"))
+        is_ppt   = name_lower.endswith((".ppt", ".pptx"))
+        is_poor_text = len(raw_text.strip()) < 200  # too little text extracted
+
         needs_vision = (
-            not raw_text.strip()
-            and (
-                name_lower.endswith((".pdf", ".png", ".jpg", ".jpeg", ".gif", ".webp"))
-            )
+            is_image
+            or is_ppt
+            or (is_poor_text and name_lower.endswith((".pdf", ".png", ".jpg", ".jpeg", ".gif", ".webp")))
         )
 
         if needs_vision:
@@ -428,12 +435,17 @@ class FileExtractionModule:
         role = ctx.get("role", "student")
 
         system_prompt = (
-            "أنت خبير في قراءة وتحليل الوثائق الجامعية.\n"
-            "لديك المحتوى الكامل للملف أدناه.\n"
-            "أجب على سؤال المستخدم بناءً على هذا المحتوى فقط.\n"
-            "إذا كان السؤال عاماً (مثل 'اقرأ الملف') → لخّص المحتوى بشكل منظم.\n"
+            "أنت مدرّس أكاديمي خبير في شرح المحتوى الجامعي بالتفصيل.\n"
+            "لديك المحتوى الكامل للملف أدناه (نص + صور إن وُجدت).\n\n"
+            "إذا طُلب منك شرح الملف أو تلخيصه أو 'اقرأ الملف':\n"
+            "  - اشرح كل مفهوم بالتفصيل الممل\n"
+            "  - اذكر كل نقطة أساسية مع أمثلة\n"
+            "  - قسّم المحتوى بعناوين واضحة\n"
+            "  - اشرح المعادلات والمصطلحات التقنية\n"
+            "  - اذكر أهمية كل جزء للطالب\n"
+            "  - لا تختصر — الشرح المفصل مطلوب\n\n"
             "استخدم نفس لغة المستخدم (عربي → عربي، إنجليزي → إنجليزي).\n"
-            "إذا كانت بيانات جدولية (Excel) → اعرضها بشكل واضح مع العناوين.\n"
+            "إذا كانت بيانات جدولية → اعرضها بشكل واضح مع العناوين.\n"
             "لا تخترع معلومات غير موجودة في الملف."
         )
 
