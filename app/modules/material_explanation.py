@@ -108,6 +108,23 @@ def _extract_pdf_text(data: bytes) -> str:
         return ""
 
 
+async def _fetch_file_url_bytes(file_url: str, auth_header: Optional[str]) -> Optional[bytes]:
+    """Download raw bytes from a URL."""
+    if not file_url or not file_url.startswith("http"):
+        return None
+    try:
+        headers: Dict[str, str] = {}
+        if auth_header:
+            headers["Authorization"] = auth_header
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(file_url, headers=headers, timeout=60.0, follow_redirects=True)
+            resp.raise_for_status()
+        return resp.content
+    except Exception as exc:
+        logger.warning("MaterialExplanationModule: byte fetch failed (%s) — %s", file_url[:80], exc)
+        return None
+
+
 async def _fetch_file_url_text(file_url: str, auth_header: Optional[str], filename: str = "") -> str:
     """
     Fetch file from URL and extract text.
@@ -120,7 +137,7 @@ async def _fetch_file_url_text(file_url: str, auth_header: Optional[str], filena
         if auth_header:
             headers["Authorization"] = auth_header
         async with httpx.AsyncClient() as client:
-            resp = await client.get(file_url, headers=headers, timeout=30.0, follow_redirects=True)
+            resp = await client.get(file_url, headers=headers, timeout=60.0, follow_redirects=True)
             resp.raise_for_status()
 
         # Determine file type from URL or content-type
@@ -132,7 +149,8 @@ async def _fetch_file_url_text(file_url: str, auth_header: Optional[str], filena
         from app.modules.file_extraction import extract_text_from_bytes
 
         if any(fname.endswith(ext) for ext in (".pdf", ".docx", ".xlsx", ".xls", ".csv", ".txt")):
-            return extract_text_from_bytes(resp.content, fname)[:6_000]
+            # No truncation here — caller handles large text
+            return extract_text_from_bytes(resp.content, fname)
 
         if "pdf" in content_type:
             return _extract_pdf_text(resp.content)
@@ -242,8 +260,8 @@ async def _collect_material_text(
             texts.append(pdf_text)
 
     combined = "\n\n".join(texts).strip()
-    # Safe token limit (~4 000 words ≈ 5 000 chars)
-    return combined[:5_000]
+    # No hard truncation — MaterialExplanationModule handles large text via deep_pdf_study
+    return combined
 
 
 class MaterialExplanationModule:
@@ -392,9 +410,90 @@ class MaterialExplanationModule:
             )
 
         logger.info(
-            "MaterialExplanationModule: %d chars of material extracted — sending to LLM",
+            "MaterialExplanationModule: %d chars of material extracted",
             len(material_text),
         )
+
+        # ── 3b. Deep PDF mode for large documents ─────────────────────────────
+        # If material is a PDF and text is large, use hierarchical summarization.
+        # This gives accurate page count and full document coverage.
+        from app.modules.deep_pdf_study import (
+            extract_pdf_pages, get_pdf_page_count, summarize_large_pdf,
+            is_full_doc_request, _SINGLE_CALL_CHAR_LIMIT
+        )
+
+        student_name = academic_ctx.get("studentName") or ""
+        subject_name = (
+            academic_ctx.get("subjectName")
+            or academic_ctx.get("courseName")
+            or "this subject"
+        )
+
+        # Check if we have a PDF URL to download for deep mode
+        pdf_bytes: Optional[bytes] = None
+        if len(material_text) > _SINGLE_CALL_CHAR_LIMIT or \
+           any(kw in (agent_input.message or "").lower() for kw in
+               ["كم صفحة", "كم عدد", "how many page", "اشرح كل", "اشرح الكامل",
+                "summarize", "لخص", "اقرأ", "شرح تفصيلي", "explain everything",
+                "explain all", "page", "صفحة"]):
+            # Try to get PDF bytes for page-level analysis
+            try:
+                materials_data_raw = await self.backend_client.fetch(
+                    route=f"/api/Materials/by-offering/{offering_id}",
+                    auth_header=agent_input.auth_header,
+                )
+                items = materials_data_raw if isinstance(materials_data_raw, list) \
+                    else materials_data_raw.get("items", [])
+                for item in (items[:3] if isinstance(items, list) else []):
+                    if not isinstance(item, dict): continue
+                    furl = (item.get("fileUrl") or item.get("signedUrl")
+                            or item.get("url") or "")
+                    fname_item = (item.get("fileName") or "").lower()
+                    if furl and fname_item.endswith(".pdf"):
+                        pdf_bytes = await _fetch_file_url_bytes(furl, agent_input.auth_header)
+                        if pdf_bytes:
+                            logger.info(
+                                "MaterialExplanationModule: downloaded PDF bytes (%d) for deep mode",
+                                len(pdf_bytes)
+                            )
+                            break
+            except Exception as e:
+                logger.warning("MaterialExplanationModule: deep mode PDF fetch failed — %s", e)
+
+        if pdf_bytes:
+            pages = extract_pdf_pages(pdf_bytes)
+            real_page_count = len(pages)
+            total_chars     = sum(len(p) for p in pages)
+
+            logger.info(
+                "MaterialExplanationModule: deep PDF mode — %d pages, %d chars",
+                real_page_count, total_chars
+            )
+
+            explanation = await summarize_large_pdf(
+                pages         = pages,
+                user_question = agent_input.message or "اشرح محتوى الملف",
+                model_router  = self.model_router,
+                model_id      = model_id,
+                subject_name  = subject_name,
+                student_name  = student_name,
+            )
+
+            return AgentOutput(
+                status="success",
+                response=explanation,
+                data={
+                    "module":         "MaterialExplanationModule",
+                    "offering_id":    offering_id,
+                    "subject_name":   subject_name,
+                    "role":           role,
+                    "has_material":   True,
+                    "page_count":     real_page_count,
+                    "total_chars":    total_chars,
+                    "model_used":     model_id,
+                    "mode":           "deep_pdf",
+                },
+            )
 
         # ── 4. LLM explanation — STRICT: only use provided material ───────────
         # Select role-appropriate system prompt
@@ -423,13 +522,17 @@ class MaterialExplanationModule:
         greeting = f"For {student_name}, " if student_name and role == "student" else ""
         dept_info = f" ({department})" if department else ""
 
+        # Use full text (no truncation) — but cap at 30K chars for single-call mode
+        # Deep PDF mode already handled above for large PDFs
+        material_for_prompt = material_text[:30_000] if len(material_text) > 30_000 else material_text
+
         user_prompt = (
             f"{greeting}{role_framing}\n\n"
             f"Subject: {subject_name}{dept_info}\n"
             f"Subject Offering ID: {offering_id}\n"
             f"User question: \"{agent_input.message}\"\n\n"
             f"=== COURSE MATERIAL (USE ONLY THIS — DO NOT USE GENERAL KNOWLEDGE) ===\n"
-            f"{material_text}\n"
+            f"{material_for_prompt}\n"
             f"=== END OF MATERIAL ===\n\n"
             "Using ONLY the course material above, provide a clear, structured "
             "explanation or summary that directly answers the user's question."

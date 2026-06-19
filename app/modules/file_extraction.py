@@ -438,7 +438,36 @@ class FileExtractionModule:
         )
 
         file_type_label = _get_file_type_label(file_name)
-        content_preview = raw_text[:8000]
+
+        # ── Deep PDF mode for large documents ────────────────────────────────
+        is_pdf = file_name.lower().endswith(".pdf")
+        if is_pdf and len(raw_text) > 8_000:
+            from app.modules.deep_pdf_study import extract_pdf_pages, summarize_large_pdf
+            pages = extract_pdf_pages(file_bytes)
+            if pages:
+                logger.info("FileExtractionModule: deep PDF mode — %d pages", len(pages))
+                explanation = await summarize_large_pdf(
+                    pages=pages,
+                    user_question=msg or "اشرح محتوى الملف",
+                    model_router=self.model_router,
+                    model_id="openai/gpt-4o-mini",
+                )
+                return AgentOutput(
+                    status="success",
+                    response=explanation or raw_text[:3000],
+                    data={
+                        "module":     "FileExtractionModule",
+                        "file_name":  file_name,
+                        "file_type":  file_type_label,
+                        "page_count": len(pages),
+                        "char_count": len(raw_text),
+                        "mode":       "deep_pdf",
+                    },
+                )
+
+        # ── Short document or non-PDF: single LLM call ────────────────────────
+        # Cap at 30K chars — enough for ~15 pages without overflowing context
+        content_preview = raw_text[:30_000]
 
         user_prompt = (
             f"نوع الملف: {file_type_label}\n"
