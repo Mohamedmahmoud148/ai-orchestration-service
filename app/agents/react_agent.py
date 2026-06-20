@@ -1073,42 +1073,105 @@ async def _tool_read_material(args: dict, context: "ExecutionContext", model_rou
         logger.error("[read_material_pdf] download failed url=%s — %s", file_url, exc)
         return {"error": f"Could not download the file: {exc}"}
 
-    # 3. Extract text
+    # 3. Extract text — try multiple methods
+    fname = file_url.split("?")[0].split("/")[-1].lower()
+    text = ""
+
+    # Method A: pdfminer (best quality for text PDFs)
     try:
         from pdfminer.high_level import extract_text as pdfminer_extract
         text = pdfminer_extract(io.BytesIO(raw)) or ""
     except Exception:
-        try:
-            text = raw.decode("utf-8", errors="ignore")
-        except Exception:
-            text = ""
+        pass
 
+    # Method B: pypdf fallback
     if not text.strip():
-        return {"error": "Could not extract text from the file."}
+        try:
+            import pypdf
+            reader = pypdf.PdfReader(io.BytesIO(raw))
+            text = "\n\n".join(p.extract_text() or "" for p in reader.pages)
+        except Exception:
+            pass
 
-    text = text[:6000]  # cap for LLM context
+    # Method C: PPT/PPTX text extraction
+    if not text.strip() and fname.endswith((".ppt", ".pptx")):
+        try:
+            from pptx import Presentation
+            prs = Presentation(io.BytesIO(raw))
+            slides = []
+            for i, slide in enumerate(prs.slides):
+                slide_text = " ".join(
+                    shape.text for shape in slide.shapes if hasattr(shape, "text")
+                )
+                if slide_text.strip():
+                    slides.append(f"[Slide {i+1}] {slide_text}")
+            text = "\n".join(slides)
+        except Exception:
+            pass
+
+    # If text extracted is very short → use deep PDF mode for large PDFs
+    if len(text.strip()) < 200 and fname.endswith(".pdf") and len(raw) > 50_000:
+        try:
+            from app.modules.deep_pdf_study import extract_pdf_pages, summarize_large_pdf
+            pages = extract_pdf_pages(raw)
+            if pages:
+                q = question or task or "اشرح محتوى الملف"
+                result = await summarize_large_pdf(
+                    pages=pages, user_question=q,
+                    model_router=model_router, model_id=_MODEL,
+                )
+                return {"material_content": result, "chars_processed": sum(len(p) for p in pages)}
+        except Exception as dp_exc:
+            logger.warning("[read_material_pdf] deep_pdf failed — %s", dp_exc)
+
+    # If still empty → try vision for scanned PDFs / images
+    if not text.strip():
+        try:
+            from app.modules.file_extraction import _vision_extract
+            vision_text = await _vision_extract(raw, fname, question or "اشرح محتوى الملف", model_router, auth)
+            if vision_text and vision_text.strip():
+                text = vision_text
+        except Exception:
+            pass
+
+    # If completely empty → inform AI to use general knowledge
+    if not text.strip():
+        fname_display = file_url.split("?")[0].split("/")[-1]
+        return {
+            "error": "unreadable_file",
+            "message": (
+                f"الملف '{fname_display}' مش قابل للقراءة كـ نص (ممكن يكون PDF مسحوب ضوئياً أو slides بصور). "
+                "اشرح للطالب الموضوع من معرفتك الأكاديمية العامة وأخبره إنك مش بتشرح من الملف."
+            )
+        }
+
+    # Cap text at 20K chars for better coverage
+    text = text[:20_000]
 
     # 4. Build task-specific prompt
+    focus = f"\nالطالب سأل عن: {question}" if question else ""
     if task == "list_headings":
-        user_prompt = f"List all main headings and topics found in this document:\n\n{text}"
+        user_prompt = f"اعرض الموضوعات والعناوين الرئيسية في هذا الملف:\n{focus}\n\n{text}"
     elif task == "explain":
-        focus = f" Focus on: {question}" if question else ""
-        user_prompt = f"Explain the content of this document in simple terms.{focus}\n\n{text}"
+        user_prompt = f"اشرح محتوى هذا الملف بالتفصيل بطريقة مبسطة للطالب:{focus}\n\n{text}"
     elif task == "read":
-        user_prompt = f"Read and present the key information from this document:\n\n{text}"
-    else:  # summarize
-        focus = f" The user specifically wants to know: {question}" if question else ""
-        user_prompt = f"Summarize this document in clear bullet points.{focus}\n\n{text}"
+        user_prompt = f"اقرأ هذا الملف وقدم المعلومات الأساسية منه:{focus}\n\n{text}"
+    else:  # summarize / default
+        user_prompt = f"قدم شرحاً وافياً ومفصلاً لهذا الملف الأكاديمي:{focus}\n\n{text}"
 
     # 5. LLM narration
     try:
         result = await model_router.generate_with_messages(
             messages=[
-                {"role": "system", "content": "You are a helpful assistant that reads and analyzes academic documents. Respond in the same language as the user's request."},
+                {"role": "system", "content": (
+                    "أنت مدرّس أكاديمي متخصص. اشرح محتوى الملف بعمق وتفصيل. "
+                    "استخدم عناوين وأمثلة واشرح كل مفهوم بوضوح. "
+                    "أجب بنفس لغة الطالب (عربي أو إنجليزي)."
+                )},
                 {"role": "user", "content": user_prompt},
             ],
             model_id=_MODEL,
-            max_tokens=1500,
+            max_tokens=2000,
         )
         return {"material_content": result, "chars_processed": len(text)}
     except Exception as exc:
