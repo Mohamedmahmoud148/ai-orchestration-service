@@ -137,59 +137,91 @@ async def explain_file(request: Request, body: ExplainFileRequest):
             "detailEn": "No text could be extracted. The file may be a scanned image or encrypted."
         })
 
-    # If very little text was extracted → try vision model for scanned PDFs/images
+    # If very little text was extracted → try vision model (proper page-by-page for PDFs)
     fname_lower = filename.lower()
-    is_likely_scanned = len(text.strip()) < 500 and fname_lower.endswith((".pdf", ".png", ".jpg", ".jpeg", ".webp"))
+    is_image = fname_lower.endswith((".png", ".jpg", ".jpeg", ".webp"))
+    is_likely_scanned = len(text.strip()) < 500 and (fname_lower.endswith(".pdf") or is_image)
     if is_likely_scanned and model_router:
         try:
-            import base64 as _b64v
-            vision_b64 = _b64.b64encode(file_bytes).decode() if 'file_bytes' in dir() else body.content_b64
-            vision_text = await model_router.generate_with_messages(
-                messages=[
-                    {"role": "system", "content": "أنت خبير في قراءة الوثائق. استخرج كل النص والمحتوى من الصورة/الملف بدقة."},
-                    {"role": "user", "content": [
-                        {"type": "text", "text": f"استخرج وشرح كل محتوى هذا الملف بالتفصيل: {filename}"},
-                        {"type": "image_url", "image_url": {"url": f"data:{body.content_type};base64,{vision_b64[:500000]}"}}
-                    ]}
-                ],
-                model_id="google/gemini-flash-1.5",
-            )
-            if vision_text and len(vision_text.strip()) > len(text.strip()):
-                text = vision_text
-                logger.info("explain-file: vision extraction got %d chars", len(text))
+            from app.modules.file_extraction import _pdf_pages_to_images
+
+            image_bytes_list: list = []
+            if is_image:
+                image_bytes_list = [file_bytes]
+            elif fname_lower.endswith(".pdf"):
+                image_bytes_list = _pdf_pages_to_images(file_bytes, max_pages=20)
+
+            if image_bytes_list:
+                content_parts = [{"type": "text", "text": (
+                    f"هذا ملف PDF يحتوي على {len(image_bytes_list)} صفحة. "
+                    "استخرج كل النصوص والمحتوى من كل صفحة بدقة تامة. "
+                    "لا تخترع أي معلومات — استخدم فقط ما تراه في الصور."
+                )}]
+                for img in image_bytes_list[:20]:
+                    b64_img = _b64.b64encode(img).decode()
+                    content_parts.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{b64_img}"}
+                    })
+
+                vision_text = await model_router.generate_with_messages(
+                    messages=[
+                        {"role": "system", "content": "أنت خبير OCR في قراءة الوثائق الجامعية. استخرج النص بدقة من كل صفحة."},
+                        {"role": "user", "content": content_parts}
+                    ],
+                    model_id="google/gemini-flash-1.5",
+                )
+                if vision_text and len(vision_text.strip()) > len(text.strip()):
+                    text = vision_text
+                    logger.info("explain-file: vision page extraction got %d chars from %d pages", len(text), len(image_bytes_list))
+            else:
+                logger.warning("explain-file: vision skipped — no pages extracted from %s", filename)
         except Exception as ve:
             logger.warning("explain-file: vision fallback failed — %s", ve)
 
-    text = text[:20_000]  # increased from 6K to 20K for deeper coverage
+    text = text[:20_000]
+    char_count = len(text.strip())
 
     # ── 2. Generate explanation ───────────────────────────────────────────────
     explanation = None
     if model_router:
-        try:
-            explanation = await model_router.generate(
-                prompt=(
-                    f"الملف: {filename}\n\n"
-                    f"=== محتوى الملف الكامل ===\n{text}\n=== نهاية المحتوى ===\n\n"
-                    f"سؤال/طلب المستخدم: اشرحلي محتوى الملف بالتفصيل\n\n"
-                    "قدّم شرحاً أكاديمياً شاملاً ومفصلاً يشمل:\n"
-                    "## 1. نظرة عامة على الملف\n"
-                    "## 2. المفاهيم الأساسية مع شرح مفصل لكل منها\n"
-                    "## 3. المعادلات والتعريفات المهمة (إن وُجدت)\n"
-                    "## 4. العلاقات بين المفاهيم\n"
-                    "## 5. نقاط مهمة للامتحان\n\n"
-                    "⚠️ استخدم المحتوى المقدّم فقط. اجعل الشرح طويلاً ومفصلاً قدر الإمكان."
-                ),
-                system_instruction=(
-                    "أنت أستاذ جامعي متخصص. مهمتك شرح المحتوى بعمق وتفصيل كامل. "
-                    "لا تختصر أبداً — الطالب يريد الفهم الكامل. "
-                    "استخدم عناوين وأمثلة وشرح مبسط لكل مفهوم. "
-                    "الرد يجب أن يكون طويلاً ومفيداً جداً. "
-                    "إذا كان المحتوى بالإنجليزية يمكنك الشرح بالعربية مع الاحتفاظ بالمصطلحات الإنجليزية."
-                ),
-                model_id="openai/gpt-4o-mini",
+        if char_count < 150:
+            explanation = (
+                f"⚠️ لم أتمكن من استخراج محتوى كافٍ من الملف **'{filename}'** "
+                f"(تم استخراج {char_count} حرف فقط).\n\n"
+                "**الأسباب المحتملة:**\n"
+                "- الملف عبارة عن صور مسح ضوئي (scanned PDF)\n"
+                "- الملف محمي بكلمة مرور\n"
+                "- الملف تالف أو غير مدعوم\n\n"
+                "**الحل:** جرّب تحويل الملف إلى PDF نصي أو رفعه كصورة PNG."
             )
-        except Exception as exc:
-            logger.error("explain-file: LLM explanation failed — %s", exc)
+        else:
+            try:
+                explanation = await model_router.generate(
+                    prompt=(
+                        f"اسم الملف: {filename}\n\n"
+                        f"=== المحتوى المستخرج من الملف ({char_count} حرف) ===\n"
+                        f"{text}\n"
+                        f"=== نهاية المحتوى ===\n\n"
+                        "المطلوب: شرح مفصل وأكاديمي يشمل:\n"
+                        "## 1. موضوع الملف والهدف منه\n"
+                        "## 2. المفاهيم الأساسية مع شرح كل منها بالتفصيل\n"
+                        "## 3. المعادلات والتعريفات المهمة (إن وجدت)\n"
+                        "## 4. العلاقات بين المفاهيم\n"
+                        "## 5. نقاط مهمة للامتحان\n\n"
+                        "⚠️ CRITICAL RULE: استخدم فقط المعلومات الموجودة في المحتوى أعلاه. "
+                        "لا تخترع أو تضيف أي معلومة غير موجودة في النص. "
+                        "إذا لم تجد معلومة كافية عن نقطة معينة، قل ذلك صراحةً."
+                    ),
+                    system_instruction=(
+                        "أنت أستاذ جامعي. شرح المحتوى المُقدَّم فقط — "
+                        "ممنوع استخدام معرفتك العامة لإضافة معلومات غير موجودة في النص المرفق. "
+                        "لا تختصر. إذا كان المحتوى بالإنجليزية اشرح بالعربية مع الاحتفاظ بالمصطلحات."
+                    ),
+                    model_id="openai/gpt-4o-mini",
+                )
+            except Exception as exc:
+                logger.error("explain-file: LLM explanation failed — %s", exc)
 
     if not explanation:
         explanation = f"تم استخراج النص من الملف ({len(text)} حرف). خدمة الشرح غير متاحة مؤقتاً."
