@@ -36,8 +36,8 @@ async def log_rag_health() -> dict:
         "recommendations":     [],
     }
 
-    # ── 1. Check OPENAI_API_KEY ───────────────────────────────────────────────
-    openai_key = os.getenv("OPENAI_API_KEY", "")
+    # ── 1. Check embedding API key (dedicated or OpenAI) ──────────────────────
+    openai_key = os.getenv("EMBEDDING_API_KEY", "") or os.getenv("OPENAI_API_KEY", "")
     health["openai_key_set"] = bool(openai_key and len(openai_key) > 10)
 
     if not health["openai_key_set"]:
@@ -58,7 +58,7 @@ async def log_rag_health() -> dict:
                 "EmbeddingService is in keyword_fallback mode. "
                 "Semantic similarity search is NOT active. Add OPENAI_API_KEY."
             )
-        elif mode in ("openai", "sentence_transformers"):
+        elif mode in ("openai", "openai_api", "sentence_transformers"):
             health["embedding_provider"] = mode
             # Try to get dimensions
             try:

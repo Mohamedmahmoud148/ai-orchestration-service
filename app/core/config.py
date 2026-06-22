@@ -9,8 +9,20 @@ class Settings(BaseSettings):
 
     # AI Config — OpenRouter
     OPENROUTER_API_KEY: str = ""
-    OPENROUTER_FALLBACK_MODEL_1: str = "openai/gpt-4o-mini"
-    OPENROUTER_FALLBACK_MODEL_2: str = ""  # e.g. "mistralai/mistral-7b-instruct"
+    # Real fallback chain — each must be a DIFFERENT provider so that if OpenAI is
+    # down/overloaded the agent keeps working. (Previously both defaulted to
+    # gpt-4o-mini, which is not a real fallback.)
+    OPENROUTER_FALLBACK_MODEL_1: str = "google/gemini-flash-1.5"
+    OPENROUTER_FALLBACK_MODEL_2: str = "mistralai/mistral-7b-instruct"
+
+    # ── Model tiering (Phase 13) ─────────────────────────────────────────────
+    # Simple/cheap tasks (classification, titles, short prompts).
+    MODEL_SIMPLE: str = "openai/gpt-4o-mini"
+    # Complex reasoning (academic advisor, PDF explanation, exam generation,
+    # study plans, regulation analysis). Override to "openai/gpt-4o" in prod.
+    MODEL_COMPLEX: str = "openai/gpt-4o-mini"
+    # Vision / OCR (scanned PDFs, images).
+    MODEL_VISION: str = "google/gemini-flash-1.5"
 
     # Embeddings — for RAG pipeline.
     # OPENAI_API_KEY: direct OpenAI key for text-embedding-3-small.
@@ -18,6 +30,10 @@ class Settings(BaseSettings):
     # EMBEDDING_MODEL: override to use a different embedding model.
     # If none are set the service falls back to keyword-overlap (no real vectors).
     OPENAI_API_KEY: str = ""
+    # Dedicated embedding key (optional). Takes priority over OPENAI_API_KEY.
+    # Point EMBEDDING_BASE_URL at any OpenAI-compatible embeddings endpoint
+    # (OpenAI, Azure, Together, Voyage, a local server, etc.).
+    EMBEDDING_API_KEY: str = ""
     GROQ_API_KEY: str = ""          # Free Whisper via Groq — fastest option
     EMBEDDING_BASE_URL: str = "https://api.openai.com/v1"
     EMBEDDING_MODEL: str = "text-embedding-3-small"

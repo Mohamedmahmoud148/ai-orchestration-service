@@ -58,6 +58,37 @@ class ModelRouter:
     # Default model served through OpenRouter
     DEFAULT_MODEL = "openai/gpt-4o-mini"
 
+    # ── Task → model tier mapping (Phase 13) ─────────────────────────────────
+    # Complex tasks route to MODEL_COMPLEX (e.g. gpt-4o), vision to MODEL_VISION,
+    # everything else to MODEL_SIMPLE. Opt-in: callers pass the resolved model_id.
+    _COMPLEX_TASKS = frozenset({
+        "academic_advisor", "pdf_explanation", "material_explanation",
+        "exam_generation", "study_plan", "regulation_analysis",
+        "doctor_intelligence", "deep_pdf",
+    })
+    _VISION_TASKS = frozenset({"vision", "ocr", "scanned_pdf", "image"})
+
+    @staticmethod
+    def pick_model(task: str) -> str:
+        """
+        Resolve a task name to the configured model tier.
+
+        Simple tasks  → MODEL_SIMPLE  (cheap, fast — classification, titles)
+        Complex tasks → MODEL_COMPLEX (smart — advisor, PDF, exam gen)
+        Vision tasks  → MODEL_VISION  (OCR, images)
+        Unknown       → MODEL_SIMPLE
+        """
+        try:
+            from app.core.config import settings
+            t = (task or "").lower()
+            if t in ModelRouter._VISION_TASKS:
+                return settings.MODEL_VISION
+            if t in ModelRouter._COMPLEX_TASKS:
+                return settings.MODEL_COMPLEX
+            return settings.MODEL_SIMPLE
+        except Exception:
+            return ModelRouter.DEFAULT_MODEL
+
     def __init__(
         self,
         gemini_client: Optional[Any] = None,

@@ -4,7 +4,8 @@ FROM python:3.11-slim
 # Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PORT=8000
+    PORT=8000 \
+    CHROMADB_PATH=/app/chroma_data
 
 # Create and switch to non-root user
 RUN addgroup --system appgroup && \
@@ -27,6 +28,13 @@ RUN pip install --no-cache-dir --upgrade pip && \
 
 # Copy application source code
 COPY --chown=appuser:appgroup app/ app/
+
+# Create the ChromaDB data directory owned by the runtime user.
+# Without this the non-root appuser cannot write to /app/chroma_data
+# (Errno 13 Permission denied) and the vector store silently degrades
+# to an in-memory backend that is lost on every restart.
+# If a Railway volume is mounted at /app/chroma_data it inherits these perms.
+RUN mkdir -p /app/chroma_data && chown -R appuser:appgroup /app/chroma_data
 
 # Switch to the non-root user
 USER appuser

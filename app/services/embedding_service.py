@@ -66,33 +66,70 @@ class EmbeddingService:
 
     def __init__(self) -> None:
         s = _get_settings()
-        self._api_key: str = s.OPENAI_API_KEY or ""
+        # Key priority: dedicated EMBEDDING_API_KEY → OPENAI_API_KEY.
+        self._api_key: str = (
+            getattr(s, "EMBEDDING_API_KEY", "") or s.OPENAI_API_KEY or ""
+        )
         self._base_url: str = (s.EMBEDDING_BASE_URL or "https://api.openai.com/v1").rstrip("/")
         self._model: str   = s.EMBEDDING_MODEL or "text-embedding-3-small"
         self._embedding_dim: int = 1536  # default for text-embedding-3-small
 
         self._openai_client = None     # AsyncOpenAI — lazy
         self._st_model = None          # SentenceTransformer — lazy
+        self._init_error: str = ""     # populated when a provider fails to init
 
-        # Determine mode
+        # Determine mode — try OpenAI-compatible first, then local ST, then fallback.
         if self._api_key:
             self._mode = "openai_api"
-            logger.info(
-                "EmbeddingService: mode=openai_api base=%s model=%s",
-                self._base_url, self._model,
-            )
+            # Eagerly construct the client so we surface auth/network errors at
+            # startup rather than silently degrading on the first request.
+            if self._get_openai_client() is not None:
+                logger.info(
+                    "EmbeddingService: EmbeddingProvider=OpenAI EmbeddingMode=openai "
+                    "base=%s model=%s Dimensions=%d Fallback=False",
+                    self._base_url, self._model, self._embedding_dim,
+                )
+            else:
+                # client init failed → fall through with a loud, explicit reason
+                logger.error(
+                    "EmbeddingService: OpenAI client init FAILED (reason=%s) — "
+                    "attempting local sentence-transformers next.",
+                    self._init_error or "unknown",
+                )
+                if self._try_load_sentence_transformers():
+                    self._mode = "sentence_transformers"
+                    self._embedding_dim = _ST_EMBEDDING_DIM
+                    logger.warning(
+                        "EmbeddingService: EmbeddingProvider=SentenceTransformers "
+                        "EmbeddingMode=sentence_transformers model=%s Dimensions=%d Fallback=True",
+                        _ST_MODEL_NAME, _ST_EMBEDDING_DIM,
+                    )
+                else:
+                    self._mode = "keyword_fallback"
+                    logger.error(
+                        "EmbeddingService: EmbeddingProvider=Keyword EmbeddingMode=keyword_fallback "
+                        "Dimensions=%d Fallback=True — RAG semantic quality is DEGRADED. "
+                        "Reason: OpenAI init failed (%s) and sentence-transformers unavailable. "
+                        "Fix: set a valid EMBEDDING_API_KEY/OPENAI_API_KEY or install ML deps.",
+                        self._embedding_dim, self._init_error or "unknown",
+                    )
         elif self._try_load_sentence_transformers():
             self._mode = "sentence_transformers"
+            self._embedding_dim = _ST_EMBEDDING_DIM
             logger.info(
-                "EmbeddingService: mode=sentence_transformers model=%s dim=%d",
+                "EmbeddingService: EmbeddingProvider=SentenceTransformers "
+                "EmbeddingMode=sentence_transformers model=%s Dimensions=%d Fallback=False",
                 _ST_MODEL_NAME, _ST_EMBEDDING_DIM,
             )
-            self._embedding_dim = _ST_EMBEDDING_DIM
         else:
             self._mode = "keyword_fallback"
-            logger.warning(
-                "EmbeddingService: mode=keyword_fallback — RAG semantic quality is DEGRADED. "
-                "Set OPENAI_API_KEY (or install sentence-transformers) for real embeddings."
+            logger.error(
+                "EmbeddingService: EmbeddingProvider=Keyword EmbeddingMode=keyword_fallback "
+                "Dimensions=%d Fallback=True — RAG semantic quality is DEGRADED. "
+                "No embedding API key set and sentence-transformers failed to load. "
+                "Fix: set EMBEDDING_API_KEY (or OPENAI_API_KEY), or pin numpy<2 so the "
+                "local model can load.",
+                self._embedding_dim,
             )
 
     # ── Mode detection helpers ────────────────────────────────────────────────
@@ -124,9 +161,12 @@ class EmbeddingService:
                     "EmbeddingService: AsyncOpenAI client ready (base=%s, model=%s)",
                     self._base_url, self._model,
                 )
-            except ImportError:
-                logger.error("EmbeddingService: 'openai' package not installed.")
-                self._mode = "keyword_fallback"
+            except ImportError as exc:
+                self._init_error = "openai package not installed"
+                logger.error("EmbeddingService: 'openai' package not installed — %s", exc)
+            except Exception as exc:
+                self._init_error = str(exc)
+                logger.error("EmbeddingService: AsyncOpenAI client init failed — %s", exc)
         return self._openai_client
 
     # ── Public status ─────────────────────────────────────────────────────────
