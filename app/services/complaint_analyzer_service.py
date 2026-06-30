@@ -25,9 +25,9 @@ class ComplaintAnalyzerService:
 
     async def analyze_complaint(self, request: AiAnalyzeComplaintRequest) -> AiComplaintAnalysisResponse:
         user_message = f"""
-        Complaint ID: {request.complaintId}
-        Target Type: {request.targetType}
-        Target ID: {request.targetId}
+        Complaint ID: {request.complaint_id}
+        Target Type: {request.target_type}
+        Target ID: {request.target_id}
         Complaint Message: {request.message}
         """
 
@@ -47,26 +47,26 @@ class ComplaintAnalyzerService:
             result_json = json.loads(result_text)
             
             # Check for duplicates / clusters via semantic similarity (Mocked here)
-            duplicate_group_id = await self._find_duplicate_cluster(request.targetType, request.targetId, request.message)
+            duplicate_group_id = await self._find_duplicate_cluster(request.target_type, request.target_id, request.message)
 
             return AiComplaintAnalysisResponse(
-                sentimentScore=float(result_json.get("sentimentScore", -0.5)),
+                sentiment_score=float(result_json.get("sentimentScore", -0.5)),
                 category=result_json.get("category", "general"),
                 severity=result_json.get("severity", "medium"),
                 summary=result_json.get("summary", "User submitted a complaint."),
-                duplicateGroupId=duplicate_group_id,
-                recommendedAction=result_json.get("recommendedAction", "Manual review required.")
+                duplicate_group_id=duplicate_group_id,
+                recommended_action=result_json.get("recommendedAction", "Manual review required.")
             )
 
         except Exception as e:
             logger.error("Error analyzing complaint: %s", str(e))
             return AiComplaintAnalysisResponse(
-                sentimentScore=-0.5,
+                sentiment_score=-0.5,
                 category="general",
                 severity="medium",
                 summary="Fallback summary due to AI service error.",
-                duplicateGroupId=None,
-                recommendedAction="Manual review required."
+                duplicate_group_id=None,
+                recommended_action="Manual review required."
             )
 
     async def _find_duplicate_cluster(self, target_type: str, target_id: str, message: str) -> Optional[str]:

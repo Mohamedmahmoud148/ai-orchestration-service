@@ -2,15 +2,15 @@ from pydantic import BaseModel
 from typing import Optional
 
 class AiAnalyzeComplaintRequest(BaseModel):
-    complaintId: str
+    complaint_id: str
     message: str
-    targetType: str
-    targetId: str
+    target_type: str
+    target_id: str
 
 class AiComplaintAnalysisResponse(BaseModel):
-    sentimentScore: float
+    sentiment_score: float
     category: str
     severity: str
     summary: str
-    duplicateGroupId: Optional[str] = None
-    recommendedAction: str
+    duplicate_group_id: Optional[str] = None
+    recommended_action: str
