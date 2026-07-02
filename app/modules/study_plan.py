@@ -229,7 +229,7 @@ class StudyPlanModule:
             enrolled_subjects: List[str] = []
             for sem in (roadmap.get("semesters") or []):
                 for sub in (sem.get("subjects") or []):
-                    if sub.get("status") == "enrolled":
+                    if sub.get("status") in ("in_progress", "enrolled"):
                         enrolled_subjects.append(
                             f"{sub.get('subjectName', '?')} ({sub.get('subjectCode', '')})"
                             f" — {sub.get('creditHours', '?')} ساعة"
