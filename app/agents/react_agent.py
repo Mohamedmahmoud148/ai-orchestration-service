@@ -1090,9 +1090,14 @@ async def _tool_read_material(args: dict, context: "ExecutionContext", model_rou
         }
 
     # 2. Download PDF
+    # Attach the caller's bearer token — most material URLs are public R2
+    # links that don't need it, but any file served from an access-controlled
+    # route (vs a public/presigned one) would otherwise silently 401/403 here
+    # while the vision-OCR fallback below (which does pass `auth`) might work.
     try:
+        headers = {"Authorization": auth} if auth else {}
         async with httpx.AsyncClient(timeout=30.0) as http:
-            resp = await http.get(file_url)
+            resp = await http.get(file_url, headers=headers)
             resp.raise_for_status()
             raw = resp.content
     except Exception as exc:

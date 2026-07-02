@@ -23,6 +23,13 @@ python-docx>=1.1.0
 openpyxl>=3.1.0
 xlrd>=2.0.1
 Pillow>=10.0.0
+# python-pptx: PPT/PPTX slide-text extraction (app/agents/react_agent.py's
+# read_material_pdf tool). Was missing here — importable locally only because
+# a dev happened to have it installed globally; any environment installing
+# strictly from this file (e.g. production) would ModuleNotFoundError on
+# every .ppt/.pptx material, silently swallowed into a generic
+# "file unreadable" response with no indication of the real cause.
+python-pptx>=1.0.0
 
 # Memory & Caching
 redis>=5.0.0
