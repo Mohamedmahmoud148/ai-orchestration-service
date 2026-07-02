@@ -107,6 +107,16 @@ class Settings(BaseSettings):
     # OPENROUTER_MODEL: model used for classification (planner) calls.
     OPENROUTER_MODEL: str = "openai/gpt-4o-mini"
 
+    # ── Agentic Architecture Upgrade — Phase 1 ────────────────────────────────
+    # USE_LANGGRAPH_ORCHESTRATION:
+    #   True  → /api/chat routes through a LangGraph StateGraph that thinly
+    #            wraps the existing Agent.run() call (see app/agents/graph.py).
+    #            No change to ReactAgent, RBAC, or tool execution internals.
+    #   False → (default) direct `await agent.run(context)` call, exactly as
+    #            before this flag existed. langgraph is never imported when
+    #            this is False, so cold start / memory footprint are unaffected.
+    USE_LANGGRAPH_ORCHESTRATION: bool = False
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

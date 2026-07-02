@@ -105,7 +105,57 @@ class Agent:
         )
         pipeline_start = time.perf_counter()
 
-        # ── Stage 0: Load Memory + User Preferences ─────────────────────
+        memory_key, plan, module_name, should_return_early = await self._load_memory(context)
+        if should_return_early:
+            # An in-progress clarification was answered with an invalid
+            # choice. context.result is already set (Arabic error message);
+            # matches the original inline `return context` exactly — no
+            # background tasks fire, no Stage 5 save happens.
+            return context
+
+        await self._execute_core(context, plan, module_name)
+
+        await self._save_memory(context, memory_key, plan, module_name)
+
+        elapsed = round(time.perf_counter() - pipeline_start, 4)
+        context.add_metadata("agent_duration_seconds", elapsed)
+
+        logger.info(
+            "[Agent] END conversation_id=%s status=%s duration_s=%s",
+            context.conversation_id,
+            "success" if context.result else "empty",
+            elapsed,
+        )
+        return context
+
+    # ──────────────────────────────────────────────────────────────────────
+    #  Stage 0 / Stage 1-4 / Stage 5 — extracted from run() (Phases 2-3 of
+    #  the agentic architecture upgrade, see docs/AGENTIC_UPGRADE_ROADMAP.md).
+    #
+    #  Pure extract-method refactor — no logic changed from the original
+    #  inline blocks. Exists as real, independently callable methods so the
+    #  LangGraph multi-node graph (app/agents/graph.py) can call each one
+    #  as a separate node instead of running the whole run() method.
+    # ──────────────────────────────────────────────────────────────────────
+
+    async def _load_memory(
+        self, context: ExecutionContext
+    ) -> tuple[str, Optional[ExecutionPlan], Optional[str], bool]:
+        """
+        Stage 0 — load memory, preferences, entities, user goal, academic
+        profile, personalized context, and last-seen file URL; resolve any
+        in-progress clarification; fire background language-detection and
+        entity-extraction tasks.
+
+        Returns (memory_key, plan, module_name, should_return_early).
+
+        should_return_early is True only when an in-progress clarification
+        was answered with an invalid choice — context.result is already set
+        to the Arabic "invalid choice" message in that case, and the caller
+        must return context immediately without firing the background tasks
+        below or running Stage 5, exactly matching the original inline
+        `return context` early-exit.
+        """
         # Use composite key so different conversations don't share memory.
         memory_key = f"{context.user_id}:{context.conversation_id}" if context.conversation_id else context.user_id
         memory = await self._memory_store.get_conversation(memory_key)
@@ -205,7 +255,7 @@ class Agent:
                 context.add_metadata("clarification_needed", True)
                 context.add_metadata("clarification_options", options)
                 context.set_result("عذراً، هذا الاختيار غير صحيح.")
-                return context
+                return memory_key, None, None, True
 
         # Detect + persist user language early (fire-and-forget, never blocks)
         asyncio.create_task(
@@ -215,6 +265,26 @@ class Agent:
         # Extract + persist conversation entities (courses, doctors, goals…)
         asyncio.create_task(self._extract_and_save_entities(context))
 
+        return memory_key, plan, module_name, False
+
+    async def _execute_core(
+        self,
+        context: ExecutionContext,
+        plan: Optional[ExecutionPlan],
+        module_name: Optional[str],
+    ) -> None:
+        """
+        Stage 1-4 (combined) — run either the ReactAgent smart path (when
+        clarification resolution did not produce a plan — the normal case)
+        or the legacy PlanExecutor path (when clarification resolution did
+        produce a plan). Writes context.result / context.metadata in place.
+
+        Note: this never needs to return an updated plan/module_name —
+        the ReactAgent branch's `plan = None` reassignment below is a
+        no-op (plan is already None on entry to that branch), so whatever
+        `plan` the caller passed in is exactly what should be passed to
+        _save_memory() afterwards, unchanged.
+        """
         if not plan:
             if self._react_agent is not None:
                 # ── ReactAgent path (smart, iterative, no keywords) ───────
@@ -250,6 +320,19 @@ class Agent:
             # Clarification path — always uses old executor
             await self._execute(context, plan, module_name)
 
+    async def _save_memory(
+        self,
+        context: ExecutionContext,
+        memory_key: str,
+        plan: Optional[ExecutionPlan],
+        module_name: Optional[str],
+    ) -> None:
+        """
+        Stage 5 — save a fresh clarification if the executor determined one
+        is needed this turn, otherwise persist conversation memory, extract
+        and persist any file URL found in the response, and fire background
+        summarization for long conversations.
+        """
         # ── Clarification Handling or Save Memory ────────────────────────
         if context.metadata.get("clarification_needed"):
             options = context.metadata.get("clarification_options", [])
@@ -316,17 +399,6 @@ class Agent:
             # Fire-and-forget: compress long conversations in the background
             if len(context.history) >= _SUMMARY_THRESHOLD:
                 asyncio.create_task(self._summarize_and_save(context))
-
-        elapsed = round(time.perf_counter() - pipeline_start, 4)
-        context.add_metadata("agent_duration_seconds", elapsed)
-
-        logger.info(
-            "[Agent] END conversation_id=%s status=%s duration_s=%s",
-            context.conversation_id,
-            "success" if context.result else "empty",
-            elapsed,
-        )
-        return context
 
     # _validate_role_permissions() REMOVED (2026-04-12)
     # ─────────────────────────────────────────────────────────────────────

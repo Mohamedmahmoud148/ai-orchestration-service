@@ -41,6 +41,25 @@ def _get_agent(fastapi_request: Request) -> Agent:
     return agent
 
 
+async def _run_orchestration(fastapi_request: Request, context: ExecutionContext) -> ExecutionContext:
+    """
+    Route through the LangGraph wrapper if enabled, else the direct
+    Agent.run() path (default, unchanged behavior).
+
+    See app/agents/graph.py — the graph-on path calls the exact same
+    Agent.run(context) internally, just sequenced through a StateGraph.
+    _PipelineStageError raised inside Agent.run() propagates through
+    graph.ainvoke() unchanged, so the caller's existing except clause
+    still catches it correctly either way.
+    """
+    graph = getattr(fastapi_request.app.state, "agent_graph", None)
+    if graph is not None:
+        result_state = await graph.ainvoke({"context": context})
+        return result_state["context"]
+    agent = _get_agent(fastapi_request)
+    return await agent.run(context)
+
+
 @router.post("/chat", response_model=ChatResponse, tags=["AI Chat"])
 async def chat_endpoint(
     request: ChatRequest, 
@@ -99,11 +118,9 @@ async def chat_endpoint(
         },
     )
 
-    # ── Delegate to Agent ─────────────────────────────────────
-    agent = _get_agent(fastapi_request)
-
+    # ── Delegate to Agent (direct, or via LangGraph wrapper if enabled) ──
     try:
-        await agent.run(context)
+        context = await _run_orchestration(fastapi_request, context)
     except _PipelineStageError as exc:
         logger.error(
             "Agent aborted. stage=%s conversation_id=%s detail=%s",
@@ -289,8 +306,26 @@ async def chat_stream_endpoint(
 
             if not use_react_stream:
                 # ── Fallback: run full pipeline then replay result ─────────
+                # Routed through _run_orchestration (same helper /api/chat
+                # uses) so this path also goes through the LangGraph wrapper
+                # when USE_LANGGRAPH_ORCHESTRATION is on — Phase 4 of the
+                # agentic architecture upgrade. This fallback already
+                # computes the full answer up front and fakes streaming by
+                # replaying it in word chunks below, so there's no real
+                # token-level streaming to preserve from astream_events —
+                # routing through the same graph-or-direct dispatch as
+                # /api/chat gives full parity more simply.
+                #
+                # Note: the result is NOT reassigned to `context` here —
+                # ExecutionContext is mutated in place by both the direct
+                # and graph paths (same object identity either way, see
+                # tests/test_langgraph_wrapper.py), and `context` is a
+                # closure variable read elsewhere in this nested generator;
+                # reassigning it here would make Python treat it as local
+                # to event_generator() throughout, breaking the earlier
+                # reads above (UnboundLocalError).
                 try:
-                    await agent.run(context)
+                    await _run_orchestration(fastapi_request, context)
                 except _PipelineStageError as exc:
                     yield f"data: {_json.dumps({'type': 'error', 'message': exc.detail})}\n\n"
                     yield "data: {\"type\": \"done\"}\n\n"

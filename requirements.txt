@@ -30,6 +30,13 @@ redis>=5.0.0
 # RAG pipeline
 chromadb>=0.4.0
 
+# Agentic architecture upgrade — Phase 1 (LangGraph thin wrapper, see
+# app/agents/graph.py). No numpy/torch dependency, so it cannot conflict
+# with the numpy<2 / torch<2.3 pins below. Only loaded when
+# USE_LANGGRAPH_ORCHESTRATION=true (import is inside the flag in main.py).
+langgraph>=0.2.0,<0.3.0
+langgraph-checkpoint>=1.0.0,<2.0.0
+
 # NumPy MUST stay < 2 — PyTorch 2.2.x + sentence-transformers are built against
 # NumPy 1.x. NumPy 2.x silently breaks PyTorch (_ARRAY_API not found) which makes
 # sentence-transformers fail to load → EmbeddingService drops to keyword_fallback

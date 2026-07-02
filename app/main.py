@@ -178,6 +178,18 @@ async def lifespan(app: FastAPI):
 
     logger.info("Agent ready — flow: User → ReactAgent (smart) → fallback: Planner → Module")
 
+    # ── 4.2 Optional LangGraph wrapper (Phase 1 — feature-flagged) ───────
+    # Import is INSIDE the flag so langgraph is never loaded into the process
+    # when the flag is off — cold start and memory footprint stay unaffected
+    # by default. See app/agents/graph.py for what this wraps.
+    app.state.agent_graph = None
+    if settings.USE_LANGGRAPH_ORCHESTRATION:
+        from app.agents.graph import build_agent_graph
+        app.state.agent_graph = build_agent_graph(app.state.agent)
+        logger.info("LangGraph orchestration ENABLED — /api/chat routes through StateGraph.")
+    else:
+        logger.info("LangGraph orchestration disabled (USE_LANGGRAPH_ORCHESTRATION=false) — direct Agent.run() path.")
+
     # ── 5. RAG services (EmbeddingService + VectorStore) ─────────────
     from app.services.embedding_service import embedding_service
     from app.services.vector_store import vector_store
@@ -233,6 +245,7 @@ async def lifespan(app: FastAPI):
     # ── Shutdown ───────────────────────────────────────────────────────
     logger.info("Shutting down AI Orchestration Service.")
     app.state.agent = None
+    app.state.agent_graph = None
     try:
         await tool_execution_client.aclose()
     except Exception as exc:
