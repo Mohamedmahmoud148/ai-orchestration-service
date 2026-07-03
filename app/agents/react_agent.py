@@ -343,7 +343,10 @@ def _build_system_prompt(context: "ExecutionContext", active_doc: Optional[dict]
         ctx_parts.append(f"userId={context.user_id}")
     if context.role:
         ctx_parts.append(f"role={context.role}")
-    for key in ("batchId", "departmentId", "collegeId", "studentId", "batchCode", "fullName", "studentName"):
+    for key in (
+        "studentId", "fullName", "studentName", "doctorName", "adminName",
+        "batchId", "batchName", "departmentId", "departmentName", "collegeName",
+    ):
         if val := user_ctx.get(key):
             ctx_parts.append(f"{key}={val}")
 
